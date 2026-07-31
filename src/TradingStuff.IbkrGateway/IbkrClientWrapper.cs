@@ -168,15 +168,16 @@ public sealed class IbkrClientWrapper(
 
     // ---- account and positions --------------------------------------------------------------
 
-    public override void accountSummary(int reqId, string account, string tag, string value, string currency) =>
-        registry.Get<ListRequest<AccountSummaryValue>>(reqId)?
-            .Add(new AccountSummaryValue(account, tag, value, currency));
+    // These three stay registered for the life of the connection. Removing them on the ...End
+    // callback — as a one-shot request would — drops every subsequent push on the floor, and
+    // re-subscribing per read exhausts TWS's account-summary cap. See AccountSubscription.
 
-    public override void accountSummaryEnd(int reqId)
-    {
-        registry.Get<ListRequest<AccountSummaryValue>>(reqId)?.Complete();
-        registry.Remove(reqId);
-    }
+    public override void accountSummary(int reqId, string account, string tag, string value, string currency) =>
+        registry.Get<AccountSummarySubscription>(reqId)?
+            .Apply(new AccountSummaryValue(account, tag, value, currency));
+
+    public override void accountSummaryEnd(int reqId) =>
+        registry.Get<AccountSummarySubscription>(reqId)?.CompleteSnapshot();
 
     public override void positionMulti(
         int requestId,
@@ -185,17 +186,14 @@ public sealed class IbkrClientWrapper(
         Contract contract,
         decimal pos,
         double avgCost) =>
-        registry.Get<ListRequest<AccountPositionRow>>(requestId)?
-            .Add(new AccountPositionRow(account, contract, pos, avgCost));
+        registry.Get<PositionsSubscription>(requestId)?
+            .Apply(new AccountPositionRow(account, contract, pos, avgCost));
 
-    public override void positionMultiEnd(int requestId)
-    {
-        registry.Get<ListRequest<AccountPositionRow>>(requestId)?.Complete();
-        registry.Remove(requestId);
-    }
+    public override void positionMultiEnd(int requestId) =>
+        registry.Get<PositionsSubscription>(requestId)?.CompleteSnapshot();
 
     public override void pnl(int reqId, double dailyPnL, double unrealizedPnL, double realizedPnL) =>
-        registry.Get<PnLRequest>(reqId)?.Apply(dailyPnL, unrealizedPnL, realizedPnL);
+        registry.Get<PnLSubscription>(reqId)?.Apply(dailyPnL, unrealizedPnL, realizedPnL);
 
     // ---- orders ---------------------------------------------------------------------------
 

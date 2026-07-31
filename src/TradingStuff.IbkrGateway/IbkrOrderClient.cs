@@ -70,7 +70,25 @@ public sealed class IbkrOrderClient(
             legIndexByConId[conIds[request.Legs[index].Contract.Key()]] = index;
         }
 
-        tracker.Track(ibkrOrderId, request.ClientOrderId, internalOrderId, legIndexByConId);
+        // Claiming the internal order id and registering the order are one atomic step. If the claim
+        // is already held, this internal order has been transmitted before — a caller retry, a
+        // duplicate request — and placing again would put a second live order on the book under a
+        // different broker id, with the caller only ever seeing the last one.
+        if (!tracker.TryTrack(ibkrOrderId, request.ClientOrderId, internalOrderId, legIndexByConId))
+        {
+            var existing = tracker.FindByInternalOrderId(internalOrderId)
+                           ?? throw new InvalidOperationException(
+                               $"Internal order {internalOrderId} is claimed but has no tracked order.");
+
+            logger.LogWarning(
+                "Internal order {InternalOrderId} is already at IBKR as order {IbkrOrderId} ({Status}). " +
+                "Returning its state instead of placing again.",
+                internalOrderId,
+                existing.IbkrOrderId,
+                existing.RawStatus);
+
+            return existing;
+        }
 
         logger.LogInformation(
             "Placing order {OrderId} for internal order {InternalOrderId}: {Plan}",

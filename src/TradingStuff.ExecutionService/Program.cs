@@ -40,7 +40,11 @@ builder.Services.AddHttpClient<IbkrOrderRouter>((sp, client) =>
         sp.GetRequiredService<IConfiguration>(),
         "IbkrGateway:BaseUrl",
         "http://ibkrgateway");
-});
+})
+    // Order placement is not idempotent. The default resilience handler retries on a 10s per-attempt
+    // timeout, and a combo that rests longer than that would be transmitted to the broker twice.
+    // 60s comfortably exceeds the gateway's 20s order settle timeout.
+    .DisableAutomaticRetries(TimeSpan.FromSeconds(60));
 
 builder.Services.AddHttpClient<IbkrPortfolioProvider>((sp, client) =>
 {

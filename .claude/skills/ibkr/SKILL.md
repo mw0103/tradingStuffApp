@@ -139,6 +139,11 @@ type, whether trading is permitted, in-flight request count).
   or committed files.
 - `placeOrder` is irreversible the instant it lands. Treat adding or changing any `placeOrder` call
   site as a change requiring explicit confirmation, not a routine edit.
+- **Never let an HTTP client retry an order.** The standard resilience handler retries on its
+  per-attempt timeout, and an order resting longer than that is re-sent as a *second* live broker
+  order under a new order id while the caller sees only the last attempt. This happened on
+  2026-07-31. Order-routing clients go through `ServiceClientConfiguration.DisableAutomaticRetries`,
+  and `IbkrOrderTracker.TryTrack` enforces one broker order per internal order independently.
 
 ## Staged migration — current position
 
@@ -163,8 +168,13 @@ stays on the fixed development figures).
 
 Three rules the implementation holds to:
 
-- **Every one of those three requests is a subscription.** Cancel in a `finally`, or each portfolio
-  read leaks one. `reqPnL` has no `...End` callback and settles on its first non-sentinel callback.
+- **Open those three streams once per connection; never subscribe per read.** TWS caps concurrent
+  `reqAccountSummary` subscriptions at **two**, and `cancelAccountSummary` does not release them —
+  verified live on TWS 223, where the third consecutive portfolio read fails with `error 322`
+  despite a well-formed cancel after every read. The cap is undocumented. Keep the subscriptions
+  registered for the connection's life, key the feed on `ConnectedAt` so a reconnect rebuilds it,
+  and read from the pushed values. `reqPnL` has no `...End` callback and settles on its first
+  non-sentinel push.
 - **Greeks come from quoting positions**, because IBKR exposes no portfolio-Greeks API. Scaled by
   quantity × multiplier so they sum with `PortfolioRiskEvaluator`'s order exposure.
 - **Never default a missing input.** `DailyPnLAvailable`, `GreeksComplete`, and

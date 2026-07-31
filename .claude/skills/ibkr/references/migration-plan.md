@@ -91,9 +91,12 @@ Four things this stage forced:
 - **The reqId-scoped variants, not the account-wide ones.** `reqPositions` has no request id, so it
   cannot be correlated through `IbkrRequestRegistry`; `reqPositionsMulti` can. Same reasoning for
   `reqAccountSummary` over `reqAccountUpdates`.
-- **All three are subscriptions, not queries.** The `...End` callback ends the *initial* delivery and
-  TWS keeps streaming afterwards, so every read cancels in a `finally`. `reqPnL` has no `...End`
-  callback at all — it settles on the first callback carrying a non-sentinel daily P&L.
+- **All three are subscriptions, not queries — open them once per connection.** The `...End` callback
+  ends the *initial* delivery and TWS keeps streaming afterwards. Subscribing and cancelling per read
+  does not work: TWS caps concurrent `reqAccountSummary` subscriptions at two and
+  `cancelAccountSummary` does not release them, so the third consecutive read fails with `error 322`
+  (verified live, cap undocumented). `reqPnL` has no `...End` callback at all — it settles on the
+  first push carrying a non-sentinel daily P&L.
 - **IBKR has no portfolio-Greeks API.** `ExistingGreeks` is built by quoting each open option
   position and scaling by quantity × multiplier, matching how `PortfolioRiskEvaluator` scales the
   incoming order. Capped at `IBKR:MaxPositionsQuoted` (50) against the 100-line market data limit,

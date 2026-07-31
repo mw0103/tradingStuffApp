@@ -113,11 +113,12 @@ public sealed class IbkrAccountClient(
 
     private async Task<IbkrPortfolioSnapshot> ReadPortfolioAsync(string account, CancellationToken cancellationToken)
     {
-        // Sequential on purpose: TWS disconnects a client that exceeds ~50 messages/second, and each
-        // of these is a fast round trip.
-        var summary = await RequestSummaryAsync(cancellationToken);
-        var positionRows = await RequestPositionsAsync(account, cancellationToken);
-        var pnl = await TryRequestPnLAsync(account, cancellationToken);
+        // No round trip: the streams are already open and TWS has been pushing into them.
+        var feed = await EnsureFeedAsync(account, cancellationToken);
+
+        var summary = feed.Summary.Values;
+        var positionRows = feed.Positions.Rows;
+        var pnl = feed.Pnl?.Latest;
 
         var buyingPower = ReadDecimal(summary, account, BuyingPowerTags);
 
@@ -259,39 +260,124 @@ public sealed class IbkrAccountClient(
         return (positions, greeksComplete);
     }
 
-    // ---- requests -----------------------------------------------------------------------------
+    // ---- the connection-scoped feed -------------------------------------------------------------
 
-    private Task<IReadOnlyList<AccountSummaryValue>> RequestSummaryAsync(CancellationToken cancellationToken) =>
-        // "All" rather than the account id: TWS rejects a group naming a single account unless it has
-        // been defined as an account group in TWS itself. Rows are filtered by account on the way out.
-        RequestSubscriptionAsync<AccountSummaryValue>(
-            (client, requestId) => client.reqAccountSummary(requestId, "All", SummaryTags),
-            (client, requestId) => client.cancelAccountSummary(requestId),
-            cancellationToken);
+    /// <summary>The three open streams, and the connection they belong to.</summary>
+    private sealed record AccountFeed(
+        DateTimeOffset ConnectedAt,
+        string Account,
+        AccountSummarySubscription Summary,
+        PositionsSubscription Positions,
+        PnLSubscription? Pnl);
 
-    private Task<IReadOnlyList<AccountPositionRow>> RequestPositionsAsync(
-        string account,
-        CancellationToken cancellationToken) =>
-        RequestSubscriptionAsync<AccountPositionRow>(
-            (client, requestId) => client.reqPositionsMulti(requestId, account, string.Empty),
-            (client, requestId) => client.cancelPositionsMulti(requestId),
-            cancellationToken);
+    private readonly SemaphoreSlim _feedGate = new(1, 1);
+    private AccountFeed? _feed;
 
-    private async Task<AccountPnL?> TryRequestPnLAsync(string account, CancellationToken cancellationToken)
+    /// <summary>
+    /// Returns the open streams for this account, opening them if this connection has none.
+    /// </summary>
+    /// <remarks>
+    /// A subscription belongs to the connection that opened it, so the feed is keyed on the
+    /// connection's <see cref="IbkrConnectionStatus.ConnectedAt"/>. After a reconnect that value
+    /// changes and the feed is rebuilt — serving values frozen at the moment of a disconnect would be
+    /// exactly the stale-risk-input problem this whole stage exists to fix.
+    /// </remarks>
+    private async Task<AccountFeed> EnsureFeedAsync(string account, CancellationToken cancellationToken)
     {
-        var client = connection.RequireClient();
-        var registry = connection.Registry;
-        var requestId = registry.NextRequestId();
-        var request = new PnLRequest();
+        var connectedAt = connection.GetStatus().ConnectedAt
+                          ?? throw new IbkrConnectionException("Not connected to TWS.");
 
-        registry.Register(requestId, request);
+        if (IsUsable(_feed, account, connectedAt) is { } live)
+        {
+            return live;
+        }
+
+        await _feedGate.WaitAsync(cancellationToken);
 
         try
         {
-            client.reqPnL(requestId, account, string.Empty);
+            if (IsUsable(_feed, account, connectedAt) is { } settled)
+            {
+                return settled;
+            }
 
-            return await request.Task
+            var feed = await OpenFeedAsync(account, connectedAt, cancellationToken);
+            _feed = feed;
+
+            return feed;
+        }
+        finally
+        {
+            _feedGate.Release();
+        }
+    }
+
+    /// <summary>The feed, if it belongs to this connection and account and none of its streams died.</summary>
+    private static AccountFeed? IsUsable(AccountFeed? feed, string account, DateTimeOffset connectedAt) =>
+        feed is not null
+        && feed.ConnectedAt == connectedAt
+        && string.Equals(feed.Account, account, StringComparison.OrdinalIgnoreCase)
+        && feed.Summary.Failure is null
+        && feed.Positions.Failure is null
+            ? feed
+            : null;
+
+    private async Task<AccountFeed> OpenFeedAsync(
+        string account,
+        DateTimeOffset connectedAt,
+        CancellationToken cancellationToken)
+    {
+        var client = connection.RequireClient();
+        var registry = connection.Registry;
+        var timeout = TimeSpan.FromSeconds(_options.RequestTimeoutSeconds);
+
+        var summary = new AccountSummarySubscription();
+        var summaryId = registry.NextRequestId();
+        registry.Register(summaryId, summary);
+
+        // "All" rather than the account id: TWS rejects a group naming a single account unless it has
+        // been defined as an account group in TWS itself. Rows are filtered by account on the way out.
+        client.reqAccountSummary(summaryId, "All", SummaryTags);
+
+        var positions = new PositionsSubscription();
+        var positionsId = registry.NextRequestId();
+        registry.Register(positionsId, positions);
+        client.reqPositionsMulti(positionsId, account, string.Empty);
+
+        await summary.InitialDelivery.WaitAsync(timeout, cancellationToken);
+        await positions.InitialDelivery.WaitAsync(timeout, cancellationToken);
+
+        var pnl = await TryOpenPnLAsync(client, registry, account, cancellationToken);
+
+        logger.LogInformation(
+            "Opened account streams for the connection established at {ConnectedAt} " +
+            "(summary {SummaryId}, positions {PositionsId}, P&L {PnLState}).",
+            connectedAt,
+            summaryId,
+            positionsId,
+            pnl is null ? "unavailable" : "open");
+
+        return new AccountFeed(connectedAt, account, summary, positions, pnl);
+    }
+
+    private async Task<PnLSubscription?> TryOpenPnLAsync(
+        EClientSocket client,
+        IbkrRequestRegistry registry,
+        string account,
+        CancellationToken cancellationToken)
+    {
+        var pnl = new PnLSubscription();
+        var pnlId = registry.NextRequestId();
+        registry.Register(pnlId, pnl);
+
+        try
+        {
+            client.reqPnL(pnlId, account, string.Empty);
+
+            await pnl.InitialDelivery
                 .WaitAsync(TimeSpan.FromSeconds(_options.PnLTimeoutSeconds), cancellationToken);
+
+            return pnl;
         }
         catch (Exception ex) when (ex is TimeoutException or IbkrRequestException)
         {
@@ -301,59 +387,8 @@ public sealed class IbkrAccountClient(
                 ex,
                 "Daily P&L is unavailable; the MAX_DAILY_LOSS risk check cannot fire on this snapshot.");
 
+            registry.Remove(pnlId);
             return null;
-        }
-        finally
-        {
-            TryCancel(client, requestId, (socket, id) => socket.cancelPnL(id));
-            registry.Remove(requestId);
-        }
-    }
-
-    /// <summary>
-    /// Issues a subscription that reports an initial snapshot terminated by an <c>...End</c> callback,
-    /// then cancels it.
-    /// </summary>
-    /// <remarks>
-    /// Unlike <c>reqContractDetails</c>, none of these requests complete on their own: the
-    /// <c>...End</c> callback ends the <em>initial</em> delivery and TWS keeps streaming updates
-    /// afterwards. Skipping the cancel leaks a subscription per read.
-    /// </remarks>
-    private async Task<IReadOnlyList<T>> RequestSubscriptionAsync<T>(
-        Action<EClientSocket, int> send,
-        Action<EClientSocket, int> cancel,
-        CancellationToken cancellationToken)
-    {
-        var client = connection.RequireClient();
-        var registry = connection.Registry;
-        var requestId = registry.NextRequestId();
-        var request = new ListRequest<T>();
-
-        registry.Register(requestId, request);
-
-        try
-        {
-            send(client, requestId);
-
-            return await request.Task
-                .WaitAsync(TimeSpan.FromSeconds(_options.RequestTimeoutSeconds), cancellationToken);
-        }
-        finally
-        {
-            TryCancel(client, requestId, cancel);
-            registry.Remove(requestId);
-        }
-    }
-
-    private void TryCancel(EClientSocket client, int requestId, Action<EClientSocket, int> cancel)
-    {
-        try
-        {
-            cancel(client, requestId);
-        }
-        catch (Exception ex)
-        {
-            logger.LogDebug(ex, "Ignoring failure to cancel account subscription {RequestId}.", requestId);
         }
     }
 

@@ -49,21 +49,43 @@ public sealed class IbkrOrderTracker(ILogger<IbkrOrderTracker> logger)
     // ExecId -> IBKR order id, so a commission report arriving separately can find its order.
     private readonly ConcurrentDictionary<string, int> _executionOrderIds = new();
 
+    // Internal order id -> IBKR order id. Enforces one broker order per internal order, and is the
+    // claim that makes that check atomic against concurrent placement attempts.
+    private readonly ConcurrentDictionary<Guid, int> _orderIdByInternalId = new();
+
     private ListRequest<OpenOrderSummary>? _openOrdersSweep;
 
-    /// <summary>Registers an order before it is transmitted, so no callback can arrive unowned.</summary>
+    /// <summary>
+    /// Claims an internal order id and registers the order, before it is transmitted.
+    /// </summary>
+    /// <remarks>
+    /// Registering first means no callback can arrive unowned. Claiming first means the same internal
+    /// order cannot be transmitted twice: the claim is a <see cref="ConcurrentDictionary{TKey,TValue}.TryAdd"/>,
+    /// so two concurrent attempts cannot both win it. Returns false when the internal order already
+    /// has a broker order, in which case the caller must not place.
+    /// </remarks>
     /// <param name="legIndexByConId">
     /// Maps each leg's IBKR conId to its index in the original request, so executions can be
     /// attributed to the right leg.
     /// </param>
-    public void Track(
+    public bool TryTrack(
         int ibkrOrderId,
         Guid? clientOrderId,
         Guid internalOrderId,
         IReadOnlyDictionary<int, int> legIndexByConId)
     {
+        if (!_orderIdByInternalId.TryAdd(internalOrderId, ibkrOrderId))
+        {
+            return false;
+        }
+
         _orders[ibkrOrderId] = new TrackedOrder(ibkrOrderId, clientOrderId, internalOrderId, legIndexByConId);
+        return true;
     }
+
+    /// <summary>The broker order already placed for an internal order, if there is one.</summary>
+    public IbkrOrderState? FindByInternalOrderId(Guid internalOrderId) =>
+        _orderIdByInternalId.TryGetValue(internalOrderId, out var ibkrOrderId) ? Get(ibkrOrderId) : null;
 
     // ---- open order reconciliation ----------------------------------------------------------
     // reqAllOpenOrders carries no request id, and neither do openOrder/openOrderEnd, so this cannot

@@ -56,9 +56,11 @@ this section has been, so treat this one as unverified until a live read is done
   `reqPositionsMulti` (positions), and `reqPnL` (daily P&L).
 - **The reqId-scoped request variants**, not `reqPositions` / `reqAccountUpdates`. The account-wide
   forms carry no request id, so `IbkrRequestRegistry` cannot correlate them or fault them on error.
-- **All three are subscriptions.** Their `...End` callback terminates the *initial* delivery only;
-  TWS streams updates afterwards, so every read cancels in a `finally`. `reqPnL` has no `...End`
-  callback at all and settles on the first callback with a non-sentinel daily P&L.
+- **All three are opened once per connection and read many times**, not subscribed and cancelled per
+  read — see the account-summary cap below. They stay registered in `IbkrRequestRegistry` for the
+  life of the connection, and the feed is keyed on `IbkrConnectionStatus.ConnectedAt` so a reconnect
+  rebuilds rather than serving values frozen at the disconnect. A portfolio read is therefore zero
+  round trips. `reqPnL` has no `...End` callback and settles on its first non-sentinel daily P&L.
 - **`ExistingGreeks` is built by quoting the open positions** — IBKR has no portfolio-Greeks API —
   scaled by quantity × multiplier so it sums with the order exposure `PortfolioRiskEvaluator`
   computes. Capped at `IBKR:MaxPositionsQuoted` (50) against the 100-line market data limit, and
@@ -75,6 +77,31 @@ this section has been, so treat this one as unverified until a live read is done
 - **Known limit:** `PositionSnapshot` carries an `OptionContract`, so equity and futures positions in
   the account have no representation. They are counted and warned about, not counted against the
   Greek limits.
+
+### Bugs the stage 5 live run exposed (2026-07-31)
+
+Both found by running against the paper account, both fixed, neither reachable by the unit suite
+before the regression tests added with them.
+
+- **An HTTP retry placed the same order at the broker twice.** `AddServiceDefaults` applies
+  `AddStandardResilienceHandler` to every internal client, which retries on its 10s per-attempt
+  timeout. The gateway waits `IBKR:OrderSettleTimeoutSeconds` (20s) for an order to settle, so a
+  combo that rested longer than 10s was re-sent: one SPXW vertical went out as IBKR order 16, was
+  retried as order 17, and ExecutionService recorded only 17's rejection while **order 16 stayed
+  working at TWS, unknown to the service that placed it**. Two fixes, deliberately independent:
+  `ServiceClientConfiguration.DisableAutomaticRetries` strips retries from the order client
+  (the cause), and `IbkrOrderTracker.TryTrack` now claims the internal order id with an atomic
+  `TryAdd` so one internal order can only ever become one broker order (defence in depth, and it
+  holds against any duplicate caller, not just this retry policy).
+- **TWS caps concurrent `reqAccountSummary` subscriptions at two, and `cancelAccountSummary` does
+  not release them.** Reads one and two succeed; the third fails with
+  `error 322: Maximum number of account summary requests exceeded; desubscribe to previous request
+  first`. The cancel is issued with the correct request id after every read, is well-formed
+  (`createCancelAccountSummaryRequestProto` sets `ReqId`, `Util.IsValidValue` passes), does not
+  throw, and reports no error — TWS keeps counting the subscription regardless. **This cap is
+  undocumented**: IBKR's account-summary and message-code pages do not mention it, and 322 is
+  documented only as "duplicate ticker id". Fixed by opening the account streams once per connection
+  instead, which is the shape these APIs are designed for anyway.
 
 ### Bugs the live round trip exposed
 
@@ -123,6 +150,19 @@ normally — that is what unblocked the round trip above.
 **TWS may reset API connections** (accepts the socket, then `RST`) when a modal dialog is awaiting
 input. The gateway now backs off on short-lived sessions instead of reconnecting every few seconds,
 but a flapping connection means TWS needs attention.
+
+**Diagnose connection problems below the adapter before suspecting it.** A socket that connects, gets
+a version-handshake reply, then stalls or resets on `START_API` is TWS refusing the API session — no
+C# involved. `~/tws-api-probe.py` does exactly that handshake in twenty lines and prints whether
+`managedAccounts` came back; use it to tell "TWS is not accepting API sessions" from "the gateway is
+broken". A TWS that is logged in (check for established connections to IBKR on ports 4000/4001) and
+listening on 7497 can still refuse `START_API` — check **Trusted IPs** contains `127.0.0.1`,
+*Allow connections from localhost only*, *Master API client ID* blank or 0, and restart TWS after
+changing any of them.
+
+**Shut the gateway down gracefully or TWS keeps the session.** `SIGINT`/`SIGTERM` must reach the
+built binary, not the `dotnet run` wrapper, or `IbkrConnection.StopAsync` never runs `eDisconnect`
+and TWS holds a dead API session. A clean stop logs `Application is shutting down...`.
 
 To route orders through IBKR, with the gateway running:
 

@@ -17,13 +17,65 @@ public sealed class IbkrOrderTrackerTests
     {
         var tracker = NewTracker();
         internalId = Guid.NewGuid();
-        tracker.Track(orderId, Guid.NewGuid(), internalId, LegIndexByConId);
+        tracker.TryTrack(orderId, Guid.NewGuid(), internalId, LegIndexByConId);
         return tracker;
     }
 
     private static Contract Leg(int conId) => new() { ConId = conId, SecType = "OPT" };
 
     private static Contract Bag() => new() { ConId = 0, SecType = "BAG" };
+
+    // ---- one broker order per internal order ------------------------------------------------
+    // Regression: on 2026-07-31 an HTTP retry re-sent a resting combo, so the same internal order
+    // reached TWS as orders 16 and 17. The caller saw only 17's rejection while 16 stayed working.
+
+    [Fact]
+    public void An_internal_order_can_only_be_tracked_once()
+    {
+        var tracker = NewTracker();
+        var internalId = Guid.NewGuid();
+
+        Assert.True(tracker.TryTrack(16, Guid.NewGuid(), internalId, LegIndexByConId));
+        Assert.False(tracker.TryTrack(17, Guid.NewGuid(), internalId, LegIndexByConId));
+    }
+
+    [Fact]
+    public void A_refused_second_claim_leaves_the_first_order_reachable()
+    {
+        // The caller returns this state instead of placing again, so it must be the original order.
+        var tracker = NewTracker();
+        var internalId = Guid.NewGuid();
+
+        tracker.TryTrack(16, Guid.NewGuid(), internalId, LegIndexByConId);
+        tracker.TryTrack(17, Guid.NewGuid(), internalId, LegIndexByConId);
+
+        Assert.Equal(16, tracker.FindByInternalOrderId(internalId)?.IbkrOrderId);
+        Assert.Null(tracker.Get(17));
+    }
+
+    [Fact]
+    public void A_terminal_first_attempt_still_blocks_a_second_placement()
+    {
+        // The claim is not released on rejection. A retry after a reject is still a duplicate
+        // submission of an order the caller already has an answer for.
+        var tracker = NewTracker();
+        var internalId = Guid.NewGuid();
+
+        tracker.TryTrack(16, Guid.NewGuid(), internalId, LegIndexByConId);
+        tracker.ApplyError(16, 163, "price exceeds the Percentage constraint of 3%.");
+
+        Assert.Equal(OrderLifecycleStatus.Failed, tracker.Get(16)?.Status);
+        Assert.False(tracker.TryTrack(17, Guid.NewGuid(), internalId, LegIndexByConId));
+    }
+
+    [Fact]
+    public void Distinct_internal_orders_are_tracked_independently()
+    {
+        var tracker = NewTracker();
+
+        Assert.True(tracker.TryTrack(16, Guid.NewGuid(), Guid.NewGuid(), LegIndexByConId));
+        Assert.True(tracker.TryTrack(17, Guid.NewGuid(), Guid.NewGuid(), LegIndexByConId));
+    }
 
     [Fact]
     public void A_precautionary_rejection_settles_the_order_as_failed()
