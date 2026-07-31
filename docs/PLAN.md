@@ -133,6 +133,10 @@ approved against fabricated inputs. Two limits remain even on the real source: e
 positions cannot be represented by `PositionSnapshot`, so their exposure is reported as a warning
 rather than counted; and a position whose Greeks cannot be quoted is flagged rather than estimated.
 
+A thirteenth code, `MISSING_QUOTE`, rejects an order whose legs are not all quoted. Every money and
+Greek limit is computed from quotes, so an unquoted leg contributes nothing and the order would
+otherwise read as risk-free and pass every check.
+
 Every risk decision should retain inputs, quote snapshot references, computed exposure, result, and
 reason codes once persistence is added.
 
@@ -152,8 +156,9 @@ reason codes once persistence is added.
 No test may reach a broker. The default `dotnet test` run stays entirely on simulated execution and
 the deterministic market-data provider.
 
-Coverage is currently inverted against risk: the broker adapter is heavily tested while the risk
-engine has one of twelve breach codes covered. Correcting that precedes further feature work.
+All thirteen breach codes are covered, each by a test that makes exactly one limit bite so a failure
+names the rule that broke. Writing them found the evaluator correlating quotes on the whole
+`OptionContract` record, which fails open — see `docs/STATE.md`.
 
 ## Assumptions
 
