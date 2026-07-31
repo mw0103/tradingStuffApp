@@ -97,18 +97,24 @@ one), then match the work against this table:
 | ALL leakage reviews and order-safety reviews, any phase | Opus | high |
 | UI (`ClientApp/`) and documentation work | Haiku | low |
 
-**The two exceptions, and only these:**
-1. The user explicitly says not to apply this policy (for this task, or generally).
-2. The user explicitly names a specific model or effort level to use for the task.
+**The two exceptions, and only these — both require words in the prompt itself:**
+1. The prompt says not to apply this policy (for this task, or generally).
+2. The prompt names a specific model or effort level to use for this task.
 
-Absent either, apply the policy without asking and without waiting for confirmation:
+**A `/model` switch is NOT an exception**, no matter how immediately it precedes the prompt.
+Changing the session model is ambient state, not an instruction, and is at least as likely to be a
+mistake, a leftover from earlier work, or unrelated to the task being asked for. "The user selected
+Opus, so they must want Opus for this" is exactly the inference this policy exists to prevent —
+only an explicit in-prompt instruction overrides the table.
+
+Absent an in-prompt exception, apply the policy without asking and without waiting for confirmation:
 
 - **Main-loop work**: if the active session model/effort does not match the row for the work about
-  to start, say so in one line, then act on the mismatch rather than merely noting it — prefer
-  delegating the work to the matching pinned agent below over doing it inline on the wrong model.
-  If delegation is impractical (e.g. a one-line fix mid-task, or the user is actively driving the
-  session interactively on a fixed model), state that plainly and proceed on the session's model
-  rather than silently pretending the mismatch doesn't exist.
+  to start, say so in one line and **delegate that work to the matching pinned agent below** — do
+  not do it inline on the wrong model. Delegation is the default remedy, not a preference. Only
+  when delegation is genuinely impossible (a one-line fix mid-task; the work is inseparable from an
+  interactive back-and-forth) may the work proceed on the session's model, and then only by saying
+  so plainly first.
 - **Delegated work (Agent/Workflow tool calls)**: always pass the `model` (and `effort` inside
   Workflow's `agent()` calls) matching the table — this is fully within direct control and has no
   excuse for drifting from policy.
