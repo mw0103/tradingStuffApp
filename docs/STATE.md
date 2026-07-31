@@ -442,6 +442,33 @@ unrecorded but nobody watched it end, so `ended_at` is an upper bound rather tha
   restarts. With a deliberately wrong connection string the gateway logged Critical and still
   traded, which is `RequireOrderPersistence=false` behaving as documented.
 
+**Defect: an evicted lease's gap was never closed, on purpose.** `SweepExpiredAsync` opened a
+`line_evicted` gap and deliberately left it open, reasoning that the lease is finished permanently.
+That reasoning is right about the lease and wrong about the row: `CoverageMonitor` does not read an
+unended gap as "this lease ended", it reads it as "recording is missing, and still missing", against
+every window from then on. Because ResearchService is expected to redeploy constantly — that is the
+stated reason the recorder lives in the gateway rather than beside it — each redeploy abandons its
+~54 node leases, the gateway evicts them after 3 missed heartbeats, and **one redeploy would poison
+coverage forever**. Observed live: 80 immortal gaps from a single afternoon of restarts. Fixed by
+bounding the gap at teardown with `closed_by = 'inferred'`. The real question ("was this conId
+covered?") is answered by the per-conId tick counts, which span lease changes; the row now only
+explains where one lease's stream stopped.
+
+**Defect: every `/ui/*` path returned 404 while the service reported healthy.** Two independent
+causes, both invisible to the build. First, `WebApplication` inserts `UseRouting` ahead of all user
+middleware, so the `/ui/{**slug}` SPA fallback was selected as an endpoint before
+`StaticFileMiddleware` ran — and that middleware deliberately does nothing once an endpoint is
+chosen, so no real asset was ever reachable. Routing is now declared explicitly after
+`UseStaticFiles`. Second, the fallback's `StaticFileOptions` carried `RequestPath = "/ui"`, but the
+fallback rewrites the path to the bare file name, which can never carry that prefix, so the lookup
+missed every time. Separately, Vite writes into `wwwroot` after MSBuild evaluation, so the SDK's
+implicit glob matched nothing and the assets never reached `bin/` or a publish output — a published
+service would have shipped with no UI at all. All three fixed and verified by loading both pages.
+
+**Known nit, not fixed:** `/ui/backfill` can render a negative relative age ("-95s ago") when the
+Postgres container's clock leads the browser's. Cosmetic, but a negative age on an operator
+dashboard reads as a bug in the data rather than in the clock; worth clamping at zero.
+
 **Live observation worth keeping:** portfolio positions come back with `exchange: "AMEX"` while
 chains and quotes use `SMART`. `PortfolioRiskEvaluator` joins quotes to order legs by whole-record
 equality, so this would silently zero every Greeks and max-loss check if the two ever met — they do

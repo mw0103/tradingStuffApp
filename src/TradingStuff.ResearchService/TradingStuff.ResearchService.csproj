@@ -37,4 +37,17 @@
     <Exec Command="npm run build" WorkingDirectory="ClientApp" />
   </Target>
 
+  <!--
+    Vite writes into wwwroot AFTER evaluation, so the SDK's implicit wwwroot glob has already run and
+    matched nothing. Without this the assets never reach bin/ or a publish output, and the service
+    starts perfectly while every /ui/* path 404s — found by curling the running app rather than by
+    building it. Globbed inside a target that runs after the SPA build so the item list is populated
+    from what Vite actually emitted.
+  -->
+  <Target Name="IncludeClientAppOutput" AfterTargets="BuildClientApp" BeforeTargets="AssignTargetPaths">
+    <ItemGroup>
+      <Content Include="wwwroot\**" CopyToOutputDirectory="PreserveNewest" CopyToPublishDirectory="PreserveNewest" />
+    </ItemGroup>
+  </Target>
+
 </Project>

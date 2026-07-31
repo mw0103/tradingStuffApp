@@ -51,24 +51,25 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<EsContractWalker>(
 
 var app = builder.Build();
 
+var spaFiles = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(
+    Path.Combine(app.Environment.ContentRootPath, "wwwroot"));
+
+// Static files MUST run before routing, and routing is therefore declared explicitly here.
+// WebApplication otherwise inserts UseRouting at the very top of the pipeline, ahead of all user
+// middleware — and StaticFileMiddleware deliberately does nothing when an endpoint has already been
+// selected. The /ui/{**slug} SPA fallback below matches every path under /ui, so with the implicit
+// ordering the real files were never reachable and every asset 404'd while the service looked
+// perfectly healthy. Found by curling the running app; nothing about the build reports it.
+app.UseStaticFiles(new StaticFileOptions { RequestPath = "/ui", FileProvider = spaFiles });
+
+app.UseRouting();
 app.UseAuthentication();
 app.UseAuthorization();
 
-// Serve the React SPA from wwwroot under /ui
-app.UseStaticFiles(new StaticFileOptions
-{
-    RequestPath = "/ui",
-    FileProvider = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(
-        Path.Combine(app.Environment.ContentRootPath, "wwwroot"))
-});
-
-// Fallback to index.html for client-side routing, scoped to /ui so the API routes work
-app.MapFallbackToFile("/ui/{**slug}", "index.html", new StaticFileOptions
-{
-    RequestPath = "/ui",
-    FileProvider = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(
-        Path.Combine(app.Environment.ContentRootPath, "wwwroot"))
-});
+// Fallback to index.html for client-side routing, scoped to /ui so the API routes work. No
+// RequestPath here, unlike the middleware above: the fallback rewrites the path to the file name
+// itself, which can never carry the /ui prefix, so setting one makes the lookup miss every time.
+app.MapFallbackToFile("/ui/{**slug}", "index.html", new StaticFileOptions { FileProvider = spaFiles });
 
 // Redirect /ui or /ui/ to /ui/coverage
 app.MapGet("/ui", () => Results.Redirect("/ui/coverage", permanent: false));

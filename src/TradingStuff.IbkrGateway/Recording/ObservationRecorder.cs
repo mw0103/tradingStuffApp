@@ -255,7 +255,17 @@ public sealed class ObservationRecorder : IObservationSink, IAsyncDisposable
     }
 
     /// <summary>Closes the open gap for <paramref name="scope"/>, if there is one.</summary>
-    public async Task CloseGapAsync(string scope)
+    /// <param name="observed">
+    /// True when recording was actually seen to resume (a tick arrived). False when the scope is
+    /// merely known to be finished — an evicted lease, say — where the end is a bound rather than a
+    /// measurement, and is recorded as <c>inferred</c>.
+    /// </param>
+    /// <remarks>
+    /// Every gap MUST eventually be closed by someone. CoverageMonitor reads an unended gap as an
+    /// outage that is still in progress, so a row left open on purpose does not read as "this
+    /// subscription is over" — it reads as "coverage is broken, and will be for all future windows."
+    /// </remarks>
+    public async Task CloseGapAsync(string scope, bool observed = true)
     {
         if (_dataSource is null || !_openGapIdByScope.TryRemove(scope, out var gapId))
         {
@@ -265,8 +275,9 @@ public sealed class ObservationRecorder : IObservationSink, IAsyncDisposable
         try
         {
             await using var command = _dataSource.CreateCommand(
-                "UPDATE gateway.recorder_gaps SET ended_at = now(), closed_by = 'observed' WHERE gap_id = $1");
+                "UPDATE gateway.recorder_gaps SET ended_at = now(), closed_by = $2 WHERE gap_id = $1");
             command.Parameters.AddWithValue(gapId);
+            command.Parameters.AddWithValue(observed ? "observed" : "inferred");
             await command.ExecuteNonQueryAsync();
 
             _logger.LogInformation("Recording gap closed: scope={Scope} gapId={GapId}.", scope, gapId);

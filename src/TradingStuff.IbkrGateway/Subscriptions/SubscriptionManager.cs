@@ -178,15 +178,32 @@ public sealed class SubscriptionManager : BackgroundService
                 "Lease {LeaseId} (conId {ConId}) expired without a heartbeat; evicting.",
                 active.LeaseId, active.ConId);
 
+            var scope = ObservationRecorder.LeaseScope(active.LeaseId);
+
             if (active.RecordToDatabase)
             {
-                // Deliberately left open: this lease is done, permanently. A future re-lease of the
-                // same conId gets a fresh leaseId and its own gap scope — see ObservationRecorder's
-                // remarks on why gap scope is per-lease, not per-conId.
-                await _recorder.OpenGapAsync(ObservationRecorder.LeaseScope(active.LeaseId), "line_evicted", cancellationToken);
+                await _recorder.OpenGapAsync(scope, "line_evicted", cancellationToken);
             }
 
             await TeardownAsync(active, cancellationToken);
+
+            if (active.RecordToDatabase)
+            {
+                // Bounded at teardown, NOT left open. An earlier version left it open on the
+                // reasoning that this lease is finished permanently, which is true — but a gap row
+                // is not read as "this lease ended", it is read by CoverageMonitor as "recording is
+                // missing, and still missing", against every window from here to eternity. Since
+                // ResearchService is expected to redeploy constantly (that is the whole reason the
+                // recorder lives in the gateway), each redeploy abandons its ~54 node leases, and
+                // one redeploy would otherwise poison coverage forever. Observed live: 80 immortal
+                // gaps from a single afternoon's restarts.
+                //
+                // 'inferred', because nothing watched recording resume — after teardown no data was
+                // owed on this scope at all. The genuine question ("was this conId covered?") is
+                // answered by CoverageMonitor's per-conId tick counts, which span lease changes;
+                // this row only explains where one lease's stream stopped.
+                await _recorder.CloseGapAsync(scope, observed: false);
+            }
         }
     }
 
