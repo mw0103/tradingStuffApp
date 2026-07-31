@@ -6,8 +6,20 @@ public sealed class PaperExecutionEngine
 {
     public PaperExecutionResult Execute(Guid orderId, SubmitOrderRequest order, IReadOnlyList<QuoteSnapshot> quotes)
     {
-        var quoteByContract = quotes.ToDictionary(quote => quote.Contract);
-        var netDebit = CalculateNetDebit(order, quoteByContract);
+        // Keyed on contract identity rather than the whole OptionContract record: a quote returned by
+        // a broker-backed provider carries fields the inbound request leg does not, and record
+        // equality would then miss every lookup. Last quote wins if a provider sends duplicates.
+        var quoteByContract = quotes
+            .GroupBy(quote => quote.Contract.Key())
+            .ToDictionary(group => group.Key, group => group.Last());
+
+        if (!TryResolveLegQuotes(order, quoteByContract, out var legQuotes))
+        {
+            // A leg we have no quote for cannot be priced, so it cannot be filled.
+            return new PaperExecutionResult(OrderLifecycleStatus.Failed, []);
+        }
+
+        var netDebit = CalculateNetDebit(order, legQuotes);
 
         if (!IsExecutable(order, netDebit))
         {
@@ -17,7 +29,7 @@ public sealed class PaperExecutionEngine
         var fills = order.Legs
             .Select((leg, index) =>
             {
-                var quote = quoteByContract[leg.Contract];
+                var quote = legQuotes[index];
                 var price = leg.Side == OrderSide.Buy ? quote.Ask : quote.Bid;
 
                 return new FillReport(
@@ -34,6 +46,29 @@ public sealed class PaperExecutionEngine
         return new PaperExecutionResult(OrderLifecycleStatus.Filled, fills);
     }
 
+    /// <summary>Resolves one quote per leg, positionally. Fails closed if any leg is unquoted.</summary>
+    private static bool TryResolveLegQuotes(
+        SubmitOrderRequest order,
+        IReadOnlyDictionary<OptionContractKey, QuoteSnapshot> quoteByContract,
+        out QuoteSnapshot[] legQuotes)
+    {
+        var resolved = new QuoteSnapshot[order.Legs.Count];
+
+        for (var index = 0; index < order.Legs.Count; index++)
+        {
+            if (!quoteByContract.TryGetValue(order.Legs[index].Contract.Key(), out var quote))
+            {
+                legQuotes = [];
+                return false;
+            }
+
+            resolved[index] = quote;
+        }
+
+        legQuotes = resolved;
+        return true;
+    }
+
     private static bool IsExecutable(SubmitOrderRequest order, decimal netDebit) =>
         order.OrderType switch
         {
@@ -47,15 +82,14 @@ public sealed class PaperExecutionEngine
             _ => false
         };
 
-    private static decimal CalculateNetDebit(
-        SubmitOrderRequest order,
-        IReadOnlyDictionary<OptionContract, QuoteSnapshot> quoteByContract)
+    private static decimal CalculateNetDebit(SubmitOrderRequest order, QuoteSnapshot[] legQuotes)
     {
         var netDebit = 0m;
 
-        foreach (var leg in order.Legs)
+        for (var index = 0; index < order.Legs.Count; index++)
         {
-            var quote = quoteByContract[leg.Contract];
+            var leg = order.Legs[index];
+            var quote = legQuotes[index];
             var fillPrice = leg.Side == OrderSide.Buy ? quote.Ask : quote.Bid;
             var signedPrice = leg.Side == OrderSide.Buy ? fillPrice : -fillPrice;
             netDebit += signedPrice * leg.Quantity;

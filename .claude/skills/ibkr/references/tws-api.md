@@ -1,8 +1,15 @@
 # TWS API (IBApi) mechanics
 
-Verify signatures against the installed `IBApi` version before writing code — callback signatures do
-change between TWS API releases (the `error` callback in particular). Official reference:
-<https://interactivebrokers.github.io/tws-api/>
+The API is vendored at `third_party/IBApi` — **TWS API 10.45.01**. Read the actual signatures from
+`third_party/IBApi/src/EWrapper.cs` rather than trusting an online tutorial; callbacks change
+between releases, and most published examples predate 10.3x. Two renames that break older samples:
+
+- `commissionReport` → **`commissionAndFeesReport`** (`CommissionAndFeesReport`)
+- `error(int, int, string, string)` → **`error(int id, long errorTime, int code, string msg, string advancedOrderRejectJson)`**
+
+Official reference: <https://interactivebrokers.github.io/tws-api/>
+
+Everything below was verified against a live paper account (TWS server version 223).
 
 ## Connection lifecycle
 
@@ -52,6 +59,12 @@ On reconnect: use a **new** `clientId`-scoped state — re-request `nextValidId`
 market data, and rebuild the conId cache only if it was invalidated. Reconnect with backoff; do not
 tight-loop `eConnect`.
 
+**Back off on short-lived sessions, not just failed connects.** TWS will accept the TCP connection
+and then immediately `RST` it (*"Connection reset by peer"* out of `EReader`) when a modal dialog is
+awaiting input, when the client id is already in use, or when the API connection limit is reached.
+A backoff that resets on a *successful* connect then reconnects at the base interval forever, because
+each attempt "succeeds" before dying a second later. Treat a session shorter than ~30s as a failure.
+
 ## Contract resolution — always resolve conId first
 
 Never construct a `Contract` by hand and place an order on it. Resolve it:
@@ -91,7 +104,45 @@ Notes that matter for `GET /market-data/options/chains/{underlying}`:
   (expiry, strike) pair exists. Filter to a strike window around spot rather than materialising
   everything — the current deterministic provider returns 11 strikes × 2 rights; that is a sane
   default window to preserve.
-- Multiple callbacks arrive, one per exchange/tradingClass. Deduplicate; prefer the `SMART` row.
+
+### Do not select the chain segment by `SMART`
+
+One callback arrives per (exchange, tradingClass) — **39 of them for SPY**. Two traps, both
+confirmed against a live paper account:
+
+1. **Adjusted option classes sit alongside the standard one.** A corporate action leaves behind a
+   digit-prefixed trading class (`2SPY`) listing a handful of strikes. Treat one as the chain and
+   you get a near-empty, untradeable result.
+2. **There is often no `SMART` segment for the standard class.** SPY's *only* `SMART` row is the
+   adjusted `2SPY` class — 3 expirations, 3 strikes. The real chain (`tradingClass = SPY`, 35
+   expirations, 489 strikes) appears on `NASDAQOM`, `AMEX`, `CBOE`, and the rest, but **never on
+   `SMART`**. Preferring `SMART` actively selects the wrong segment, and it fails quietly: you get a
+   plausible-looking chain with a handful of strikes.
+
+Select on **`tradingClass == underlying symbol`**, breaking ties by strike count. `SMART` is still
+the correct exchange to route and quote on — it just is not how the segment is identified.
+Implemented in `IbkrMarketDataClient.SelectChainSegment`, with the SPY case pinned in tests.
+
+### Index options (SPX) differ in four ways
+
+Confirmed live. Any of these alone stops SPX working:
+
+1. **The underlying is `IND`, not `STK`.** SPX resolves to nothing as a stock. It is `SecType = "IND"`
+   on `CBOE` (conId 416904). `ResolveUnderlyingAsync` probes STK then IND, so any index works
+   without a hard-coded symbol list. The same `SecType` must then be passed as
+   `reqSecDefOptParams`'s `underlyingSecType`.
+2. **Two series share every strike and expiration.** `SPX` is AM-settled monthlies (20 expirations,
+   574 strikes); **`SPXW`** is PM-settled weeklies and dailies (39 expirations, 728 strikes) — and
+   SPXW is what trades in extended hours. `tradingClass == symbol` picks the monthlies, so pass an
+   explicit trading class for index options.
+3. **`Contract.TradingClass` must be set when resolving.** Otherwise `reqContractDetails` matches both
+   SPX and SPXW at the same strike/expiry and resolution takes whichever arrives first. This is why
+   `OptionContract.TradingClass` exists and is part of `OptionContractKey`.
+4. **`Order.OutsideRth = true` is required outside 09:30–16:15 ET.** SPX/SPXW run nearly 24×5 in
+   global trading hours; without the flag a pre-market order is held rather than worked.
+
+SPXW quotes pre-market are real and tight — e.g. 7435C 32.30/32.60 with delta 0.662 at ~08:15 ET,
+where SPY at the same moment had no book at all.
 
 ## Market data and Greeks
 
@@ -151,12 +202,61 @@ client.placeOrder(orderId, bag, order);
 - `ComboLeg.Ratio` is a **ratio**, and `Order.TotalQuantity` is the **number of spreads**. A 2-lot
   1×1 vertical is `Ratio = 1` on each leg with `TotalQuantity = 2` — not `Ratio = 2`. Getting this
   wrong silently trades the wrong size. `OrderLegRequest.Quantity` in Contracts is per-leg absolute
-  quantity, so the adapter must factor out the GCD to derive ratios + spread count.
+  quantity, so the adapter factors out the GCD to derive ratios + spread count
+  (`IbkrOrderBuilder.SpreadCount` / `.Ratios`).
 - Net credit is expressed as a **negative** `LmtPrice`. `PaperExecutionEngine.CalculateNetDebit`
-  already produces a signed net using the same convention (buy positive, sell negative), so its sign
-  convention carries over — but it multiplies by leg quantity, so divide back to per-spread.
+  produces a signed net with the same convention (buy positive, sell negative) — but it multiplies by
+  leg quantity, making `SubmitOrderRequest.LimitPrice` a **whole-order** net, while TWS wants the net
+  for **one combo unit**. `IbkrOrderBuilder.PerSpreadPrice` divides by the spread count. The two are
+  identical at one spread, which is exactly why this is easy to miss.
+- Set `Order.Action = "BUY"` and carry direction in the leg actions. Setting `"SELL"` on the combo
+  inverts every leg.
 - Prefer `"LMT"`. Market orders on option combos are commonly rejected or fill poorly.
-- Fills arrive **per leg**, which matches `FillReport.LegIndex`. Map by `execDetails` conId → leg.
+### Combo fills: three executions for a two-leg spread
+
+A filled combo produces an execution for the **BAG itself** carrying the net price, **plus one per
+leg**. Confirmed on a filled SPXW vertical: `BAG @ 3.80`, `leg @ 36.40`, `leg @ 32.60`.
+
+- **Skip the BAG row** (`contract.SecType == "BAG"`). It is a summary of the others, not a third
+  fill; counting it invents a leg that does not exist and records the net as a leg price.
+- **Attribute the leg rows by conId**, not by arrival order. Legs do not fill in request order, and
+  one leg can fill in several executions while the other has not started — so a running counter
+  mislabels them. Keep a conId → leg-index map from before the order is transmitted.
+- Dedupe on `ExecId`; executions replay after a reconnect.
+
+### A combo's average fill price is signed
+
+`orderStatus.avgFillPrice` for a combo filled at a net credit arrives **negative**. Convert it with a
+signed converter — running it through a price converter that rejects negatives (correct for an option
+quote, where negative means "no quote") silently reports every credit fill as zero.
+
+### TWS Precautionary Settings will reject your first orders
+
+**Error 163** — *"price exceeds the Percentage constraint of 3%"* — is not a bug in your order. TWS
+applies client-side *Precautionary Settings* before an order ever reaches the exchange, and the
+defaults reject any limit more than a few percent from the market. A deliberately unmarketable test
+price is refused outright, and so is a realistic one when the market is closed and TWS has no
+reference price to compare against.
+
+It is **not** about having a stale price, and not fixed by pricing the order sensibly. It rejected a
+marketable SPXW vertical priced exactly at the natural (3.80 debit) against a live, tight, two-sided
+book. For a combo TWS appears to compare the *net* price against a leg/underlying reference, so any
+spread net is a huge percentage away and every BAG order is refused.
+
+Fix in TWS: **Global Configuration → Presets → (instrument type, e.g. Options) → Precautionary
+Settings**. Clear or widen *Percentage*; the sibling limits (*Size Limit*, *Total Value Limit*,
+*Number of Ticks*) reject on the same principle. Expect to clear *Percentage* before any combo order
+will work over the API.
+
+Treat 163 as terminal for the order — see `IbkrErrorCodes.IsOrderRejection`. Left unmapped, the
+order sits at `PendingSubmit` forever while being dead.
+
+### Terminal states must not be overwritten
+
+The real sequence for a rejected order is **163** (rejected) → **202** (cancelled) → **161** if
+anything then tries to cancel it (*"not in a cancellable state"*). Applying callbacks blindly leaves
+the order reporting the trailing 161 notice as its outcome. Once an order is terminal, ignore later
+status and error chatter.
 
 ## Order IDs and status
 
@@ -193,6 +293,17 @@ the `errorTime` parameter was added around API 10.30; older versions omit it.
 **Informational, not errors** (log at debug, never fail on these):
 2104, 2106, 2158 (market data / HMDS farm connection OK), 2107 (farm inactive), 2100–2110 generally.
 
+**The delayed-data family is the subtle one.** TWS reports these as errors on a market-data request
+*while still streaming usable ticks*. Faulting the request discards data that is already on its way —
+this is what a paper account without an OPRA subscription hits on every option quote:
+
+| Code | Meaning | Fault the request? |
+|---|---|---|
+| 10090 | Part of the data is unsubscribed; independent ticks still stream | **No** |
+| 10091 | Needs a subscription, but **delayed data is available** | **No** |
+| 10167 | Not subscribed; displaying delayed market data | **No** |
+| 10168 | Not subscribed **and delayed data not enabled** — nothing will arrive | **Yes** |
+
 | Code | Meaning | Handling |
 |---|---|---|
 | 200 | No security definition found | Permanent — fault the request, do not retry |
@@ -204,6 +315,8 @@ the `errorTime` parameter was added around API 10.30; older versions omit it.
 | 1101 | Restored, **data lost** | Resubscribe all market data |
 | 1102 | Restored, data maintained | Resume |
 | 10197 | No market data during competing session | Same account logged in elsewhere |
+
+Classification lives in `IbkrErrorCodes`; add codes there rather than at call sites.
 
 `id` is `-1` for connection-level messages, otherwise the `reqId`/`orderId` — route it to the right
 pending TCS.

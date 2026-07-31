@@ -2,12 +2,27 @@ using TradingStuff.Contracts;
 
 namespace TradingStuff.MarketDataService;
 
-public sealed class DeterministicOptionMarketDataProvider(IConfiguration configuration)
+public sealed class DeterministicOptionMarketDataProvider(IConfiguration configuration) : IOptionMarketDataProvider
 {
+    public string Source => configuration["MarketData:Source"] ?? "ibkr-deterministic-paper-feed";
+
+    public Task<MarketDataQuoteResponse> GetQuotesAsync(
+        MarketDataQuoteRequest request,
+        CancellationToken cancellationToken) =>
+        Task.FromResult(GetQuotes(request));
+
+    public Task<IReadOnlyList<OptionContract>> GetOptionChainAsync(
+        string underlying,
+        DateOnly? expiration,
+        CancellationToken cancellationToken) =>
+        Task.FromResult(GetOptionChain(
+            underlying,
+            expiration ?? DateOnly.FromDateTime(DateTime.UtcNow.Date.AddDays(30))));
+
     public MarketDataQuoteResponse GetQuotes(MarketDataQuoteRequest request)
     {
         var capturedAt = DateTimeOffset.UtcNow;
-        var source = configuration["MarketData:Source"] ?? "ibkr-deterministic-paper-feed";
+        var source = Source;
 
         var quotes = request.Legs
             .Select(leg => CreateQuote(leg.Contract, capturedAt, source))

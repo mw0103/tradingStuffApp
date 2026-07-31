@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Vendored Interactive Brokers TWS API C# client. Third-party source — do not edit by hand.
+    See README.md for provenance and upgrade instructions.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>IBApi</RootNamespace>
+    <AssemblyName>IBApi</AssemblyName>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <IsPackable>false</IsPackable>
+
+    <!-- Third-party code: do not hold it to this repo's analysis rules. -->
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+    <EnableNETAnalyzers>false</EnableNETAnalyzers>
+    <AnalysisMode>None</AnalysisMode>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS0618;CS0612;CS1591;CS0067;CS0414;CS0169;CS8981;SYSLIB0011;IDE0005</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Required by the generated IBApi.protobuf message types (TWS API 10.4x+). -->
+    <PackageReference Include="Google.Protobuf" Version="3.35.1" />
+  </ItemGroup>
+
+</Project>

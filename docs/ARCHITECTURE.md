@@ -44,11 +44,14 @@ In the current slice, RabbitMQ, Postgres, Keycloak, and IBKR are AppHost-modeled
 1. A client submits `SubmitOrderRequest` to `ExecutionService`.
 2. `OrderRequestValidator` validates v1 option strategy shape and order-type requirements.
 3. `ExecutionService` requests option quote snapshots from `MarketDataService`.
-4. `ExecutionService` loads a portfolio snapshot.
+4. `ExecutionService` loads a portfolio snapshot — fixed development figures, or the real IBKR
+   account through the gateway, per `Portfolio:Source`. A portfolio that cannot be read stops the
+   order here rather than falling back.
 5. `ExecutionService` calls `RiskService` with order, portfolio, and quote inputs.
 6. `RiskService` returns approved/rejected risk decision with breaches and Greeks exposure delta.
-7. Approved orders are passed to `PaperExecutionEngine`.
-8. The paper engine creates simulated fills from quote bid/ask data.
+7. Approved orders go to the `IOrderRouter` selected by `Execution:Router`.
+8. `PaperOrderRouter` creates simulated fills from quote bid/ask data; `IbkrOrderRouter` sends the
+   order to the gateway, which places it as a combo against TWS.
 9. `ExecutionService` stores the order and emits lifecycle events through `IExecutionEventPublisher`.
 
 ## Boundaries And Replacement Points
@@ -57,7 +60,7 @@ In the current slice, RabbitMQ, Postgres, Keycloak, and IBKR are AppHost-modeled
 - `IExecutionEventPublisher`: currently in-memory/logging; replace with RabbitMQ publisher and outbox.
 - `IMarketDataClient`: HTTP boundary to market data; keep while replacing deterministic provider with IBKR adapter.
 - `IRiskClient`: HTTP boundary to risk; keep for separate risk-service ownership.
-- `IPortfolioProvider`: currently development snapshot; replace with account/position store and broker reconciliation.
+- `IPortfolioProvider`: development snapshot by default, `IbkrPortfolioProvider` on `Portfolio:Source=ibkr`. Still to add: a position store so risk does not depend on the broker being reachable, and representation for non-option positions.
 - `DevelopmentJwtAuthenticationHandler`: replace with real JWT bearer validation against Keycloak.
 
 ## Data Model Direction

@@ -38,11 +38,11 @@ A TWS connection is **stateful and single-owner per `clientId`**:
 So **do not** let `MarketDataService` and `ExecutionService` each open their own connection. Two
 independent ID sequences against one account is how you get orphaned orders and lost fills.
 
-### Required shape
+### Implemented shape
 
-Add one project, `src/TradingStuff.IbkrGateway`, that owns exactly one `EClientSocket` and exposes
-internal HTTP to the rest of the mesh — the same bearer-token internal-call pattern the other
-services already use (`ServiceClientConfiguration.ConfigureInternalClient`).
+`src/TradingStuff.IbkrGateway` owns exactly one `EClientSocket` and exposes internal HTTP to the rest
+of the mesh, using the same bearer-token pattern as the other services
+(`ServiceClientConfiguration.ConfigureInternalClient`, now in `ServiceDefaults`).
 
 ```
 MarketDataService ─┐
@@ -54,38 +54,29 @@ ExecutionService ──┘
 `GET /market-data/options/chains/{underlying}`) unchanged and swaps its provider implementation.
 Nothing downstream of it needs to know IBKR exists.
 
-## Aspire wiring change this requires
+## Aspire wiring
 
-`src/TradingStuff.AppHost/Program.cs` currently models the broker as an HTTP external service:
-
-```csharp
-var ibkrGatewayUrl = builder.AddParameter("ibkr-gateway-url", "http://localhost:5000", ...);
-var ibkrGateway = builder.AddExternalService("ibkr-gateway", ibkrGatewayUrl);
-```
-
-**A TWS socket is not HTTP**, so `AddExternalService` with a URL is the wrong model. Replace it with
-host/port/clientId parameters and make the adapter a real project:
+The broker was originally modelled as an HTTP external service
+(`AddExternalService("ibkr-gateway", "http://localhost:5000")`). **A TWS socket is not HTTP**, so
+that was replaced with host/port/clientId parameters plus a real adapter project:
 
 ```csharp
 var ibkrHost     = builder.AddParameter("ibkr-host", "127.0.0.1", publishValueAsDefault: true);
 var ibkrPort     = builder.AddParameter("ibkr-port", "7497", publishValueAsDefault: true); // paper TWS
 var ibkrClientId = builder.AddParameter("ibkr-client-id", "11", publishValueAsDefault: true);
-var ibkrAccount  = builder.AddParameter("ibkr-account", "DU0000000", publishValueAsDefault: true);
-
-var ibkr = builder.AddProject("ibkrgateway", "../TradingStuff.IbkrGateway/TradingStuff.IbkrGateway.csproj")
-    .WithEnvironment("Authentication__DevelopmentToken", devInternalToken)
-    .WithEnvironment("IBKR__Host", ibkrHost)
-    .WithEnvironment("IBKR__Port", ibkrPort)
-    .WithEnvironment("IBKR__ClientId", ibkrClientId)
-    .WithEnvironment("IBKR__AccountId", ibkrAccount);
+var ibkrMarketDataType = builder.AddParameter("ibkr-market-data-type", "3", publishValueAsDefault: true);
 ```
 
 Ports: **7497** TWS paper, 7496 TWS live, **4002** IB Gateway paper, 4001 IB Gateway live.
 TWS/Gateway must have *Enable ActiveX and Socket Clients* on and the host IP in Trusted IPs.
 
-Keep `GET /market-data/ibkr/status` — extend it to report real connection state (connected,
-clientId, serverVersion, last error code, delayed-vs-live data mode) instead of the current
-static placeholder.
+`marketdataservice` deliberately has **no `WaitFor(ibkrGateway)`**: the gateway reports unhealthy
+whenever TWS is down, and waiting on health would stop the whole mesh from starting just because TWS
+is closed.
+
+`GET /market-data/ibkr/status` proxies the gateway's real socket state; `GET /ibkr/status` on the
+gateway is the source of truth (connected, clientId, serverVersion, managed accounts, market data
+type, whether trading is permitted, in-flight request count).
 
 ## Mapping to the existing Contracts
 
@@ -97,6 +88,7 @@ static placeholder.
 | `OptionContract.Right` | `Contract.Right` — `"C"` / `"P"` |
 | `OptionContract.Multiplier` | `Contract.Multiplier` — string `"100"` |
 | `OptionContract.Exchange` / `.Currency` | `Contract.Exchange` (`"SMART"`) / `Contract.Currency` |
+| `OptionContract.TradingClass` | `Contract.TradingClass` — required for SPX vs SPXW |
 | `OptionContract.Symbol` | **nothing** — this is a synthetic local key, never send it |
 | `OptionGreeks` | `tickOptionComputation` callback (delta, gamma, vega, theta) |
 | `QuoteSnapshot.Bid/.Ask/.Last` | `tickPrice` tick types 1 / 2 / 4 |
@@ -104,7 +96,7 @@ static placeholder.
 | `SubmitOrderRequest.LimitPrice` | `Order.LmtPrice` — combo **net**; negative means net credit |
 | `OrderType` Market/Limit/Stop/StopLimit | `"MKT"` / `"LMT"` / `"STP"` / `"STP LMT"` |
 | `TimeInForce` Day/GTC/IOC/FOK | `"DAY"` / `"GTC"` / `"IOC"` / `"FOK"` |
-| `FillLiquidity.BrokerReported` | `execDetails` + `commissionReport` |
+| `FillLiquidity.BrokerReported` | `execDetails` + `commissionAndFeesReport` |
 | `OrderLifecycleStatus` | `orderStatus` string — mapping in `references/tws-api.md` |
 
 ### Three traps in this mapping
@@ -113,21 +105,18 @@ static placeholder.
    `double`. Convert only at the adapter boundary and round strikes to the contract's tick before
    comparing — `450.0d` round-tripped can miss an exact-match lookup on `decimal 450.00m`.
 
-2. **Adding `ConId` to `OptionContract` will break `PaperExecutionEngine`.** You need the IBKR
-   `conId` to build combo legs, and the natural move is to add it to the record. But
-   `PaperExecutionEngine.Execute` does:
+2. **Never key a dictionary on the whole `OptionContract` record.** *(Resolved — keep it that way.)*
+   `OptionContract` is a `record`, so equality is structural over *every* property. `PaperExecutionEngine`
+   used to do `quotes.ToDictionary(q => q.Contract)`, which threw `KeyNotFoundException` the moment a
+   broker-backed quote carried a field the inbound leg lacked.
 
-   ```csharp
-   var quoteByContract = quotes.ToDictionary(quote => quote.Contract);
-   ...
-   var quote = quoteByContract[leg.Contract];   // KeyNotFoundException
-   ```
-
-   `OptionContract` is a `record`, so lookup is structural equality over *all* properties. The
-   moment quotes come back carrying a resolved `ConId` and the inbound request legs don't, every
-   lookup throws. Either key the dictionary on a stable subset instead of the whole record, or hold
-   the conId in an adapter-side cache keyed by the existing five identity fields. Decide this
-   before touching the record.
+   The fix is `OptionContractKey` in `TradingContracts.cs` — underlying, expiration, strike, right,
+   currency, and trading class, with case normalisation — reached via `contract.Key()`. Correlate
+   quotes, legs, and fills on that. `OptionContract` is deliberately **not** carrying `ConId`: conIds
+   live in an adapter-side cache in `IbkrMarketDataClient` keyed on `OptionContractKey`, so the record
+   stays a stable identity. `TradingClass` is the one exception, because SPX and SPXW are genuinely
+   different instruments rather than broker metadata — and providers echo contracts back as supplied
+   rather than enriching them, so both sides of a lookup stay in agreement.
 
 3. **Market orders on option combos.** IBKR frequently rejects or badly fills `MKT` on multi-leg
    BAG orders. `PaperExecutionEngine` currently treats `OrderType.Market` as always executable.
@@ -136,7 +125,9 @@ static placeholder.
 
 ## Safety rules — non-negotiable
 
-`docs/PLAN.md` states: *"No live broker orders are placed in v1."* Hold that line.
+`docs/PLAN.md` scopes v1 to two non-live modes — *simulated* (fills invented locally) and
+*paper brokerage* (real orders to a `DU` account, simulated money). Orders against a funded
+(`U`-prefixed) account are out of scope. Hold that line.
 
 - **Default to paper.** Port 7497/4002 and a `DU`-prefixed account. A `U`-prefixed account is live money.
 - **Live routing requires an explicit, separate opt-in** — a config flag that is `false` by default
@@ -148,19 +139,78 @@ static placeholder.
   or committed files.
 - `placeOrder` is irreversible the instant it lands. Treat adding or changing any `placeOrder` call
   site as a change requiring explicit confirmation, not a routine edit.
+- **Never let an HTTP client retry an order.** The standard resilience handler retries on its
+  per-attempt timeout, and an order resting longer than that is re-sent as a *second* live broker
+  order under a new order id while the caller sees only the last attempt. This happened on
+  2026-07-31. Order-routing clients go through `ServiceClientConfiguration.DisableAutomaticRetries`,
+  and `IbkrOrderTracker.TryTrack` enforces one broker order per internal order independently.
 
-## Staged migration
+## Staged migration — current position
 
-Do not swap the deterministic provider out in one step — it is the only thing making the test suite
-repeatable. Sequence in `references/migration-plan.md`; the short version:
+All six stages are implemented and **verified against a live paper account**. Details and acceptance
+criteria in `references/migration-plan.md`.
 
-1. `IbkrGateway` project + connection lifecycle + `/health`. No market data, no orders.
-2. Contract resolution (`reqContractDetails` → conId) with a cache.
-3. Chains (`reqSecDefOptParams`) behind `GET /market-data/options/chains/{underlying}`.
-4. Streaming quotes + Greeks; put it behind `MarketData:Source` so the deterministic provider stays
-   selectable and keeps the existing 6 tests green.
-5. Read-only account/position sync to replace `PortfolioProvider`.
-6. Order placement — **paper only**, behind the opt-in flag, last.
+**Use SPY, not SPX/SPXW, when you need a combo to actually fill.** As of 2026-07-31 every SPXW combo
+parks at `PreSubmitted` with no error — at any price, including `MKT`, inside regular hours, with and
+without `OutsideRth`. SPY combos on the identical code path fill immediately. Unexplained and
+account-level rather than a code defect; see the open question in `docs/STATE.md`.
+
+| Stage | Status |
+|---|---|
+| 1. Connection lifecycle, pump, reconnect, health | **Done** |
+| 2. Contract resolution + conId cache | **Done** |
+| 3. Chains (`reqSecDefOptParams`) | **Done** |
+| 4. Streaming quotes + Greeks | **Done** |
+| 5. Account/position sync → `PortfolioProvider` | **Done — verified live with an open position** |
+| 6. Order placement (paper only, opt-in) | **Done — round trip filled on the paper account** |
+
+### Account and positions (stage 5)
+
+`IbkrAccountClient` serves `GET /ibkr/account/portfolio` from `reqAccountSummary` +
+`reqPositionsMulti` + `reqPnL`. ExecutionService consumes it through `IbkrPortfolioProvider` when
+`Portfolio:Source=ibkr` (opt-in on the same footing as `Execution:Router`; anything unrecognised
+stays on the fixed development figures).
+
+Three rules the implementation holds to:
+
+- **Open those three streams once per connection; never subscribe per read.** TWS caps concurrent
+  `reqAccountSummary` subscriptions at **two**, and `cancelAccountSummary` does not release them —
+  verified live on TWS 223, where the third consecutive portfolio read fails with `error 322`
+  despite a well-formed cancel after every read. The cap is undocumented. Keep the subscriptions
+  registered for the connection's life, key the feed on `ConnectedAt` so a reconnect rebuilds it,
+  and read from the pushed values. `reqPnL` has no `...End` callback and settles on its first
+  non-sentinel push.
+- **Greeks come from quoting positions**, because IBKR exposes no portfolio-Greeks API. Scaled by
+  quantity × multiplier so they sum with `PortfolioRiskEvaluator`'s order exposure.
+- **Never default a missing input.** `DailyPnLAvailable`, `GreeksComplete`, and
+  `NonOptionPositionCount` ride along on the response, and an unreadable portfolio raises
+  `PortfolioUnavailableException` (503, no order placed) rather than falling back to stub figures.
+  A defaulted zero daily P&L silently disables `MAX_DAILY_LOSS`.
+
+The deterministic provider remains the default and is what the test suite uses; it is not going away.
+Selection is via `MarketData:Source` (`MarketDataSources.UsesIbkrGateway`), and anything
+unrecognised falls back to deterministic rather than silently hitting a broker.
+
+### Order routing (stage 6)
+
+`IbkrOrderClient` is the **only** caller of `placeOrder`, and it calls
+`IbkrConnection.EnsureTradingPermitted()` first. Routing is opt-in twice over:
+
+- `Execution:Router` on ExecutionService — `paper` (default) simulates fills; only the exact string
+  `ibkr` routes to the broker. A typo stays on paper.
+- `IBKR:AllowLiveTrading` on the gateway — false by default; a non-`DU` account with it false blocks
+  placement while still serving market data.
+
+The gateway exposes `POST /ibkr/orders`, `GET /ibkr/orders/{id}`, `POST /ibkr/orders/{id}/cancel`,
+and `GET /ibkr/orders/open` — the last being the honest answer to "is anything resting?", since the
+in-memory tracker only knows about the current run.
+
+**TWS's Precautionary Settings percentage constraint blocks combo orders until cleared** — see
+`references/tws-api.md`.
+
+Verified end to end on a `DU` paper account: a 1-lot SPXW 7435/7440 call vertical opened at a
+3.80 debit and closed at a 3.40 credit, both filling at the natural, with correct per-leg fills and
+commissions. Use **SPX/SPXW, not SPY**, outside regular hours — SPY has no pre-market book at all.
 
 ## References
 

@@ -1,4 +1,3 @@
-using System.Net.Http.Headers;
 using System.Net.Http.Json;
 using TradingStuff.Contracts;
 
@@ -39,15 +38,5 @@ public sealed class HttpMarketDataClient(HttpClient httpClient) : IMarketDataCli
 
         return await response.Content.ReadFromJsonAsync<MarketDataQuoteResponse>(cancellationToken)
             ?? throw new InvalidOperationException("Market-data service returned an empty response.");
-    }
-}
-
-public static class ServiceClientConfiguration
-{
-    public static void ConfigureInternalClient(HttpClient httpClient, IConfiguration configuration, string baseUrlKey, string fallback)
-    {
-        httpClient.BaseAddress = new Uri(configuration[baseUrlKey] ?? fallback);
-        var token = configuration["Authentication:DevelopmentToken"] ?? "dev-internal-token";
-        httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
     }
 }

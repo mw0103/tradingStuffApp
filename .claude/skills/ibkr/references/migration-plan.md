@@ -1,5 +1,9 @@
 # Staged migration: deterministic provider → IBKR
 
+> **Status (2026-07-31): all six stages implemented and verified live** against a `DU` paper account
+> on TWS server version 223 — real chains, real conIds, real Greeks, filled combo round trips, and a
+> portfolio read carrying a real position with correctly scaled Greeks.
+
 `DeterministicOptionMarketDataProvider` is the only reason the 6 tests in
 `tests/TradingStuff.Tests/TradingWorkflowTests.cs` are repeatable. It does not get deleted — it
 becomes the default provider behind a switch, and stays the one used by tests and offline work.
@@ -21,7 +25,7 @@ class is step 0 — `MarketDataService/Program.cs` currently injects the concret
 
 ---
 
-## Stage 1 — Connection only
+## Stage 1 (DONE) — Connection only
 
 `src/TradingStuff.IbkrGateway`: one `EClientSocket`, `EWrapper` implementation, the `EReader` pump
 thread, reconnect-with-backoff, and `AddServiceDefaults()` for the shared auth/telemetry.
@@ -35,30 +39,32 @@ Wire into AppHost per the parameter change in `SKILL.md`. Point
 **Done when:** `aspire start` with TWS paper running shows connected + a `DU` account; with TWS
 *not* running, the service starts, reports unhealthy, and retries without crashing the AppHost.
 
-## Stage 2 — Contract resolution
+## Stage 2 (DONE) — Contract resolution
 
 `reqContractDetails` → conId, with an in-memory cache keyed on underlying + expiry + strike + right +
 currency, and the TCS bridge from `references/tws-api.md`.
 
-Resolve the `OptionContract`-carries-`ConId` question here (trap #2 in `SKILL.md`) **before**
-anything depends on it. Recommended: keep `OptionContract` unchanged and hold conIds in an
-adapter-side cache, so `PaperExecutionEngine`'s record-equality dictionary lookups keep working.
+Resolved as trap #2 in `SKILL.md`: conIds live in an adapter-side cache keyed on
+`OptionContractKey`, never on the whole `OptionContract` record.
 
 `POST /ibkr/contracts/resolve` taking `OptionContract[]`.
 
 **Done when:** a known-good SPY option resolves to a conId; a bogus strike returns a clean error
 (200) rather than hanging; the existing 6 tests still pass untouched.
 
-## Stage 3 — Chains
+## Stage 3 (DONE) — Chains
 
-`reqSecDefOptParams` behind `GET /market-data/options/chains/{underlying}`. Deduplicate the
-per-exchange callbacks, prefer `SMART`, filter to a strike window around spot (the deterministic
-provider's ±5 strikes × 2 rights is the shape to preserve).
+`reqSecDefOptParams` behind `GET /market-data/options/chains/{underlying}`, filtered to a strike
+window around spot (the deterministic provider's ±5 strikes × 2 rights is the shape preserved).
+
+Segment selection is by **`tradingClass == symbol`**, *not* by `SMART` — SPY's only `SMART` segment
+is the adjusted `2SPY` class with 3 strikes, while the real 489-strike chain has no `SMART` row at
+all. See `references/tws-api.md`.
 
 **Done when:** the endpoint returns real expirations/strikes with `MarketData:Source=ibkr-delayed`,
 and still returns the deterministic chain on the default source.
 
-## Stage 4 — Quotes and Greeks
+## Stage 4 (DONE) — Quotes and Greeks
 
 `reqMktData` streaming, accumulate `tickPrice` + `tickOptionComputation` per tickerId, emit a
 `QuoteSnapshot` when bid/ask/model-greeks are all present or a timeout fires. Guard every
@@ -72,19 +78,46 @@ path.
 subscription count returns to zero after each call; the 6 tests still pass on the deterministic
 source.
 
-## Stage 5 — Account and positions (read-only)
+## Stage 5 (DONE) — Account and positions (read-only)
 
-`reqAccountSummary` / `reqPositions` → replace the stub behind
-`ExecutionService/PortfolioProvider.cs` so `PortfolioSnapshot.BuyingPower` and `ExistingGreeks`
-reflect the real paper account. Risk checks in `PortfolioRiskEvaluator` get meaningful inputs here —
-this is what makes the existing risk limits real, and it carries zero order-placement risk.
+`IbkrAccountClient` reads `reqAccountSummary`, `reqPositionsMulti`, and `reqPnL`, and
+`IbkrPortfolioProvider` in ExecutionService replaces the stub behind `IPortfolioProvider` when
+`Portfolio:Source=ibkr`. `PortfolioSnapshot.BuyingPower`, `DailyPnL`, `Positions`, and
+`ExistingGreeks` now come from the account orders are actually routed to.
+
+Four things this stage forced:
+
+- **The reqId-scoped variants, not the account-wide ones.** `reqPositions` has no request id, so it
+  cannot be correlated through `IbkrRequestRegistry`; `reqPositionsMulti` can. Same reasoning for
+  `reqAccountSummary` over `reqAccountUpdates`.
+- **All three are subscriptions, not queries — open them once per connection.** The `...End` callback
+  ends the *initial* delivery and TWS keeps streaming afterwards. Subscribing and cancelling per read
+  does not work: TWS caps concurrent `reqAccountSummary` subscriptions at two and
+  `cancelAccountSummary` does not release them, so the third consecutive read fails with `error 322`
+  (verified live, cap undocumented). `reqPnL` has no `...End` callback at all — it settles on the
+  first push carrying a non-sentinel daily P&L.
+- **IBKR has no portfolio-Greeks API.** `ExistingGreeks` is built by quoting each open option
+  position and scaling by quantity × multiplier, matching how `PortfolioRiskEvaluator` scales the
+  incoming order. Capped at `IBKR:MaxPositionsQuoted` (50) against the 100-line market data limit,
+  and cached for `IBKR:PortfolioCacheSeconds` (5) because every order submission triggers a read.
+- **Gaps are reported, never defaulted.** `IbkrPortfolioSnapshot` carries `DailyPnLAvailable`,
+  `GreeksComplete`, and `NonOptionPositionCount`. A daily P&L silently read as zero disables
+  `MAX_DAILY_LOSS`; a non-option position silently dropped removes its delta from the Greek limits.
+  `IbkrPortfolioProvider` logs each gap, and an unreadable portfolio throws rather than falling back
+  to the development figures.
+
+Note the account-model limit this exposes: `PositionSnapshot` carries an `OptionContract`, so equity
+and futures positions in the account have no representation and their exposure is counted only as a
+warning.
 
 **Done when:** `RiskEvaluationRequest.Portfolio` reflects actual paper-account buying power and
-positions.
+positions. **Met and verified live** on 2026-07-31 — a SPY vertical round trip put a real position
+through the read, confirming contract mapping, the `avgCost` conversion, Greek scaling, and the short
+leg's sign flip. Figures in `docs/STATE.md`.
 
-## Stage 6 — Order placement (paper only, last)
+## Stage 6 (DONE) — Order placement (paper only)
 
-Only after 1–5 are stable. Combo/BAG construction, `placeOrder`, `orderStatus` → lifecycle mapping,
+Combo/BAG construction, `placeOrder`, `orderStatus` → lifecycle mapping,
 `execDetails` → `FillReport` with `FillLiquidity.BrokerReported` and `ExecId` dedupe.
 
 Guards, all of them required:
@@ -103,15 +136,24 @@ Guards, all of them required:
 
 ## Test strategy
 
-The 6 existing tests are unit tests with fake clients — they must never touch a socket. Keep them on
-the deterministic provider permanently.
+The suite is 91 unit tests using fake clients — none of them touch a socket, and none may. Keep them
+on the deterministic provider permanently.
 
-New IBKR tests split in two:
+Already covered: tick sentinel guarding (price vs Greek sign rules), delayed-tick-field handling,
+partial-quote settling, request/error correlation, error-code classification, chain segment
+selection, provider selection fallback, and the `OptionContractKey` regressions.
 
-- **Unit** — combo construction (ratio/GCD/spread-count arithmetic, credit sign), `orderStatus` →
-  lifecycle mapping, tick sentinel guarding, `decimal`↔`double` rounding. No socket. These cover the
-  logic most likely to be wrong.
+Also covered: combo construction (ratio/GCD/spread-count arithmetic, credit sign), `orderStatus` →
+lifecycle mapping, BAG-summary exclusion, and conId-based fill attribution.
+
+Also covered: account selection, account-summary tag fallback and currency preference, position
+contract mapping, `avgCost`-to-per-share conversion, and position Greek scaling including the short
+sign.
+
+Still to add:
+
 - **Integration** — marked with a trait so they are excluded by default, requiring a running paper
-  TWS. Never in the default `dotnet test` run.
+  TWS. Never in the default `dotnet test` run. Stage 5 is the first thing they should cover, since
+  it is the only stage not yet exercised live.
 
 Record the pinned `IBApi` version in `docs/STATE.md`; callback signatures change between releases.
