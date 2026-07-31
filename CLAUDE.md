@@ -18,7 +18,7 @@ mkdir -p /tmp/dotnet_home
 
 ```bash
 dotnet build TradingStuff.slnx
-dotnet test tests/TradingStuff.Tests/TradingStuff.Tests.csproj -m:1    # 125 tests, all should pass
+dotnet test tests/TradingStuff.Tests/TradingStuff.Tests.csproj -m:1    # 149 tests, all should pass
 aspire start --non-interactive                                        # full distributed app
 ```
 
@@ -80,6 +80,26 @@ The IBKR integration is complete end to end and a full round trip has filled on 
 Milestone 1 is **not** complete: persistence and event transport are unmet, and Postgres/RabbitMQ/
 Keycloak start but nothing connects to them. Prerequisites and gotchas are in `docs/STATE.md`; API
 detail is in the `ibkr` skill.
+
+## Model and effort policy (milestone 2 research phases)
+
+At session start, check which research phase is active in `docs/STATE.md` (the "Left" list names
+the next phase; the last "Done" entry names the completed one) and pick the model/effort for the
+work at hand from this table. **If the session's active model does not match the policy for the
+phase being worked, say so explicitly before starting** — do not silently proceed on a mismatch.
+
+| Work | Model | Reasoning effort |
+|---|---|---|
+| Phase 1–3 and Phase 7 implementation (recorder, backfill, snapshots, execution simulator) | Sonnet | medium |
+| Phase 4 implementation (features, labels, baselines, study runner) | Sonnet | high |
+| Phase 5, 6, 8 (residual models + gates, implied-vs-forecast study, shadow/live ops) | Opus | high |
+| ALL leakage reviews and order-safety reviews, any phase | Opus | high |
+| UI (`ClientApp/`) and documentation work | Haiku | low |
+
+Pinned-model agents exist for delegation regardless of the session model: `implementer` (Sonnet),
+`ui-builder` (Haiku), `leakage-reviewer` (Opus, high effort) — see `.claude/agents/`. Route
+leakage/order-safety review work through `leakage-reviewer` rather than reviewing inline on a
+smaller model.
 
 ## Trading safety
 
