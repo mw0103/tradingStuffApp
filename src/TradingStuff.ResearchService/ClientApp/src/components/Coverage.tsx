@@ -270,9 +270,17 @@ const Coverage: React.FC = () => {
                         {expandedNodes[node.nodeId] && node.conIdSegments.length > 0 && (
                           <>
                             {node.conIdSegments.map((segment) => (
-                              // Keyed on assignedFrom, not conId: a node that rotates off a conId
-                              // and back onto it inside the window has two segments for that conId,
-                              // and the partial unique index makes assignedFrom the unique one.
+                              // Keyed on assignedFrom, not conId: CoverageMonitor emits one segment
+                              // per node_assignments ROW, so a node that rotates off a conId and
+                              // back onto it inside the window has two segments carrying that same
+                              // conId — a duplicate key, and React silently drops one of them.
+                              // Live during any session where spot oscillates across a strike.
+                              // assignedFrom is unique per node because a node's assignments are
+                              // time-disjoint and meet exactly (close and open share one
+                              // transaction's now()). Note that is NOT what the partial unique index
+                              // on node_assignments guarantees — that only enforces a single OPEN
+                              // assignment per node, and every segment here except the current one
+                              // is closed.
                               <tr key={`segment-${node.nodeId}-${segment.assignedFrom}`} className="segment-row">
                                 <td></td>
                                 <td></td>
