@@ -26,8 +26,10 @@ imposes). This roadmap is the architecture and sequencing half.
 4. **Smallest credible architecture:** extend `TradingStuff.IbkrGateway` (pacing governor,
    historical client, subscription leases, raw-event recording, order-id persistence); one new
    `TradingStuff.ResearchService` + small `TradingStuff.ResearchContracts`; Postgres via Aspire
-   `AddPostgres` as the ONLY data bus; daily Parquet artifacts; server-rendered `/ui/*` pages.
-   No Kafka, no ClickHouse, no RabbitMQ client for research, no React, no Python service.
+   `AddPostgres` as the ONLY data bus; daily Parquet artifacts; a **React+Vite research UI built
+   into and served by ResearchService** (the one place a real frontend earns its keep — coverage,
+   surface, and study diagnostics are interactive-visualization surfaces). No Kafka, no
+   ClickHouse, no RabbitMQ client for research, no Python service.
 5. **False-discovery discipline is a platform feature:** immutable trial registry, pre-registered
    variants (cap 10 before the holdout opens), QLIKE-only gating, SPA tests on sweeps, PBO and
    Deflated Sharpe from the registry, placebo pipeline gates, a first-class no-trade region,
@@ -91,7 +93,8 @@ Two processes touch research data; Postgres is the only data bus.
 │  ForecastRegistry (baselines)        │
 │  StudyRunner + TrialRegistry         │
 │  ConservativeExecutionSimulator      │
-│  Research UI (server-rendered /ui/*) │
+│  Research UI (React+Vite SPA, served │
+│    from ResearchService wwwroot)     │
 └──────────────────────────────────────┘
 ```
 
@@ -120,6 +123,15 @@ except the `IbkrOptionMarketDataProvider` window/tradingClass param fix.
   Research contracts churn weekly early on and must not ripple through five services and 125
   tests. **Persistence:** plain Npgsql + hand-written SQL + embedded ordered migrations (no EF —
   the hot path needs binary COPY; partition DDL is raw SQL regardless).
+- **Research UI: a React+Vite SPA owned by ResearchService** (`src/TradingStuff.ResearchService/
+  ClientApp/`, Vite build emitted to `wwwroot/` and served as static files by the same service —
+  one deployable, no separate frontend host; `npm run dev` proxies to the service for local
+  iteration; the csproj builds the app on publish). The SPA consumes ResearchService's JSON
+  endpoints (`/research/*`). Auth split for this local-first operator surface: static assets and
+  read-only research GETs are anonymous (matching the AuditDashboard's `/`), while anything
+  mutating (study runs, recorder controls) keeps `RequireAuthorization`. The execution-path
+  services remain fully authorized and get no frontend. This supersedes the earlier
+  server-rendered-pages decision.
 - **Schema:** `research.*` (ResearchService-written: instruments, contract_definitions,
   capability_probes, backfill_jobs/requests, bars, option_nodes, node_assignments, sessions,
   surface_snapshots/snapshot_nodes, feature/label/forecast tables, studies/runs/trials/metrics/
@@ -162,8 +174,10 @@ acceptance criteria live in the approved plan; the contours:
 - **Phase 1 — recorder-first slice (L, calendar-critical):** subscription leases + heartbeats +
   reconnect replay (hooked into the existing 1101/1102 handling); ObservationRecorder
   (bounded Channel → batched COPY; drop-oldest + gap row on overflow — never block the EReader
-  pump); node selection seeding the registered grid; RecorderOrchestrator; CoverageMonitor +
-  `/ui/coverage`. Acceptance: a full RTH+GTH session at ≥95% coverage, all gaps explained.
+  pump); node selection seeding the registered grid; RecorderOrchestrator; CoverageMonitor; the
+  research-UI scaffold (React+Vite `ClientApp/` in ResearchService, Vite build wired into publish)
+  with its first route, `/ui/coverage`. Acceptance: a full RTH+GTH session at ≥95% coverage, all
+  gaps explained, visible in the UI.
 - **Phase 2 — sessions + backfill (L, concurrent with Phase 1 operations):** session calendar +
   holiday data + `SessionClock`; historical client (`formatDate=2`; `keepUpToDate` deferred;
   `reqRealTimeBars` cut); resumable/idempotent BackfillCoordinator (the request table IS the
@@ -193,7 +207,7 @@ simulator; structure/entry-timing comparison; shadow ops.
 
 **Not (yet or ever):** deep historical option backfill (runtime-verified impossible); full-chain
 tick recorder; Kafka/ClickHouse/new DB; RabbitMQ client for research; SSE/long-poll delivery;
-`reqRealTimeBars`; React/Vite; Python ML service (deferred per `docs/PLAN.md`); generic next-bar
+`reqRealTimeBars`; Python ML service (deferred per `docs/PLAN.md`); generic next-bar
 direction predictor; LSTM before linear rungs pass gates; dealer-gamma inference from daily OI;
 HFT/queue-position research; NLP/news; automated live trading; optimization against paper fills;
 CrossStrikeRelativeValueStudy; VX futures until entitlement is probe-verified.

@@ -73,8 +73,9 @@ recording path takes the fewest hops). A new `TradingStuff.ResearchService` owns
 derived: schema migrations, backfill planning/checkpoints, node selection and recorder
 orchestration, session/calendar normalization, as-of surface snapshots, point-in-time feature and
 forward-label pipelines behind a cutoff-enforcing reader, baseline forecasters, a study runner
-with an immutable trial registry, a conservative execution simulator, and server-rendered `/ui/*`
-pages. Postgres (schemas `gateway` and `research`, day-partitioned raw events, ~60-day hot window)
+with an immutable trial registry, a conservative execution simulator, and a React+Vite research UI
+(`ClientApp/` built into ResearchService's `wwwroot` and served by the same process — one
+deployable, no separate frontend host). Postgres (schemas `gateway` and `research`, day-partitioned raw events, ~60-day hot window)
 plus daily verified Parquet exports are the only data infrastructure — no message broker or
 analytics database is part of the design.
 
