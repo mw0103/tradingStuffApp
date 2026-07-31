@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import type { CoverageReport } from '../types/coverage';
+import type { CoverageReport, CoverageStatus } from '../types/coverage';
 import './Coverage.css';
 
 interface LoadingState {
@@ -47,10 +47,22 @@ const Coverage: React.FC = () => {
     return () => clearInterval(interval);
   }, [autoRefresh]);
 
-  const getCoverageColor = (ratio: number): string => {
+  const getCoverageColor = (ratio: number | null): string => {
+    if (ratio === null) return 'warning';
     if (ratio >= 0.95) return 'good';
     if (ratio >= 0.8) return 'warning';
     return 'bad';
+  };
+
+  // A window with no believable denominator gets a sentence, not a percentage. Showing 0% for a
+  // weekend or 100% for an unsynced session table is how a gate stops being read.
+  const statusExplanation: Record<CoverageStatus, string> = {
+    'measured': '',
+    'not-configured': 'No database is configured, so nothing was measured.',
+    'no-session-in-window': 'No exchange session overlaps this window — nothing was expected to record.',
+    'sessions-out-of-sync': 'research.sessions disagrees with the session generator; the denominator cannot be trusted.',
+    'window-rejected': 'The requested window was empty, inverted, or too long to measure.',
+    'calendar-unknown': 'A configured calendar key is not in the shipped calendar dataset.',
   };
 
   const formatRatio = (ratio: number): string => {
@@ -118,11 +130,20 @@ const Coverage: React.FC = () => {
           <section className="coverage-section">
             <h2>Overall Coverage</h2>
             <div className={`coverage-summary ${getCoverageColor(data.overallCoverageRatio)}`}>
-              <div className="coverage-value">{formatRatio(data.overallCoverageRatio)}%</div>
-              <div className="coverage-meta">
-                {data.totalMinutes} minutes total
+              <div className="coverage-value">
+                {data.overallCoverageRatio === null ? 'Not measured' : `${formatRatio(data.overallCoverageRatio)}%`}
               </div>
-              {data.overallCoverageRatio < 0.95 && (
+              <div className="coverage-meta">
+                {data.totalMinutes} expected session minutes
+                {data.basis.sessions.length > 0 && ` across ${data.basis.sessions.length} session(s)`}
+              </div>
+              {data.overallCoverageRatio === null && (
+                <div className="coverage-flag">
+                  {statusExplanation[data.basis.status]}
+                  {data.basis.detail && ` (${data.basis.detail})`}
+                </div>
+              )}
+              {data.overallCoverageRatio !== null && data.overallCoverageRatio < 0.95 && (
                 <div className="coverage-flag">Below 95% acceptance threshold</div>
               )}
             </div>
@@ -134,6 +155,7 @@ const Coverage: React.FC = () => {
             <div className="time-range">
               <div><strong>From:</strong> {formatDateTime(data.from)}</div>
               <div><strong>To:</strong> {formatDateTime(data.to)}</div>
+              <div><strong>Sessions:</strong> {data.basis.calendars.join(', ')}</div>
             </div>
           </section>
 

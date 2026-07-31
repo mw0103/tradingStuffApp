@@ -20,6 +20,64 @@ public sealed record SessionCalendarSyncResult(
     int Deleted,
     short GeneratorVersion);
 
+/// <summary>A <c>research.sessions</c> row as read back, with the generator version stamped on it.</summary>
+public sealed record PersistedSession(TradingSession Session, short GeneratorVersion);
+
+/// <summary>How a persisted <c>research.sessions</c> row stands against the generator's output.</summary>
+public static class SessionCalendarEntryState
+{
+    /// <summary>The generator produces it and the table holds it, boundary for boundary.</summary>
+    public const string InSync = "in-sync";
+
+    /// <summary>The generator produces it and the table does not. Shrinks every SQL-side denominator.</summary>
+    public const string Missing = "missing";
+
+    /// <summary>Both have it and they disagree — different boundaries, half-day flag, or generator version.</summary>
+    public const string Mismatched = "mismatched";
+
+    /// <summary>The table holds it and the generator does not: a trading day that never happened.</summary>
+    public const string Phantom = "phantom";
+}
+
+/// <summary>
+/// One calendar-date-label slot, showing what the generator produces and what the table holds.
+/// </summary>
+/// <param name="Generated">Null only when the row is a <see cref="SessionCalendarEntryState.Phantom"/>.</param>
+/// <param name="Persisted">Null only when the row is <see cref="SessionCalendarEntryState.Missing"/>.</param>
+public sealed record SessionCalendarEntry(
+    string Calendar,
+    DateOnly TradingDate,
+    string Label,
+    string State,
+    int DurationMinutes,
+    TradingSession? Generated,
+    TradingSession? Persisted,
+    short? PersistedGeneratorVersion);
+
+/// <summary>
+/// The auditable view of a calendar over a date range: every session the generator produces, matched
+/// against what <c>research.sessions</c> actually holds.
+/// </summary>
+/// <remarks>
+/// Both sides are reported rather than just the table, because the table is the side that can be
+/// wrong in the direction nobody notices — a missing row silently shrinks a coverage denominator and
+/// a phantom row keeps a closed market's trading day alive.
+/// </remarks>
+public sealed record SessionCalendarView(
+    DateOnly From,
+    DateOnly To,
+    IReadOnlyList<string> Calendars,
+    short GeneratorVersion,
+    string Revision,
+    DateOnly? KnownGoodThrough,
+    bool DatabaseConfigured,
+    int Generated,
+    int InSync,
+    int Missing,
+    int Mismatched,
+    int Phantom,
+    IReadOnlyList<SessionCalendarEntry> Sessions);
+
 /// <summary>
 /// Persists generated sessions into <c>research.sessions</c> so SQL-side consumers (coverage
 /// denominators, gap detection, backfill slice planning) can join against the same boundaries
@@ -134,8 +192,148 @@ public sealed class SessionCalendarService(
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
 
+        return [.. (await ReadPersistedAsync(connection, calendar, from, to, cancellationToken))
+            .Select(row => row.Session)];
+    }
+
+    /// <summary>
+    /// Reconciles the generator against the table over a date range, for the operator surface at
+    /// <c>GET /research/sessions</c>.
+    /// </summary>
+    /// <remarks>
+    /// Read-only: it reports a divergence, it does not repair one. Repair is
+    /// <see cref="SyncAsync"/>'s job and belongs on <see cref="SessionCalendarSynchronizer"/>'s
+    /// schedule, so that retiring a published session row is never a side effect of somebody looking
+    /// at a page.
+    /// </remarks>
+    public async Task<SessionCalendarView> DescribeAsync(
+        IReadOnlyList<string> calendars,
+        DateOnly from,
+        DateOnly to,
+        CancellationToken cancellationToken)
+    {
+        var connectionString = configuration.GetConnectionString("trading");
+        var persistedByCalendar = new Dictionary<string, List<PersistedSession>>(StringComparer.Ordinal);
+
+        if (!string.IsNullOrWhiteSpace(connectionString))
+        {
+            await using var connection = new NpgsqlConnection(connectionString);
+            await connection.OpenAsync(cancellationToken);
+
+            foreach (var calendar in calendars)
+            {
+                persistedByCalendar[calendar] = await ReadPersistedAsync(
+                    connection, calendar, from, to, cancellationToken);
+            }
+        }
+
+        return Reconcile(
+            calendars, from, to, persistedByCalendar, databaseConfigured: !string.IsNullOrWhiteSpace(connectionString));
+    }
+
+    /// <summary>The pure half of <see cref="DescribeAsync"/> — everything after the rows are read.</summary>
+    internal SessionCalendarView Reconcile(
+        IReadOnlyList<string> calendars,
+        DateOnly from,
+        DateOnly to,
+        IReadOnlyDictionary<string, List<PersistedSession>> persistedByCalendar,
+        bool databaseConfigured)
+    {
+        var entries = new List<SessionCalendarEntry>();
+
+        foreach (var calendar in calendars)
+        {
+            var generated = generator.Generate(calendar, from, to);
+            var persisted = persistedByCalendar.GetValueOrDefault(calendar) ?? [];
+
+            // Keyed on the table's own UNIQUE (calendar, trading_date, label): that is what makes a
+            // row the SAME session rather than a different one, so it is what a mismatch has to be
+            // measured against. Comparing by boundary instead would render every corrected session as
+            // one phantom plus one missing.
+            var persistedByKey = persisted.ToDictionary(row => (row.Session.TradingDate, row.Session.Label));
+
+            foreach (var session in generated)
+            {
+                var key = (session.TradingDate, session.Label);
+                var duration = (int)(session.CloseUtc - session.OpenUtc).TotalMinutes;
+
+                if (!persistedByKey.Remove(key, out var row))
+                {
+                    entries.Add(new SessionCalendarEntry(
+                        calendar, session.TradingDate, session.Label, SessionCalendarEntryState.Missing,
+                        duration, session, null, null));
+
+                    continue;
+                }
+
+                var matches = row.Session with { SessionId = SessionGenerator.UnpersistedSessionId } == session
+                              && row.GeneratorVersion == SessionGenerator.GeneratorVersion;
+
+                entries.Add(new SessionCalendarEntry(
+                    calendar,
+                    session.TradingDate,
+                    session.Label,
+                    matches ? SessionCalendarEntryState.InSync : SessionCalendarEntryState.Mismatched,
+                    duration,
+                    session,
+                    row.Session,
+                    row.GeneratorVersion));
+            }
+
+            // Whatever is left in the dictionary is in the table and not in the generator.
+            foreach (var (_, row) in persistedByKey)
+            {
+                entries.Add(new SessionCalendarEntry(
+                    calendar,
+                    row.Session.TradingDate,
+                    row.Session.Label,
+                    SessionCalendarEntryState.Phantom,
+                    (int)(row.Session.CloseUtc - row.Session.OpenUtc).TotalMinutes,
+                    null,
+                    row.Session,
+                    row.GeneratorVersion));
+            }
+        }
+
+        entries.Sort((left, right) =>
+        {
+            var byDate = left.TradingDate.CompareTo(right.TradingDate);
+
+            if (byDate != 0)
+            {
+                return byDate;
+            }
+
+            var byCalendar = string.CompareOrdinal(left.Calendar, right.Calendar);
+
+            return byCalendar != 0 ? byCalendar : string.CompareOrdinal(left.Label, right.Label);
+        });
+
+        return new SessionCalendarView(
+            from,
+            to,
+            calendars,
+            SessionGenerator.GeneratorVersion,
+            generator.Data.Revision,
+            generator.Data.KnownGoodThrough,
+            databaseConfigured,
+            entries.Count(entry => entry.Generated is not null),
+            entries.Count(entry => entry.State == SessionCalendarEntryState.InSync),
+            entries.Count(entry => entry.State == SessionCalendarEntryState.Missing),
+            entries.Count(entry => entry.State == SessionCalendarEntryState.Mismatched),
+            entries.Count(entry => entry.State == SessionCalendarEntryState.Phantom),
+            entries);
+    }
+
+    private static async Task<List<PersistedSession>> ReadPersistedAsync(
+        NpgsqlConnection connection,
+        string calendar,
+        DateOnly from,
+        DateOnly to,
+        CancellationToken cancellationToken)
+    {
         await using var command = new NpgsqlCommand(
-            "SELECT session_id, calendar, trading_date, open_utc, close_utc, label, is_half_day " +
+            "SELECT session_id, calendar, trading_date, open_utc, close_utc, label, is_half_day, generator_version " +
             "FROM research.sessions " +
             "WHERE calendar = $1 AND trading_date >= $2 AND trading_date <= $3 " +
             "ORDER BY trading_date, open_utc",
@@ -144,22 +342,24 @@ public sealed class SessionCalendarService(
         command.Parameters.AddWithValue(from);
         command.Parameters.AddWithValue(to);
 
-        var sessions = new List<TradingSession>();
+        var rows = new List<PersistedSession>();
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
 
         while (await reader.ReadAsync(cancellationToken))
         {
-            sessions.Add(new TradingSession(
-                reader.GetInt64(0),
-                reader.GetString(1),
-                reader.GetFieldValue<DateOnly>(2),
-                reader.GetFieldValue<DateTimeOffset>(3),
-                reader.GetFieldValue<DateTimeOffset>(4),
-                reader.GetString(5),
-                reader.GetBoolean(6)));
+            rows.Add(new PersistedSession(
+                new TradingSession(
+                    reader.GetInt64(0),
+                    reader.GetString(1),
+                    reader.GetFieldValue<DateOnly>(2),
+                    reader.GetFieldValue<DateTimeOffset>(3),
+                    reader.GetFieldValue<DateTimeOffset>(4),
+                    reader.GetString(5),
+                    reader.GetBoolean(6)),
+                reader.GetInt16(7)));
         }
 
-        return sessions;
+        return rows;
     }
 
     private static async Task<(int Inserted, int Updated)> UpsertAsync(

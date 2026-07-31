@@ -1,8 +1,10 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using Npgsql;
 using TradingStuff.ResearchService.Persistence;
 using TradingStuff.ResearchService.Recording;
+using TradingStuff.ResearchService.Sessions;
 using TradingStuff.ResearchService.Universe;
 
 namespace TradingStuff.Tests;
@@ -36,6 +38,20 @@ public sealed class ResearchRecordingPostgresTests
         new ConfigurationBuilder()
             .AddInMemoryCollection(new Dictionary<string, string?> { ["ConnectionStrings:trading"] = connectionString })
             .Build();
+
+    private static CoverageMonitor MonitorFor(string connectionString) =>
+        new(ConfigurationFor(connectionString), new SessionClock(), Options.Create(new CoverageOptions()),
+            NullLogger<CoverageMonitor>.Instance);
+
+    /// <summary>
+    /// Materialises the sessions the coverage window needs. Without this the table is empty, which is
+    /// not a benign starting state — see
+    /// <see cref="Coverage_refuses_to_report_a_ratio_when_the_sessions_table_is_unsynced"/>.
+    /// </summary>
+    private static Task SyncSessionsAsync(string connectionString) =>
+        new SessionCalendarService(
+                new SessionGenerator(), ConfigurationFor(connectionString), NullLogger<SessionCalendarService>.Instance)
+            .SyncAllAsync(new DateOnly(2026, 7, 1), new DateOnly(2026, 8, 31), CancellationToken.None);
 
     [Fact]
     public async Task Migration_003_seeds_the_54_node_registered_grid()
@@ -198,17 +214,142 @@ public sealed class ResearchRecordingPostgresTests
             await gap.ExecuteNonQueryAsync();
         }
 
-        var monitor = new CoverageMonitor(ConfigurationFor(connectionString), NullLogger<CoverageMonitor>.Instance);
+        await SyncSessionsAsync(connectionString);
+
+        var monitor = MonitorFor(connectionString);
         var report = await monitor.GetCoverageAsync(from, to, CancellationToken.None);
+
+        Assert.Equal(CoverageBasisStatus.Measured, report.Basis.Status);
 
         var node999 = Assert.Single(report.PerConId);
         Assert.Equal(999, node999.ConId);
         Assert.Equal(3, node999.MinutesWithData);
-        Assert.Equal(10, node999.TotalMinutes);
+        Assert.Equal(10, node999.TotalMinutes); // ten in-session minutes, not ten wall-clock minutes
         Assert.Equal(0.3, node999.CoverageRatio, precision: 3);
 
         var gapRow = Assert.Single(report.Gaps);
         Assert.Equal("disconnect", gapRow.Reason);
+    }
+
+    [Fact]
+    public async Task Coverage_expects_the_session_length_not_the_window_length()
+    {
+        // The regression the session calendar was wired in for. A whole UTC day of Cboe index
+        // recording is 1,185 expected minutes (GTH 00:15-13:15 UTC plus RTH 13:30-20:15 UTC on
+        // 2026-07-31), not the 1,440 the wall-clock denominator asked for — which put a flawless
+        // recording day at 82% and made the roadmap's 95% acceptance gate unreachable.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        await SyncSessionsAsync(connectionString);
+
+        var day = new DateTimeOffset(2026, 7, 31, 0, 0, 0, TimeSpan.Zero);
+        var report = await MonitorFor(connectionString).GetCoverageAsync(day, day.AddDays(1), CancellationToken.None);
+
+        Assert.Equal(CoverageBasisStatus.Measured, report.Basis.Status);
+        Assert.Equal(1185, report.TotalMinutes);
+        Assert.Equal(2, report.Basis.Sessions.Count);
+        Assert.Equal(report.Basis.GeneratedSessions, report.Basis.PersistedSessions);
+    }
+
+    [Fact]
+    public async Task Ticks_recorded_outside_every_session_cannot_push_coverage_past_one()
+    {
+        // Between the 08:15 CT GTH close and the 08:30 CT RTH open the Cboe index book is shut, but
+        // TWS will still deliver the occasional snapshot tick. Counting those in the numerator while
+        // the denominator only knows about sessions is how a ratio drifts above 100% — the numerator
+        // is therefore filtered by the same clipped session intervals as the denominator.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        await SyncSessionsAsync(connectionString);
+
+        var day = new DateTimeOffset(2026, 7, 31, 0, 0, 0, TimeSpan.Zero);
+
+        await using (var connection = new NpgsqlConnection(connectionString))
+        {
+            await connection.OpenAsync();
+
+            // 13:20 and 13:25 UTC: after GTH closes at 13:15, before RTH opens at 13:30.
+            foreach (var minute in new[] { 20, 25 })
+            {
+                await using var insert = new NpgsqlCommand(
+                    "INSERT INTO gateway.underlying_tick_events (con_id, lease_id, observed_at, changed_fields, origin, normalization_version) " +
+                    "VALUES ($1, $2, $3, 1, 1, 1)",
+                    connection);
+                insert.Parameters.AddWithValue(4001);
+                insert.Parameters.AddWithValue(Guid.NewGuid());
+                insert.Parameters.AddWithValue(day.AddHours(13).AddMinutes(minute));
+                await insert.ExecuteNonQueryAsync();
+            }
+
+            // One tick that IS inside RTH, so the conId is not simply absent from the report.
+            await using var inSession = new NpgsqlCommand(
+                "INSERT INTO gateway.underlying_tick_events (con_id, lease_id, observed_at, changed_fields, origin, normalization_version) " +
+                "VALUES ($1, $2, $3, 1, 1, 1)",
+                connection);
+            inSession.Parameters.AddWithValue(4001);
+            inSession.Parameters.AddWithValue(Guid.NewGuid());
+            inSession.Parameters.AddWithValue(day.AddHours(14));
+            await inSession.ExecuteNonQueryAsync();
+        }
+
+        var report = await MonitorFor(connectionString).GetCoverageAsync(day, day.AddDays(1), CancellationToken.None);
+
+        var underlying = Assert.Single(report.PerConId, row => row.ConId == 4001);
+        Assert.Equal(1, underlying.MinutesWithData); // the two out-of-session ticks contribute nothing
+    }
+
+    [Fact]
+    public async Task Coverage_refuses_to_report_a_ratio_when_the_sessions_table_is_unsynced()
+    {
+        // The absence hazard, and the reason CoverageMonitor consults the generator at all: a query
+        // over research.sessions cannot emit a row for a session that is missing, and a missing
+        // session SHRINKS the denominator. An empty table would therefore have reported a perfect
+        // score for a window in which nothing was recorded, rather than reporting nothing.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var day = new DateTimeOffset(2026, 7, 31, 0, 0, 0, TimeSpan.Zero);
+
+        var report = await MonitorFor(connectionString).GetCoverageAsync(day, day.AddDays(1), CancellationToken.None);
+
+        Assert.Equal(CoverageBasisStatus.SessionsOutOfSync, report.Basis.Status);
+        Assert.Null(report.OverallCoverageRatio);
+        Assert.Equal(0, report.Basis.PersistedSessions);
+        Assert.Equal(2, report.Basis.GeneratedSessions);
+    }
+
+    [Fact]
+    public async Task Coverage_over_a_closed_market_reports_no_measurement_rather_than_zero_percent()
+    {
+        // Saturday 2026-08-01. Nothing was expected, so nothing is measured — a weekend is not a 0%
+        // recording day, and reporting it as one is how an acceptance gate becomes permanently red
+        // and therefore unread.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        await SyncSessionsAsync(connectionString);
+
+        var saturday = new DateTimeOffset(2026, 8, 1, 0, 0, 0, TimeSpan.Zero);
+        var report = await MonitorFor(connectionString).GetCoverageAsync(saturday, saturday.AddDays(1), CancellationToken.None);
+
+        Assert.Equal(CoverageBasisStatus.NoSessionInWindow, report.Basis.Status);
+        Assert.Null(report.OverallCoverageRatio);
+        Assert.Equal(0, report.TotalMinutes);
+        Assert.Empty(report.Basis.Sessions);
     }
 
     [Fact]
@@ -220,12 +361,16 @@ public sealed class ResearchRecordingPostgresTests
         }
 
         var connectionString = await PrepareAsync(server);
-        var monitor = new CoverageMonitor(ConfigurationFor(connectionString), NullLogger<CoverageMonitor>.Instance);
+        await SyncSessionsAsync(connectionString);
 
-        var report = await monitor.GetCoverageAsync(DateTimeOffset.UtcNow.AddHours(-1), DateTimeOffset.UtcNow, CancellationToken.None);
+        // Inside the 2026-07-31 Cboe RTH session, so there genuinely is a denominator to fall short of.
+        var from = new DateTimeOffset(2026, 7, 31, 14, 0, 0, TimeSpan.Zero);
+        var report = await MonitorFor(connectionString).GetCoverageAsync(from, from.AddHours(1), CancellationToken.None);
 
+        Assert.Equal(CoverageBasisStatus.Measured, report.Basis.Status);
+        Assert.Equal(60, report.TotalMinutes);
         Assert.Empty(report.PerConId);
-        Assert.Equal(0, report.OverallCoverageRatio);
+        Assert.Equal(0d, report.OverallCoverageRatio);
     }
 
     [Fact]
@@ -245,17 +390,15 @@ public sealed class ResearchRecordingPostgresTests
 
         // A node assignment for a conId that never once ticks.
         await selector.UpsertAssignmentAsync(connectionString, nodeId: 9, conId: 999999, "bootstrap", CancellationToken.None);
+        await SyncSessionsAsync(connectionString);
 
-        var from = DateTimeOffset.UtcNow.AddHours(-1);
-        var to = DateTimeOffset.UtcNow;
-        var monitor = new CoverageMonitor(configuration, NullLogger<CoverageMonitor>.Instance);
-
-        var report = await monitor.GetCoverageAsync(from, to, CancellationToken.None);
+        var from = new DateTimeOffset(2026, 7, 31, 14, 0, 0, TimeSpan.Zero);
+        var report = await MonitorFor(connectionString).GetCoverageAsync(from, from.AddHours(1), CancellationToken.None);
 
         var dead = Assert.Single(report.PerConId, c => c.ConId == 999999);
         Assert.Equal(0, dead.MinutesWithData);
         Assert.Equal(0, dead.CoverageRatio);
-        Assert.Equal(0, report.OverallCoverageRatio); // the only expected conId, and it's fully dead
+        Assert.Equal(0d, report.OverallCoverageRatio); // the only expected conId, and it's fully dead
     }
 
     [Fact]

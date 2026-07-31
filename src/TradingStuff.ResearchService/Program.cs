@@ -4,6 +4,7 @@ using TradingStuff.ResearchService.Backfill;
 using TradingStuff.ResearchService.Gateway;
 using TradingStuff.ResearchService.Persistence;
 using TradingStuff.ResearchService.Recording;
+using TradingStuff.ResearchService.Sessions;
 using TradingStuff.ResearchService.Universe;
 using TradingStuff.ServiceDefaults;
 
@@ -32,7 +33,31 @@ builder.Services.AddHttpClient<IbkrGatewayClient>((sp, http) =>
     })
     .DisableAutomaticRetries(TimeSpan.FromSeconds(80));
 
+// ---- session calendar: the platform's single authority for "what data was expected when" --------
+// Everything is a singleton because the generator memoises a year of sessions per calendar on first
+// touch and is pure thereafter; a scoped instance would rebuild that cache per request for no reason.
+// The calendar dataset is registered explicitly rather than left to SessionGenerator's parameterless
+// convenience constructor, so the one place the embedded JSON enters the process is visible here.
+// SessionClock is registered under both its own type and ISessionClock: the interface is the doctrine
+// (the only type permitted to convert timezones), and resolving it must not hand out a second clock
+// with a second cache that could answer differently.
+builder.Services.AddSingleton(ExchangeCalendarSet.Embedded);
+builder.Services.AddSingleton<SessionGenerator>();
+builder.Services.AddSingleton<SessionClock>();
+builder.Services.AddSingleton<ISessionClock>(sp => sp.GetRequiredService<SessionClock>());
+builder.Services.AddSingleton<SessionCalendarService>();
+
+// A hosted service, and the justification is on SessionCalendarSynchronizer itself: research.sessions
+// has no other writer, CoverageMonitor takes its denominator from it, and an unwritten session table
+// does not fail loudly — it shrinks denominators, which makes coverage read HIGHER. The timer (twice
+// a day) exists because the synced range ends at today + N days and "today" moves under a process
+// that runs for weeks; a pass with nothing to do writes no rows.
+builder.Services.Configure<SessionCalendarOptions>(builder.Configuration.GetSection("Sessions"));
+builder.Services.AddSingleton<SessionCalendarSynchronizer>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<SessionCalendarSynchronizer>());
+
 builder.Services.AddSingleton<NodeSelector>();
+builder.Services.Configure<CoverageOptions>(builder.Configuration.GetSection("Coverage"));
 builder.Services.AddSingleton<CoverageMonitor>();
 builder.Services.AddSingleton<RecorderOrchestrator>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<RecorderOrchestrator>());
@@ -148,6 +173,12 @@ app.MapGet("/research/capabilities", async (
         }
     });
 
+// The default window stays a trailing 24 hours, but it means something different now that the
+// denominator comes from research.sessions rather than from (to - from): a trailing day ending
+// mid-RTH spans one whole Cboe GTH session plus the two RTH halves either side of it, which is
+// exactly one session-day of expected minutes. Under the old wall-clock arithmetic the same window
+// asked for 1,440 minutes of a market open for roughly 1,185 of them, so a flawless recording day
+// could not clear the 95% acceptance threshold at all.
 app.MapGet("/research/coverage", async (
         DateTimeOffset? from,
         DateTimeOffset? to,
@@ -162,6 +193,80 @@ app.MapGet("/research/coverage", async (
 
 app.MapGet("/research/nodes", async (NodeSelector nodeSelector, CancellationToken cancellationToken) =>
     Results.Ok(await nodeSelector.GetCurrentAssignmentsAsync(cancellationToken)));
+
+// The session calendar, side by side: what the generator produces for a date range, and what
+// research.sessions actually holds for it. Both halves are reported because this is the reference
+// data every downstream artifact is validated AGAINST — coverage denominators today, snapshot and
+// feature cutoffs later — so a defect in it is invisible by construction, and the only thing that
+// makes it visible is a human being able to read the boundaries against a published exchange
+// calendar. Hence the per-row generated/persisted pair, the duration in minutes (a half day is
+// obvious at a glance), and the dataset's own revision and knownGoodThrough horizon.
+//
+// Read-only in the strict sense: it never syncs, even when it reports rows as missing. Regenerating
+// can RETIRE a published session row, which is not something a page refresh should be able to do —
+// SessionCalendarSynchronizer owns that on a schedule the logs record.
+app.MapGet("/research/sessions", async (
+        string? calendar,
+        DateOnly? from,
+        DateOnly? to,
+        SessionCalendarService sessions,
+        SessionCalendarSynchronizer synchronizer,
+        SessionClock clock,
+        CancellationToken cancellationToken) =>
+    {
+        // A week either side of today: enough to see the session that is running, the one that just
+        // ran, and the one coming up, without an operator having to type dates to get a useful answer.
+        var today = DateOnly.FromDateTime(DateTime.UtcNow);
+        var start = from ?? today.AddDays(-7);
+        var end = to ?? today.AddDays(7);
+
+        if (end < start)
+        {
+            return Results.Problem(
+                title: "Invalid date range.",
+                detail: $"'to' ({end:yyyy-MM-dd}) is before 'from' ({start:yyyy-MM-dd}).",
+                statusCode: StatusCodes.Status400BadRequest);
+        }
+
+        // Bounded because the response is one row per session per calendar and the full dataset runs
+        // to tens of thousands; a year at a time is plenty to audit a calendar by hand.
+        if (end.DayNumber - start.DayNumber > 366)
+        {
+            return Results.Problem(
+                title: "Date range too wide.",
+                detail: "At most 366 days can be described in one request.",
+                statusCode: StatusCodes.Status400BadRequest);
+        }
+
+        var requested = calendar is { Length: > 0 }
+            ? calendar.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            : [.. clock.Calendars];
+
+        if (requested.Except(clock.Calendars, StringComparer.Ordinal).ToArray() is { Length: > 0 } unknown)
+        {
+            return Results.Problem(
+                title: "Unknown calendar.",
+                detail: $"'{string.Join("', '", unknown)}' is not in the calendar dataset. " +
+                        $"Known calendars: {string.Join(", ", clock.Calendars)}.",
+                statusCode: StatusCodes.Status400BadRequest);
+        }
+
+        try
+        {
+            return Results.Ok(new
+            {
+                calendar = await sessions.DescribeAsync(requested, start, end, cancellationToken),
+                sync = synchronizer.State,
+            });
+        }
+        catch (NpgsqlException ex)
+        {
+            return Results.Problem(
+                title: "Could not read the session calendar.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+    });
 
 // Backfill progress, derived from research.backfill_requests rather than from any in-memory
 // tracker — the same "a restart re-derives state from the checkpoint table" principle the table

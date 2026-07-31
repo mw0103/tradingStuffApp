@@ -283,10 +283,10 @@ until a live session has been recorded end to end.
   logic that Phase 2's `EsContractWalker` already owns; duplicating it here for Phase 1 would be
   exactly the premature abstraction the plan argues against.
 - **`CoverageMonitor`** + `GET /research/coverage`: per-conId and overall coverage ratio (distinct
-  1-minute buckets with data ÷ total minutes) over a window (default trailing 24 h — this measures
-  a fixed UTC window, not yet an actual RTH/GTH session; `SessionCalendarService` in Phase 2 will
-  let this align to real session boundaries), plus overlapping `recorder_gaps` rows.
-  `GET /research/nodes` reports current assignments.
+  1-minute buckets with data ÷ expected minutes) over a window, plus overlapping `recorder_gaps`
+  rows. `GET /research/nodes` reports current assignments. **Superseded in Phase 2:** the
+  denominator was a fixed UTC window here, which Phase 2 replaced with real session minutes — see
+  the Phase 2 entry for why that made the 95 % gate unreachable by construction.
 - **`/research/*` is anonymous** (matching AuditDashboard's existing unauthenticated `/`) — a
   deliberate posture change from Phase 0's `RequireAuthorization()` on `/research/status` and
   `/research/capabilities`, applied consistently to the new endpoints too.
@@ -374,8 +374,35 @@ Roadmap Phase 2 (`docs/plans/ibkr-edge-research-roadmap.md`): the historical pla
   plus `kind` (historical vs top-up) and per-job `slice_duration`. 006: gap-close provenance (below).
 - **`IbkrHistoricalClient`** — `reqHeadTimeStamp` and `reqHistoricalData` with `formatDate=2`
   (epoch) so exchange-local timezone strings never enter parsing. `reqRealTimeBars` stays cut.
-- **`SessionCalendarService` + `SessionClock`** — the only type permitted to call
-  `TimeZoneInfo.ConvertTime`; half-days and DST transitions covered by tests.
+- **`SessionCalendarService` + `SessionClock` + `SessionCalendarSynchronizer`** — the platform's
+  single authority for "what data was expected when". `SessionClock` is the only type permitted to
+  call `TimeZoneInfo.ConvertTime`, and it is registered under both its own type and `ISessionClock`
+  so resolving the interface cannot hand out a second clock with a second cache. The synchronizer is
+  a hosted service because `research.sessions` has no other writer and an unwritten session table
+  does not fail loudly — it shrinks every denominator, which makes coverage read *higher*; its timer
+  exists to move the `today + N` horizon under a process that runs for weeks, not to detect change.
+  Verified live: one startup pass materialised 32,682 rows across 4 calendars for 1993→2026.
+- **The coverage denominator was wrong, and wrong in the flattering direction.** It divided
+  tick-bearing minutes by `(to - from)`, so the default trailing-24 h window asked for 1,440 minutes
+  of a market open for about 1,185 and reported single-digit percentages on a perfectly healthy day —
+  which made the roadmap's 95 % acceptance threshold **unreachable by construction, and therefore
+  meaningless**. Expected minutes now come from the union of the RTH and GTH sessions overlapping the
+  window, clipped to it, counted by an ordered sweep rather than summed (`CME_ES` nests RTH inside
+  its Globex row; summing would inflate that denominator by 405 min/day). The numerator is filtered
+  by the same clipped intervals, so numerator ⊆ denominator by construction and an out-of-session
+  tick cannot push a conId past 100 %.
+- **Coverage refuses to report a number it cannot justify.** `research.sessions` is reconciled
+  boundary-for-boundary against what `ISessionClock` generates for the same window; on any
+  disagreement the ratio is `null` with status `sessions-out-of-sync`. This is the class (c)
+  absent-row discipline applied to a denominator: a query over the table cannot emit a row for a
+  *missing* session, and the missing row shrinks the denominator, so absence renders as health in
+  the one direction nobody checks. The clock is a pure function of the checked-in calendar data and
+  never reads the table, so it is a genuinely independent witness. A weekend now reports
+  `no-session-in-window` with no ratio rather than a fabricated 0 % — migration 006's lesson, that a
+  permanently-red gate is a gate nobody reads, applied a second time.
+- **`GET /research/sessions`** — generated vs persisted rows side by side with an `in-sync` /
+  `missing` / `mismatched` / `phantom` state per row, so the calendar everything downstream is
+  validated against can itself be checked.
 - **`BackfillPlanner` / `BackfillCoordinator` / `BackfillStore`** — resumable and idempotent by
   construction; the request row IS the checkpoint. Claiming is one `UPDATE ... RETURNING` over a
   `FOR UPDATE ... SKIP LOCKED` candidate subquery, because `SKIP LOCKED` has no
@@ -484,8 +511,21 @@ Milestone 2 (research platform — sequenced in `docs/plans/ibkr-edge-research-r
   (fixed moneyness offsets). Re-evaluating a node's assigned strike against its own recorded delta
   once streaming (the roadmap's "|Δ−target| > 0.10 sustained 30 min" rule), with dual-subscribe
   overlap and a churn cap, is a deliberate, documented follow-up — not implemented yet.
-- Phase 2: session calendar, historical client, resumable backfill (SPX/SPY/VIX/ES incl.
-  `EsContractWalker`, which will also unblock live ES tick recording), gap detection.
+- **Per-conId session calendars.** Coverage uses ONE denominator (Cboe RTH+GTH) for every conId,
+  but SPY is NYSE-calendared and neither the SPX nor the VIX index level updates through Cboe GTH,
+  so those three underlying lines cannot exceed roughly a third of the denominator however healthy
+  the recording is — and `OverallCoverageRatio` is an unweighted mean, so they drag it down a couple
+  of points. Not a regression (the old wall-clock denominator was worse for everything), but until
+  this is fixed **read the 95 % gate against the option-node rows, not the overall figure**. Doing
+  it properly needs a conId → instrument → calendar mapping, and the core underlyings are not in
+  `node_assignments` to hang one off.
+- **A dead core-underlying subscription is still invisible.** Phase 1 fixed this for option nodes by
+  unioning tick counts with `node_assignments`, but the core underlyings are not in that table, so a
+  fully-dead SPX/VIX/SPY line still produces no row rather than a 0 % row. Same absent-row class as
+  the defects above; carried forward knowingly.
+- **No repair-on-demand for a drifted `research.sessions`.** Recovery is a restart or the 12 h
+  timer. A sync trigger on an endpoint was rejected deliberately: regenerating can retire a
+  published session row, which must not be a side effect of a page refresh.
 - Phases 3–8: snapshots → features/labels/baselines/study runner → residual models →
   implied-vs-forecast study → execution simulator → shadow ops.
 
