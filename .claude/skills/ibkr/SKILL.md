@@ -125,7 +125,9 @@ type, whether trading is permitted, in-flight request count).
 
 ## Safety rules — non-negotiable
 
-`docs/PLAN.md` states: *"No live broker orders are placed in v1."* Hold that line.
+`docs/PLAN.md` scopes v1 to two non-live modes — *simulated* (fills invented locally) and
+*paper brokerage* (real orders to a `DU` account, simulated money). Orders against a funded
+(`U`-prefixed) account are out of scope. Hold that line.
 
 - **Default to paper.** Port 7497/4002 and a `DU`-prefixed account. A `U`-prefixed account is live money.
 - **Live routing requires an explicit, separate opt-in** — a config flag that is `false` by default

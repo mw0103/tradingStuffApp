@@ -11,7 +11,7 @@ Greenfield .NET Aspire trading microservice workspace focused on paper options e
 - C# audit dashboard with local operator links.
 - Shared contracts for options, multileg orders, quotes, fills, risk decisions, and lifecycle events.
 - Aspire AppHost wiring for Postgres, RabbitMQ, Keycloak, TWS connection parameters, and all services.
-- xUnit coverage (45 tests) for strategy validation, risk rejection, paper fills, workflow orchestration, and the IBKR adapter logic.
+- xUnit coverage (91 tests) for strategy validation, risk rejection, fills, workflow orchestration, and the IBKR adapter logic.
 
 ## Run
 
@@ -111,7 +111,9 @@ extended hours. Orders outside 09:30–16:15 ET also need `IBKR__OutsideRegularT
 
 ### Safety
 
-Paper only. `docs/PLAN.md` holds the line that **no live broker orders are placed in v1**.
+No orders against a funded account in v1 — see the trading-mode table in `docs/PLAN.md`.
+*Simulated* (fills invented locally) and *paper brokerage* (real orders to a `DU` account) are both
+in scope and are not the same thing.
 `IBKR:AllowLiveTrading` defaults to false; if the connected account is not `DU`-prefixed while it is
 false, the gateway logs a critical warning and blocks order placement while still serving market data.
 
@@ -131,6 +133,9 @@ The next production step is to replace `DevelopmentJwtAuthenticationHandler` wit
 ## Known Follow-ups
 
 - Replace in-memory repositories/outbox with Postgres-backed order state and RabbitMQ publishing.
-- Replace deterministic market-data provider with an IBKR Gateway adapter.
+  Both containers currently start unused, as does Keycloak.
+- Replace the stubbed `PortfolioProvider` with real IBKR account/position data. Until then the risk
+  engine runs on fabricated buying power, zero daily P&L, and zero existing Greeks.
+- Cover the remaining 11 risk breach codes with tests.
 - Add the Python ML signal service after execution/risk/data behavior is stable.
 - Address Aspire 13.4.2 transitive `MessagePack` vulnerability warnings when an upstream patched Aspire package is available.
