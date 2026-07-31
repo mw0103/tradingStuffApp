@@ -107,7 +107,7 @@ public sealed class TradingWorkflowTests
                 MaxDailyLoss: 1_000m,
                 MaxAbsGreeks: new GreeksVector(1_000m, 1_000m, 1_000m, 1_000m)))),
             new FakePortfolioProvider(SampleOrders.Portfolio(order.AccountId)),
-            new PaperExecutionEngine(),
+            new PaperOrderRouter(new PaperExecutionEngine()),
             repository,
             publisher);
 

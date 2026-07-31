@@ -23,6 +23,7 @@
     <ProjectReference Include="..\..\src\TradingStuff.ExecutionService\TradingStuff.ExecutionService.csproj" />
     <ProjectReference Include="..\..\src\TradingStuff.RiskService\TradingStuff.RiskService.csproj" />
     <ProjectReference Include="..\..\src\TradingStuff.MarketDataService\TradingStuff.MarketDataService.csproj" />
+    <ProjectReference Include="..\..\src\TradingStuff.IbkrGateway\TradingStuff.IbkrGateway.csproj" />
   </ItemGroup>
 
 </Project>

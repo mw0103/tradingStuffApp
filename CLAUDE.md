@@ -18,7 +18,7 @@ mkdir -p /tmp/dotnet_home
 
 ```bash
 dotnet build TradingStuff.slnx
-dotnet test tests/TradingStuff.Tests/TradingStuff.Tests.csproj -m:1    # 6 tests, all should pass
+dotnet test tests/TradingStuff.Tests/TradingStuff.Tests.csproj -m:1    # 45 tests, all should pass
 aspire start --non-interactive                                        # full distributed app
 ```
 
@@ -34,7 +34,9 @@ For logic changes, `dotnet test` alone is the fast loop.
 | `TradingStuff.Contracts` | All shared records/enums, single file `TradingContracts.cs`. Changes here ripple everywhere. |
 | `TradingStuff.ExecutionService` | Order REST API, validation, lifecycle, paper fills, event publishing |
 | `TradingStuff.RiskService` | Pre-trade risk: buying power, max loss, contract count, daily loss, Greeks limits |
-| `TradingStuff.MarketDataService` | Option quotes, Greeks, chains. Currently a deterministic generator. |
+| `TradingStuff.MarketDataService` | Option quotes, Greeks, chains. Deterministic generator or IBKR, per `MarketData:Source`. |
+| `TradingStuff.IbkrGateway` | Owns the **single** TWS socket. Contract resolution, chains, quotes, order placement. |
+| `third_party/IBApi` | Vendored IBKR TWS API 10.45.01. Do not edit. |
 | `TradingStuff.AuditDashboard` | Local operator surface |
 | `TradingStuff.ServiceDefaults` | OpenTelemetry, health checks, resilience, dev auth handler |
 | `TradingStuff.AppHost` | Aspire orchestration |
@@ -46,7 +48,11 @@ persist → publish lifecycle events. Read it before changing anything order-rel
 
 - **.NET 10, Aspire 13.4, C# 13.** Primary constructors, file-scoped namespaces, `sealed record` for
   contracts, collection expressions (`[]`), minimal APIs. Match the surrounding style.
-- **All money and prices are `decimal`.** Never `double` outside a broker-adapter boundary.
+- **All money and prices are `decimal`.** Never `double` outside a broker-adapter boundary
+  (`IBApi` is all `double`; convert only there).
+- **Never key a collection on a whole `OptionContract`.** It is a `record`, so equality covers every
+  property and lookups break as soon as one side carries a broker-enriched field. Use
+  `contract.Key()` → `OptionContractKey`. Do not add broker fields like `ConId` to the record.
 - Services talk to each other over HTTP with a bearer token via
   `ServiceClientConfiguration.ConfigureInternalClient`. Endpoints use `.RequireAuthorization()`.
 - Every order carries `OrderId` + `CorrelationId`; lifecycle events chain via `CausationId`.
@@ -62,9 +68,13 @@ Outstanding (from `docs/STATE.md`):
 - In-memory order/event stores → Postgres
 - In-memory event publisher → RabbitMQ
 - `DevelopmentJwtAuthenticationHandler` → Keycloak OIDC/JWT validation
-- Deterministic market data → real IBKR adapter
+- IBKR stage 5: account/position sync → replace the stubbed `PortfolioProvider` (the last gap)
 - Python ML signal service
 - Aspire transitive `MessagePack` advisory, pending an upstream patch
+
+The IBKR integration is complete end to end: connection, contract resolution, chains, quotes with
+Greeks, and order placement. A full round trip has filled on the paper account. Prerequisites and
+gotchas are in `docs/STATE.md`; API detail is in the `ibkr` skill.
 
 ## Trading safety
 

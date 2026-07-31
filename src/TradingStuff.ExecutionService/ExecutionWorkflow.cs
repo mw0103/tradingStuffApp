@@ -7,7 +7,7 @@ public sealed class ExecutionWorkflow(
     IMarketDataClient marketDataClient,
     IRiskClient riskClient,
     IPortfolioProvider portfolioProvider,
-    PaperExecutionEngine paperExecutionEngine,
+    IOrderRouter orderRouter,
     IOrderRepository orderRepository,
     IExecutionEventPublisher eventPublisher)
 {
@@ -55,22 +55,26 @@ public sealed class ExecutionWorkflow(
         }
 
         events.Add(NewEvent(orderId, OrderLifecycleStatus.RiskApproved, "Risk service approved the order.", correlationId, events[^1].EventId));
-        events.Add(NewEvent(orderId, OrderLifecycleStatus.Submitted, "Order submitted to paper execution engine.", correlationId, events[^1].EventId));
+        events.Add(NewEvent(orderId, OrderLifecycleStatus.Submitted, $"Order submitted via the '{orderRouter.Name}' router.", correlationId, events[^1].EventId));
 
-        var paperResult = paperExecutionEngine.Execute(orderId, request, quoteResponse.Quotes);
-        if (paperResult.Fills.Count > 0)
+        var routed = await orderRouter.RouteAsync(orderId, request, quoteResponse.Quotes, cancellationToken);
+
+        if (routed.Fills.Count > 0 || routed.Status != OrderLifecycleStatus.Submitted)
         {
-            events.Add(NewEvent(orderId, paperResult.Status, $"Paper engine produced {paperResult.Fills.Count} fill(s).", correlationId, events[^1].EventId));
+            var detail = routed.BrokerReference is { } reference ? $" (broker order {reference})" : string.Empty;
+            var message = routed.Message ?? $"Router '{orderRouter.Name}' produced {routed.Fills.Count} fill(s).";
+
+            events.Add(NewEvent(orderId, routed.Status, message + detail, correlationId, events[^1].EventId));
         }
 
         var acceptedOrder = new ExecutionOrder(
             orderId,
             correlationId,
             request,
-            paperResult.Status,
+            routed.Status,
             quoteResponse.Quotes,
             riskDecision,
-            paperResult.Fills,
+            routed.Fills,
             events,
             now,
             DateTimeOffset.UtcNow);
@@ -78,7 +82,7 @@ public sealed class ExecutionWorkflow(
         await orderRepository.SaveAsync(acceptedOrder, cancellationToken);
         await PublishLifecycleAsync(acceptedOrder, cancellationToken);
 
-        return new SubmitOrderResponse(orderId, correlationId, acceptedOrder.Status, riskDecision, paperResult.Fills);
+        return new SubmitOrderResponse(orderId, correlationId, acceptedOrder.Status, riskDecision, routed.Fills);
     }
 
     public Task<ExecutionOrder?> GetAsync(Guid orderId, CancellationToken cancellationToken) =>

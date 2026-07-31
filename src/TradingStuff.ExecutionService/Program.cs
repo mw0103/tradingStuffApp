@@ -33,6 +33,35 @@ builder.Services.AddHttpClient<IMarketDataClient, HttpMarketDataClient>((sp, cli
         "http://marketdataservice");
 });
 
+builder.Services.AddHttpClient<IbkrOrderRouter>((sp, client) =>
+{
+    ServiceClientConfiguration.ConfigureInternalClient(
+        client,
+        sp.GetRequiredService<IConfiguration>(),
+        "IbkrGateway:BaseUrl",
+        "http://ibkrgateway");
+});
+
+builder.Services.AddSingleton<PaperOrderRouter>();
+
+// Simulated fills unless real routing is explicitly opted into. An unrecognised value stays on
+// paper rather than silently sending orders to a broker.
+builder.Services.AddSingleton<IOrderRouter>(sp =>
+{
+    var router = sp.GetRequiredService<IConfiguration>()["Execution:Router"];
+
+    if (!OrderRouters.UsesIbkr(router))
+    {
+        return sp.GetRequiredService<PaperOrderRouter>();
+    }
+
+    sp.GetRequiredService<ILogger<Program>>().LogWarning(
+        "Execution:Router is '{Router}': approved orders will be sent to IBKR through the gateway.",
+        OrderRouters.Ibkr);
+
+    return sp.GetRequiredService<IbkrOrderRouter>();
+});
+
 var app = builder.Build();
 
 app.UseAuthentication();

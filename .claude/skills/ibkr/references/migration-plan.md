@@ -1,5 +1,9 @@
 # Staged migration: deterministic provider → IBKR
 
+> **Status (2026-07-31): stages 1–4 and 6 complete**, verified live against a `DU` paper account
+> on TWS server version 223 — real chains, real conIds, real Greeks, and a filled SPXW vertical
+> round trip. Only stage 5 (account/position sync) remains.
+
 `DeterministicOptionMarketDataProvider` is the only reason the 6 tests in
 `tests/TradingStuff.Tests/TradingWorkflowTests.cs` are repeatable. It does not get deleted — it
 becomes the default provider behind a switch, and stays the one used by tests and offline work.
@@ -21,7 +25,7 @@ class is step 0 — `MarketDataService/Program.cs` currently injects the concret
 
 ---
 
-## Stage 1 — Connection only
+## Stage 1 (DONE) — Connection only
 
 `src/TradingStuff.IbkrGateway`: one `EClientSocket`, `EWrapper` implementation, the `EReader` pump
 thread, reconnect-with-backoff, and `AddServiceDefaults()` for the shared auth/telemetry.
@@ -35,30 +39,32 @@ Wire into AppHost per the parameter change in `SKILL.md`. Point
 **Done when:** `aspire start` with TWS paper running shows connected + a `DU` account; with TWS
 *not* running, the service starts, reports unhealthy, and retries without crashing the AppHost.
 
-## Stage 2 — Contract resolution
+## Stage 2 (DONE) — Contract resolution
 
 `reqContractDetails` → conId, with an in-memory cache keyed on underlying + expiry + strike + right +
 currency, and the TCS bridge from `references/tws-api.md`.
 
-Resolve the `OptionContract`-carries-`ConId` question here (trap #2 in `SKILL.md`) **before**
-anything depends on it. Recommended: keep `OptionContract` unchanged and hold conIds in an
-adapter-side cache, so `PaperExecutionEngine`'s record-equality dictionary lookups keep working.
+Resolved as trap #2 in `SKILL.md`: conIds live in an adapter-side cache keyed on
+`OptionContractKey`, never on the whole `OptionContract` record.
 
 `POST /ibkr/contracts/resolve` taking `OptionContract[]`.
 
 **Done when:** a known-good SPY option resolves to a conId; a bogus strike returns a clean error
 (200) rather than hanging; the existing 6 tests still pass untouched.
 
-## Stage 3 — Chains
+## Stage 3 (DONE) — Chains
 
-`reqSecDefOptParams` behind `GET /market-data/options/chains/{underlying}`. Deduplicate the
-per-exchange callbacks, prefer `SMART`, filter to a strike window around spot (the deterministic
-provider's ±5 strikes × 2 rights is the shape to preserve).
+`reqSecDefOptParams` behind `GET /market-data/options/chains/{underlying}`, filtered to a strike
+window around spot (the deterministic provider's ±5 strikes × 2 rights is the shape preserved).
+
+Segment selection is by **`tradingClass == symbol`**, *not* by `SMART` — SPY's only `SMART` segment
+is the adjusted `2SPY` class with 3 strikes, while the real 489-strike chain has no `SMART` row at
+all. See `references/tws-api.md`.
 
 **Done when:** the endpoint returns real expirations/strikes with `MarketData:Source=ibkr-delayed`,
 and still returns the deterministic chain on the default source.
 
-## Stage 4 — Quotes and Greeks
+## Stage 4 (DONE) — Quotes and Greeks
 
 `reqMktData` streaming, accumulate `tickPrice` + `tickOptionComputation` per tickerId, emit a
 `QuoteSnapshot` when bid/ask/model-greeks are all present or a timeout fires. Guard every
@@ -72,7 +78,7 @@ path.
 subscription count returns to zero after each call; the 6 tests still pass on the deterministic
 source.
 
-## Stage 5 — Account and positions (read-only)
+## Stage 5 (not started) — Account and positions (read-only)
 
 `reqAccountSummary` / `reqPositions` → replace the stub behind
 `ExecutionService/PortfolioProvider.cs` so `PortfolioSnapshot.BuyingPower` and `ExistingGreeks`
@@ -82,9 +88,9 @@ this is what makes the existing risk limits real, and it carries zero order-plac
 **Done when:** `RiskEvaluationRequest.Portfolio` reflects actual paper-account buying power and
 positions.
 
-## Stage 6 — Order placement (paper only, last)
+## Stage 6 (DONE) — Order placement (paper only)
 
-Only after 1–5 are stable. Combo/BAG construction, `placeOrder`, `orderStatus` → lifecycle mapping,
+Combo/BAG construction, `placeOrder`, `orderStatus` → lifecycle mapping,
 `execDetails` → `FillReport` with `FillLiquidity.BrokerReported` and `ExecId` dedupe.
 
 Guards, all of them required:
@@ -103,14 +109,18 @@ Guards, all of them required:
 
 ## Test strategy
 
-The 6 existing tests are unit tests with fake clients — they must never touch a socket. Keep them on
-the deterministic provider permanently.
+The suite is 91 unit tests using fake clients — none of them touch a socket, and none may. Keep them
+on the deterministic provider permanently.
 
-New IBKR tests split in two:
+Already covered: tick sentinel guarding (price vs Greek sign rules), delayed-tick-field handling,
+partial-quote settling, request/error correlation, error-code classification, chain segment
+selection, provider selection fallback, and the `OptionContractKey` regressions.
 
-- **Unit** — combo construction (ratio/GCD/spread-count arithmetic, credit sign), `orderStatus` →
-  lifecycle mapping, tick sentinel guarding, `decimal`↔`double` rounding. No socket. These cover the
-  logic most likely to be wrong.
+Also covered: combo construction (ratio/GCD/spread-count arithmetic, credit sign), `orderStatus` →
+lifecycle mapping, BAG-summary exclusion, and conId-based fill attribution.
+
+Still to add when stage 5 lands:
+
 - **Integration** — marked with a trait so they are excluded by default, requiring a running paper
   TWS. Never in the default `dotnet test` run.
 

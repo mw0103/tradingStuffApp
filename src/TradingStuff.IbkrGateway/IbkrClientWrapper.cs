@@ -1,0 +1,235 @@
+using IBApi;
+
+namespace TradingStuff.IbkrGateway;
+
+/// <summary>One segment of a <c>reqSecDefOptParams</c> response — TWS sends one per exchange/class.</summary>
+internal sealed record OptionChainSegment(
+    string Exchange,
+    int UnderlyingConId,
+    string TradingClass,
+    string Multiplier,
+    IReadOnlyList<string> Expirations,
+    IReadOnlyList<double> Strikes);
+
+/// <summary>
+/// Routes TWS callbacks to the pending requests that are waiting on them.
+/// </summary>
+/// <remarks>
+/// Derives from <see cref="DefaultEWrapper"/> so only the handful of callbacks this adapter uses are
+/// overridden rather than all ~170 members of <see cref="EWrapper"/>.
+/// <para>
+/// Every method here runs on the EReader pump thread. Do no blocking work and take no long locks —
+/// stalling this thread stalls every in-flight request on the connection.
+/// </para>
+/// </remarks>
+public sealed class IbkrClientWrapper(
+    IbkrRequestRegistry registry,
+    IbkrOrderTracker orderTracker,
+    ILogger<IbkrClientWrapper> logger)
+    : DefaultEWrapper
+{
+    public event Action<int>? NextValidIdReceived;
+    public event Action<string>? ManagedAccountsReceived;
+    public event Action? ConnectionClosedReceived;
+    public event Action<int>? ConnectivityChanged;
+
+    // ---- connection lifecycle -------------------------------------------------------------
+
+    public override void nextValidId(int orderId)
+    {
+        logger.LogInformation("TWS assigned next valid order id {OrderId}.", orderId);
+        NextValidIdReceived?.Invoke(orderId);
+    }
+
+    public override void managedAccounts(string accountsList)
+    {
+        logger.LogInformation("TWS reported managed accounts.");
+        ManagedAccountsReceived?.Invoke(accountsList);
+    }
+
+    public override void connectionClosed()
+    {
+        logger.LogWarning("TWS connection closed.");
+        registry.FailAll(new IbkrConnectionException("The TWS connection closed while requests were in flight."));
+        ConnectionClosedReceived?.Invoke();
+    }
+
+    public override void marketDataType(int reqId, int marketDataType) =>
+        logger.LogInformation("Market data type for request {ReqId} is {MarketDataType}.", reqId, marketDataType);
+
+    // ---- errors ---------------------------------------------------------------------------
+
+    public override void error(int id, long errorTime, int errorCode, string errorMsg, string advancedOrderRejectJson)
+    {
+        if (IbkrErrorCodes.IsInformational(errorCode))
+        {
+            logger.LogDebug("TWS notice {Code} (request {ReqId}): {Message}", errorCode, id, errorMsg);
+
+            if (IbkrErrorCodes.IsConnectionLevel(errorCode))
+            {
+                ConnectivityChanged?.Invoke(errorCode);
+            }
+
+            return;
+        }
+
+        if (IbkrErrorCodes.IsConnectionLevel(errorCode))
+        {
+            logger.LogWarning("TWS connectivity event {Code}: {Message}", errorCode, errorMsg);
+
+            if (errorCode == IbkrErrorCodes.ConnectivityLost)
+            {
+                registry.FailAll(new IbkrConnectionException($"TWS connectivity lost ({errorCode}): {errorMsg}"));
+            }
+
+            ConnectivityChanged?.Invoke(errorCode);
+            return;
+        }
+
+        // id is -1 for connection-scoped messages; anything else targets a specific request or order
+        // and must fault it, or the caller waits forever for a reply that will never come. Requests
+        // and orders share one id sequence, so at most one of these two claims it.
+        if (id >= 0 && registry.Fail(id, new IbkrRequestException(errorCode, errorMsg)))
+        {
+            logger.LogWarning("TWS error {Code} faulted request {ReqId}: {Message}", errorCode, id, errorMsg);
+            return;
+        }
+
+        if (id >= 0)
+        {
+            orderTracker.ApplyError(id, errorCode, errorMsg);
+        }
+
+        logger.LogWarning("TWS error {Code} (request {ReqId}): {Message}", errorCode, id, errorMsg);
+    }
+
+    public override void error(Exception e) =>
+        logger.LogError(e, "TWS client raised an exception.");
+
+    public override void error(string str) =>
+        logger.LogError("TWS client error: {Message}", str);
+
+    // ---- contract resolution --------------------------------------------------------------
+
+    public override void contractDetails(int reqId, ContractDetails contractDetails) =>
+        registry.Get<ListRequest<ContractDetails>>(reqId)?.Add(contractDetails);
+
+    public override void contractDetailsEnd(int reqId)
+    {
+        registry.Get<ListRequest<ContractDetails>>(reqId)?.Complete();
+        registry.Remove(reqId);
+    }
+
+    // ---- option chains --------------------------------------------------------------------
+
+    public override void securityDefinitionOptionParameter(
+        int reqId,
+        string exchange,
+        int underlyingConId,
+        string tradingClass,
+        string multiplier,
+        HashSet<string> expirations,
+        HashSet<double> strikes) =>
+        registry.Get<ListRequest<OptionChainSegment>>(reqId)?.Add(new OptionChainSegment(
+            exchange,
+            underlyingConId,
+            tradingClass,
+            multiplier,
+            [.. expirations],
+            [.. strikes]));
+
+    public override void securityDefinitionOptionParameterEnd(int reqId)
+    {
+        registry.Get<ListRequest<OptionChainSegment>>(reqId)?.Complete();
+        registry.Remove(reqId);
+    }
+
+    // ---- market data ----------------------------------------------------------------------
+
+    public override void tickPrice(int tickerId, int field, double price, TickAttrib attribs) =>
+        registry.Get<ITickSink>(tickerId)?.ApplyPrice(field, price);
+
+    public override void tickOptionComputation(
+        int tickerId,
+        int field,
+        int tickAttrib,
+        double impliedVolatility,
+        double delta,
+        double optPrice,
+        double pvDividend,
+        double gamma,
+        double vega,
+        double theta,
+        double undPrice) =>
+        registry.Get<ITickSink>(tickerId)?.ApplyOptionComputation(field, delta, gamma, vega, theta);
+
+    public override void tickSnapshotEnd(int tickerId) =>
+        registry.Get<ITickSink>(tickerId)?.CompletePartial();
+
+    // ---- orders ---------------------------------------------------------------------------
+
+    public override void orderStatus(
+        int orderId,
+        string status,
+        decimal filled,
+        decimal remaining,
+        double avgFillPrice,
+        long permId,
+        int parentId,
+        double lastFillPrice,
+        int clientId,
+        string whyHeld,
+        double mktCapPrice) =>
+        orderTracker.ApplyOrderStatus(orderId, status, filled, remaining, avgFillPrice, permId, whyHeld);
+
+    public override void openOrder(int orderId, Contract contract, Order order, OrderState orderState)
+    {
+        logger.LogDebug(
+            "Open order {OrderId}: {Status} {OrderType} on {Symbol}.",
+            orderId,
+            orderState.Status,
+            order.OrderType,
+            contract.Symbol);
+
+        orderTracker.AddOpenOrder(new OpenOrderSummary(
+            orderId,
+            contract.Symbol ?? string.Empty,
+            contract.SecType ?? string.Empty,
+            order.Action ?? string.Empty,
+            order.TotalQuantity,
+            order.OrderType ?? string.Empty,
+            order.LmtPrice,
+            orderState.Status ?? string.Empty,
+            order.Account ?? string.Empty));
+    }
+
+    public override void openOrderEnd() => orderTracker.CompleteOpenOrdersSweep();
+
+    public override void execDetails(int reqId, Contract contract, Execution execution)
+    {
+        logger.LogInformation(
+            "Execution {ExecId} on order {OrderId}: {Shares} @ {Price}.",
+            execution.ExecId,
+            execution.OrderId,
+            execution.Shares,
+            execution.Price);
+
+        orderTracker.ApplyExecution(contract, execution);
+    }
+
+    public override void commissionAndFeesReport(CommissionAndFeesReport commissionAndFeesReport) =>
+        orderTracker.ApplyCommission(commissionAndFeesReport);
+}
+
+/// <summary>The socket dropped, or was never up, when a request needed it.</summary>
+public sealed class IbkrConnectionException(string message) : Exception(message);
+
+/// <summary>TWS rejected a specific request.</summary>
+public sealed class IbkrRequestException(int errorCode, string message)
+    : Exception($"TWS error {errorCode}: {message}")
+{
+    public int ErrorCode { get; } = errorCode;
+
+    /// <summary>True when retrying the identical request cannot succeed.</summary>
+    public bool IsPermanent => IbkrErrorCodes.IsPermanentRequestFailure(ErrorCode);
+}

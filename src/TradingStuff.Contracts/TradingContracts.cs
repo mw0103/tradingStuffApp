@@ -82,7 +82,53 @@ public sealed record OptionContract(
     OptionRight Right,
     string Exchange = "SMART",
     string Currency = "USD",
-    int Multiplier = 100);
+    int Multiplier = 100,
+    /// <summary>
+    /// Option series this contract belongs to, when the underlying lists more than one.
+    /// </summary>
+    /// <remarks>
+    /// Required to disambiguate index options: SPX (AM-settled monthlies) and SPXW (PM-settled
+    /// weeklies and dailies) list the same strikes on the same expirations, so strike + expiry +
+    /// right does not identify a single instrument. Null for underlyings with one series.
+    /// </remarks>
+    string? TradingClass = null);
+
+/// <summary>
+/// Broker-neutral identity of an option contract: only the fields that make it a distinct tradable
+/// instrument.
+/// </summary>
+/// <remarks>
+/// Always correlate quotes, legs, and fills on this key — never on a whole <see cref="OptionContract"/>.
+/// <see cref="OptionContract"/> is a record, so its equality is structural over <em>every</em> property,
+/// including the synthetic <see cref="OptionContract.Symbol"/> and any broker-enriched values. A
+/// dictionary keyed on the whole record starts throwing <see cref="KeyNotFoundException"/> the moment
+/// one side of a lookup carries a field the other does not.
+/// </remarks>
+public readonly record struct OptionContractKey(
+    string Underlying,
+    DateOnly Expiration,
+    decimal Strike,
+    OptionRight Right,
+    string Currency,
+    string TradingClass);
+
+public static class OptionContractExtensions
+{
+    /// <summary>Identity key for correlating this contract across quotes, legs, and fills.</summary>
+    /// <remarks>
+    /// Trading class is included because SPX and SPXW are genuinely different instruments at the same
+    /// strike and expiration. It is normalised to the empty string when absent, so a contract that
+    /// never had one still round-trips: providers echo contracts back as supplied rather than
+    /// enriching them, which is what keeps both sides of a lookup in agreement.
+    /// </remarks>
+    public static OptionContractKey Key(this OptionContract contract) => new(
+        contract.Underlying.ToUpperInvariant(),
+        contract.Expiration,
+        contract.Strike,
+        contract.Right,
+        contract.Currency.ToUpperInvariant(),
+        contract.TradingClass?.ToUpperInvariant() ?? string.Empty);
+}
 
 public sealed record OrderLegRequest(
     OptionContract Contract,

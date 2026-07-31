@@ -5,46 +5,92 @@ using TradingStuff.ServiceDefaults;
 var builder = WebApplication.CreateBuilder(args);
 
 builder.AddServiceDefaults();
+
+// The deterministic generator stays registered unconditionally: it is what makes the test suite and
+// offline development repeatable, and it is the fallback whenever the IBKR source is not selected.
 builder.Services.AddSingleton<DeterministicOptionMarketDataProvider>();
+
+builder.Services.AddHttpClient<IbkrOptionMarketDataProvider>((sp, http) =>
+{
+    var configuration = sp.GetRequiredService<IConfiguration>();
+    ServiceClientConfiguration.ConfigureInternalClient(
+        http,
+        configuration,
+        "IbkrGateway:BaseUrl",
+        "http://localhost:5100");
+});
+
+builder.Services.AddSingleton<IOptionMarketDataProvider>(sp =>
+{
+    var configuration = sp.GetRequiredService<IConfiguration>();
+    var source = configuration["MarketData:Source"];
+
+    return MarketDataSources.UsesIbkrGateway(source)
+        ? sp.GetRequiredService<IbkrOptionMarketDataProvider>()
+        : sp.GetRequiredService<DeterministicOptionMarketDataProvider>();
+});
 
 var app = builder.Build();
 
 app.UseAuthentication();
 app.UseAuthorization();
 
-app.MapPost("/market-data/options/quotes", (
+app.MapPost("/market-data/options/quotes", async (
         MarketDataQuoteRequest request,
-        DeterministicOptionMarketDataProvider provider) =>
+        IOptionMarketDataProvider provider,
+        CancellationToken cancellationToken) =>
     {
         if (request.Legs.Count == 0)
         {
             return Results.BadRequest(new { error = "At least one option leg is required." });
         }
 
-        return Results.Ok(provider.GetQuotes(request));
+        return Results.Ok(await provider.GetQuotesAsync(request, cancellationToken));
     })
     .RequireAuthorization();
 
-app.MapGet("/market-data/options/chains/{underlying}", (
+app.MapGet("/market-data/options/chains/{underlying}", async (
         string underlying,
         string? expiration,
-        DeterministicOptionMarketDataProvider provider) =>
+        IOptionMarketDataProvider provider,
+        CancellationToken cancellationToken) =>
     {
-        var targetExpiration = DateOnly.TryParse(expiration, out var parsed)
-            ? parsed
-            : DateOnly.FromDateTime(DateTime.UtcNow.Date.AddDays(30));
+        DateOnly? target = DateOnly.TryParse(expiration, out var parsed) ? parsed : null;
 
-        return Results.Ok(provider.GetOptionChain(underlying, targetExpiration));
+        return Results.Ok(await provider.GetOptionChainAsync(underlying, target, cancellationToken));
     })
     .RequireAuthorization();
 
-app.MapGet("/market-data/ibkr/status", (IConfiguration configuration) => Results.Ok(new
+app.MapGet("/market-data/ibkr/status", async (
+        IConfiguration configuration,
+        IOptionMarketDataProvider provider,
+        IbkrOptionMarketDataProvider ibkrProvider,
+        CancellationToken cancellationToken) =>
     {
-        required = true,
-        mode = configuration["MarketData:Source"] ?? "ibkr-deterministic-paper-feed",
-        gatewayUrl = configuration["IBKR:GatewayUrl"] ?? "http://localhost:5000",
-        note = "IBKR Gateway is modeled as a required external Aspire dependency; this v1 provider keeps quote generation deterministic for paper tests."
-    }))
+        if (!MarketDataSources.UsesIbkrGateway(configuration["MarketData:Source"]))
+        {
+            return Results.Ok(new
+            {
+                required = true,
+                mode = provider.Source,
+                connected = false,
+                note = $"Serving the deterministic paper feed. Set MarketData:Source to " +
+                       $"'{MarketDataSources.IbkrDelayed}' or '{MarketDataSources.IbkrLive}' to route " +
+                       "through the IBKR gateway.",
+            });
+        }
+
+        // Report the gateway's real socket state rather than a static placeholder.
+        var status = await ibkrProvider.GetGatewayStatusAsync(cancellationToken);
+
+        return Results.Ok(new
+        {
+            required = true,
+            mode = provider.Source,
+            connected = status is not null,
+            gateway = status,
+        });
+    })
     .RequireAuthorization();
 
 app.MapDefaultEndpoints();

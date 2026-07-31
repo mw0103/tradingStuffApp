@@ -4,11 +4,15 @@
     <Project Path="src/TradingStuff.AuditDashboard/TradingStuff.AuditDashboard.csproj" />
     <Project Path="src/TradingStuff.Contracts/TradingStuff.Contracts.csproj" />
     <Project Path="src/TradingStuff.ExecutionService/TradingStuff.ExecutionService.csproj" />
+    <Project Path="src/TradingStuff.IbkrGateway/TradingStuff.IbkrGateway.csproj" />
     <Project Path="src/TradingStuff.MarketDataService/TradingStuff.MarketDataService.csproj" />
     <Project Path="src/TradingStuff.RiskService/TradingStuff.RiskService.csproj" />
     <Project Path="src/TradingStuff.ServiceDefaults/TradingStuff.ServiceDefaults.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/TradingStuff.Tests/TradingStuff.Tests.csproj" />
+  </Folder>
+  <Folder Name="/third_party/">
+    <Project Path="third_party/IBApi/IBApi.csproj" />
   </Folder>
 </Solution>
