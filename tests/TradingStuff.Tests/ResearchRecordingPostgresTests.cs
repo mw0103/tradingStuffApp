@@ -53,6 +53,56 @@ public sealed class ResearchRecordingPostgresTests
                 new SessionGenerator(), ConfigurationFor(connectionString), NullLogger<SessionCalendarService>.Instance)
             .SyncAllAsync(new DateOnly(2026, 7, 1), new DateOnly(2026, 8, 31), CancellationToken.None);
 
+    /// <summary>
+    /// Inserts a <c>research.node_assignments</c> row with an EXPLICIT <c>assigned_from</c>/
+    /// <c>assigned_to</c> rather than going through <see cref="NodeSelector"/>, whose
+    /// <c>assigned_from</c> is the real wall clock via Postgres <c>now()</c>. The coverage tests here
+    /// pin their windows to the fixed calendar date 2026-07-31 (the date <see cref="SyncSessionsAsync"/>
+    /// materialises sessions for), so a row's tenure needs to be just as fixed — a wall-clock
+    /// timestamp would make whether an assignment overlaps that window depend on what day it happens
+    /// to be when the suite actually runs.
+    /// </summary>
+    private static async Task InsertAssignmentAsync(
+        string connectionString, short nodeId, int conId, DateTimeOffset assignedFrom, DateTimeOffset? assignedTo)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+
+        await using var command = new NpgsqlCommand(
+            "INSERT INTO research.node_assignments (node_id, con_id, assigned_from, assigned_to, reason, selector_version) " +
+            "VALUES ($1, $2, $3, $4, 'bootstrap', 1)",
+            connection);
+        command.Parameters.AddWithValue(nodeId);
+        command.Parameters.AddWithValue(conId);
+        command.Parameters.AddWithValue(assignedFrom);
+        command.Parameters.AddWithValue((object?)assignedTo ?? DBNull.Value);
+        await command.ExecuteNonQueryAsync();
+    }
+
+    /// <summary>
+    /// Bulk-inserts one tick per whole minute in [<paramref name="from"/>, <paramref name="to"/>) for
+    /// <paramref name="conId"/>, via <c>generate_series</c> rather than a per-minute round trip — the
+    /// rotation tests below need on the order of a thousand minutes ticked to exercise a realistic
+    /// session-length window.
+    /// </summary>
+    private static async Task InsertTicksEveryMinuteAsync(
+        string connectionString, int conId, DateTimeOffset from, DateTimeOffset to)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+
+        await using var command = new NpgsqlCommand(
+            "INSERT INTO gateway.underlying_tick_events " +
+            "(con_id, lease_id, observed_at, changed_fields, origin, normalization_version) " +
+            "SELECT $1, gen_random_uuid(), minute, 1, 1, 1 " +
+            "FROM generate_series($2::timestamptz, $3::timestamptz - interval '1 minute', interval '1 minute') AS minute",
+            connection);
+        command.Parameters.AddWithValue(conId);
+        command.Parameters.AddWithValue(from);
+        command.Parameters.AddWithValue(to);
+        await command.ExecuteNonQueryAsync();
+    }
+
     [Fact]
     public async Task Migration_003_seeds_the_54_node_registered_grid()
     {
@@ -221,11 +271,14 @@ public sealed class ResearchRecordingPostgresTests
 
         Assert.Equal(CoverageBasisStatus.Measured, report.Basis.Status);
 
-        var node999 = Assert.Single(report.PerConId);
-        Assert.Equal(999, node999.ConId);
-        Assert.Equal(3, node999.MinutesWithData);
-        Assert.Equal(10, node999.TotalMinutes); // ten in-session minutes, not ten wall-clock minutes
-        Assert.Equal(0.3, node999.CoverageRatio, precision: 3);
+        // conId 999 has no node_assignments row at all, so it falls back to the whole-window
+        // denominator via UnassignedConIds — the same measurement this report has always made for a
+        // conId with no assignment tenure to narrow it to.
+        var conId999 = Assert.Single(report.UnassignedConIds);
+        Assert.Equal(999, conId999.ConId);
+        Assert.Equal(3, conId999.MinutesWithData);
+        Assert.Equal(10, conId999.TotalMinutes); // ten in-session minutes, not ten wall-clock minutes
+        Assert.Equal(0.3, conId999.CoverageRatio, precision: 3);
 
         var gapRow = Assert.Single(report.Gaps);
         Assert.Equal("disconnect", gapRow.Reason);
@@ -302,7 +355,9 @@ public sealed class ResearchRecordingPostgresTests
 
         var report = await MonitorFor(connectionString).GetCoverageAsync(day, day.AddDays(1), CancellationToken.None);
 
-        var underlying = Assert.Single(report.PerConId, row => row.ConId == 4001);
+        // conId 4001 has no node_assignments row (it stands in for a core underlying here), so it is
+        // measured via UnassignedConIds against the whole-window denominator.
+        var underlying = Assert.Single(report.UnassignedConIds, row => row.ConId == 4001);
         Assert.Equal(1, underlying.MinutesWithData); // the two out-of-session ticks contribute nothing
     }
 
@@ -353,7 +408,7 @@ public sealed class ResearchRecordingPostgresTests
     }
 
     [Fact]
-    public async Task Coverage_is_zero_with_no_data_and_no_recorded_conids()
+    public async Task Coverage_is_unmeasured_not_zero_when_no_instrument_is_being_recorded()
     {
         if (ServerConnectionString is not { } server)
         {
@@ -367,10 +422,18 @@ public sealed class ResearchRecordingPostgresTests
         var from = new DateTimeOffset(2026, 7, 31, 14, 0, 0, TimeSpan.Zero);
         var report = await MonitorFor(connectionString).GetCoverageAsync(from, from.AddHours(1), CancellationToken.None);
 
+        // The DENOMINATOR is sound — there is a real session here — so the basis is 'measured'.
         Assert.Equal(CoverageBasisStatus.Measured, report.Basis.Status);
         Assert.Equal(60, report.TotalMinutes);
-        Assert.Empty(report.PerConId);
-        Assert.Equal(0d, report.OverallCoverageRatio);
+        Assert.Empty(report.PerNode);
+        Assert.Empty(report.UnassignedConIds);
+
+        // But nothing is being recorded, so there is no ratio to report. Asserting 0d here — which
+        // this test previously did — encodes the bug: 0% reads as "every instrument is dead", the
+        // loudest possible alarm, when the truth is "no instrument is subscribed yet". That fires on
+        // every fresh deployment and on every window predating the recorder's first lease, and a
+        // gate that is red for a non-problem stops being read at all.
+        Assert.Null(report.OverallCoverageRatio);
     }
 
     [Fact]
@@ -378,27 +441,173 @@ public sealed class ResearchRecordingPostgresTests
     {
         // Regression: a plain GROUP BY over the raw event tables never produces a row for a conId
         // with no ticks at all — a total recording failure was previously indistinguishable from
-        // "this conId doesn't exist", the opposite of what a coverage report is for.
+        // "this conId doesn't exist", the opposite of what a coverage report is for. A node that has
+        // never rotated (one segment, spanning the whole window) must still show this: node-level
+        // aggregation (see the rotation tests below) must not accidentally reintroduce the hole it
+        // was designed to close for the common, non-rotated case.
         if (ServerConnectionString is not { } server)
         {
             return;
         }
 
         var connectionString = await PrepareAsync(server);
-        var configuration = ConfigurationFor(connectionString);
-        var selector = new NodeSelector(configuration, gateway: null!, NullLogger<NodeSelector>.Instance);
-
-        // A node assignment for a conId that never once ticks.
-        await selector.UpsertAssignmentAsync(connectionString, nodeId: 9, conId: 999999, "bootstrap", CancellationToken.None);
         await SyncSessionsAsync(connectionString);
+
+        // Assigned well before the window and never closed, inserted directly (rather than through
+        // NodeSelector, whose assigned_from is the real wall clock) so the assignment's tenure is
+        // guaranteed to cover the fixed 2026-07-31 window regardless of when this test happens to run.
+        await InsertAssignmentAsync(
+            connectionString, nodeId: 9, conId: 999999,
+            assignedFrom: new DateTimeOffset(2026, 7, 30, 0, 0, 0, TimeSpan.Zero), assignedTo: null);
 
         var from = new DateTimeOffset(2026, 7, 31, 14, 0, 0, TimeSpan.Zero);
         var report = await MonitorFor(connectionString).GetCoverageAsync(from, from.AddHours(1), CancellationToken.None);
 
-        var dead = Assert.Single(report.PerConId, c => c.ConId == 999999);
+        var dead = Assert.Single(report.PerNode, n => n.NodeId == 9);
         Assert.Equal(0, dead.MinutesWithData);
-        Assert.Equal(0, dead.CoverageRatio);
+        Assert.Equal(0d, dead.CoverageRatio);
+
+        // The per-segment breakdown still names the specific dead conId — the aggregate does not
+        // absorb it into invisibility even though there is only one segment to aggregate here.
+        var segment = Assert.Single(dead.ConIdSegments);
+        Assert.Equal(999999, segment.ConId);
+        Assert.Equal(0, segment.MinutesWithData);
+        Assert.Equal(0d, segment.CoverageRatio);
         Assert.Equal(0d, report.OverallCoverageRatio); // the only expected conId, and it's fully dead
+    }
+
+    [Fact]
+    public async Task A_mid_window_rotation_reports_one_healthy_node_not_two_partial_conids()
+    {
+        // The concrete failure this fix exists for. Node rotation is routine — RecorderOrchestrator
+        // re-runs node selection every two minutes, and either the target expiry (advances at UTC
+        // midnight) or the target strike (moves whenever the spot proxy crosses a boundary) can
+        // change on any pass — so a single, flawlessly-recorded node contributes TWO conId rows to
+        // any window straddling a rotation. Measuring each against the WHOLE window (the previous
+        // design) makes their unweighted average land near 50% no matter how healthy the recording
+        // was: here the retiring conId's own tenure is 345 of the window's 1,185 minutes and the new
+        // conId's is the remaining 840, so 345/1185 ≈ 29% and 840/1185 ≈ 71% average to exactly 50%.
+        // Measured against each conId's own tenure instead, both segments are fully ticked and the
+        // NODE reads 100%.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        await SyncSessionsAsync(connectionString);
+
+        // 2026-07-31: Cboe GTH 00:15-13:15 UTC (780 min) + RTH 13:30-20:15 UTC (405 min) = 1,185
+        // published expected minutes — see CoverageSessionMinutesTests for the hand-derivation.
+        var windowFrom = new DateTimeOffset(2026, 7, 31, 0, 0, 0, TimeSpan.Zero);
+        var windowTo = windowFrom.AddDays(1);
+        var rotatedAt = new DateTimeOffset(2026, 7, 31, 6, 0, 0, TimeSpan.Zero); // mid-GTH
+
+        const int retiredConId = 5001;
+        const int newConId = 5002;
+
+        await InsertAssignmentAsync(
+            connectionString, nodeId: 1, conId: retiredConId,
+            assignedFrom: windowFrom.AddDays(-1), assignedTo: rotatedAt);
+        await InsertAssignmentAsync(
+            connectionString, nodeId: 1, conId: newConId,
+            assignedFrom: rotatedAt, assignedTo: null);
+
+        // Retiring conId's own tenure inside the window, intersected with GTH (00:15-13:15): the
+        // window opens at 00:00 but GTH does not start until 00:15, so [00:15, 06:00) = 5h45m = 345
+        // minutes, hand-computed from the published session boundaries above.
+        await InsertTicksEveryMinuteAsync(
+            connectionString, retiredConId,
+            new DateTimeOffset(2026, 7, 31, 0, 15, 0, TimeSpan.Zero), rotatedAt);
+
+        // New conId's tenure: the rest of GTH, [06:00, 13:15) = 7h15m = 435 min, plus the whole of
+        // RTH, [13:30, 20:15) = 405 min -> 840 minutes. 345 + 840 = 1,185, the full published total:
+        // this node was continuously assigned (by one conId or the other) for the entire window.
+        await InsertTicksEveryMinuteAsync(
+            connectionString, newConId, rotatedAt, new DateTimeOffset(2026, 7, 31, 13, 15, 0, TimeSpan.Zero));
+        await InsertTicksEveryMinuteAsync(
+            connectionString, newConId,
+            new DateTimeOffset(2026, 7, 31, 13, 30, 0, TimeSpan.Zero),
+            new DateTimeOffset(2026, 7, 31, 20, 15, 0, TimeSpan.Zero));
+
+        var report = await MonitorFor(connectionString).GetCoverageAsync(windowFrom, windowTo, CancellationToken.None);
+
+        Assert.Equal(CoverageBasisStatus.Measured, report.Basis.Status);
+        Assert.Equal(1185, report.TotalMinutes);
+
+        var node = Assert.Single(report.PerNode, n => n.NodeId == 1);
+        Assert.Equal(2, node.ConIdSegments.Count);
+        Assert.Equal(1185, node.TotalMinutes);
+        Assert.Equal(1185, node.MinutesWithData);
+        Assert.Equal(1d, node.CoverageRatio); // not ~50%
+
+        var retired = Assert.Single(node.ConIdSegments, s => s.ConId == retiredConId);
+        Assert.Equal(345, retired.TotalMinutes);
+        Assert.Equal(345, retired.MinutesWithData);
+
+        var replacement = Assert.Single(node.ConIdSegments, s => s.ConId == newConId);
+        Assert.Equal(840, replacement.TotalMinutes);
+        Assert.Equal(840, replacement.MinutesWithData);
+
+        Assert.Equal(1d, report.OverallCoverageRatio); // the only node in the report
+    }
+
+    [Fact]
+    public async Task A_node_reassigned_just_before_the_request_does_not_report_a_spurious_zero()
+    {
+        // The other half of the same defect: because the old design read only the CURRENT
+        // assignment with no window filter, a node rotated moments before the request was measured
+        // as 0 ticks over the FULL window's denominator, reporting a healthy node as freshly 0% —
+        // indistinguishable from the genuinely dead node covered above. Node-level aggregation fixes
+        // this the same way it fixes the mid-window case: the brief, still-quiet new segment is
+        // outweighed by the long, healthy old one.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        await SyncSessionsAsync(connectionString);
+
+        // A short window fully inside RTH (13:30-20:15 UTC) keeps the arithmetic simple: 25 published
+        // expected minutes, nothing else in play.
+        var windowFrom = new DateTimeOffset(2026, 7, 31, 13, 35, 0, TimeSpan.Zero);
+        var windowTo = new DateTimeOffset(2026, 7, 31, 14, 0, 0, TimeSpan.Zero);
+        var rotatedAt = windowTo.AddMinutes(-2); // reassigned two minutes before the report
+
+        const int oldConId = 6001;
+        const int newConId = 6002;
+
+        await InsertAssignmentAsync(
+            connectionString, nodeId: 2, conId: oldConId,
+            assignedFrom: new DateTimeOffset(2026, 7, 31, 10, 0, 0, TimeSpan.Zero), assignedTo: rotatedAt);
+        await InsertAssignmentAsync(
+            connectionString, nodeId: 2, conId: newConId, assignedFrom: rotatedAt, assignedTo: null);
+
+        // The old conId ticked every minute of its 23-minute tenure inside the window; the new one
+        // has not ticked at all yet (typical of a subscription that just started).
+        await InsertTicksEveryMinuteAsync(connectionString, oldConId, windowFrom, rotatedAt);
+
+        var report = await MonitorFor(connectionString).GetCoverageAsync(windowFrom, windowTo, CancellationToken.None);
+
+        Assert.Equal(CoverageBasisStatus.Measured, report.Basis.Status);
+        Assert.Equal(25, report.TotalMinutes);
+
+        var node = Assert.Single(report.PerNode, n => n.NodeId == 2);
+        Assert.Equal(25, node.TotalMinutes);
+        Assert.Equal(23, node.MinutesWithData);
+        Assert.NotNull(node.CoverageRatio);
+        Assert.Equal(23d / 25d, node.CoverageRatio!.Value, precision: 6); // ~92%, not 0%
+        Assert.NotEqual(0d, node.CoverageRatio);
+
+        // The freshly-assigned conId's own segment still shows its 0% plainly — the node aggregate
+        // does not hide a conId that goes dead the instant it becomes the assignment.
+        var freshSegment = Assert.Single(node.ConIdSegments, s => s.ConId == newConId);
+        Assert.Equal(2, freshSegment.TotalMinutes);
+        Assert.Equal(0, freshSegment.MinutesWithData);
+        Assert.Equal(0d, freshSegment.CoverageRatio);
+
+        Assert.NotEqual(0d, report.OverallCoverageRatio);
     }
 
     [Fact]

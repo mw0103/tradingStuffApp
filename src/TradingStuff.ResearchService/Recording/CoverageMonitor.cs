@@ -18,11 +18,12 @@ public sealed class CoverageOptions
     /// core underlyings do not all trade against it: SPY is NYSE-calendared, and neither the SPX nor
     /// the VIX index level updates through Cboe GTH. Those three lines therefore cannot exceed roughly
     /// a third of the RTH+GTH denominator no matter how healthy the recording is, and
-    /// <c>OverallCoverageRatio</c> is an unweighted mean across all reporting conIds, so they pull it
-    /// down by a couple of points. This is not a regression — the old wall-clock denominator was worse
-    /// for every instrument — but it means the 95% gate should be read against the option-node rows
-    /// until per-conId calendars exist. Doing that properly needs a conId → instrument → calendar
-    /// mapping, and the core underlyings are not in <c>node_assignments</c> to hang one off.
+    /// <c>OverallCoverageRatio</c> is an unweighted mean across all reporting nodes and unassigned
+    /// conIds, so they pull it down by a couple of points. This is not a regression — the old
+    /// wall-clock denominator was worse for every instrument — but it means the 95% gate should be
+    /// read against the per-node rows until per-conId calendars exist. Doing that properly needs a
+    /// conId → instrument → calendar mapping, and the core underlyings are not in
+    /// <c>node_assignments</c> to hang one off.
     /// </remarks>
     public string[] Calendars { get; set; } = ["CBOE_INDEX_RTH", "CBOE_INDEX_GTH"];
 
@@ -59,8 +60,64 @@ public static class CoverageBasisStatus
     public const string CalendarUnknown = "calendar-unknown";
 }
 
-/// <summary>Per-conId minute coverage over the window's expected session minutes.</summary>
+/// <summary>
+/// Per-conId minute coverage over the window's expected session minutes, for a conId
+/// <c>research.node_assignments</c> knows nothing about (the core underlyings — SPX, VIX, SPY —
+/// which are single, never-rotating instruments, not registered nodes). The whole window is the
+/// correct denominator for these because there is no assignment interval to narrow it to.
+/// </summary>
 public sealed record ConIdCoverage(int ConId, int MinutesWithData, int TotalMinutes, double CoverageRatio);
+
+/// <summary>
+/// One conId's tenure as a node's assignment, clipped to the report window and measured against
+/// the session minutes it overlaps — never the whole window. <see cref="MeasuredFromUtc"/> and
+/// <see cref="MeasuredToUtc"/> are <see cref="AssignedFrom"/>/<see cref="AssignedTo"/> narrowed to
+/// the window and floored to whole minutes, the same clipping <see cref="CoverageSession"/> applies
+/// to a session; <see cref="TotalMinutes"/> is that clipped interval intersected with the session
+/// union, not its raw width, so an assignment held overnight through a session gap is not charged
+/// for the gap.
+/// </summary>
+/// <param name="CoverageRatio">
+/// NULL when <see cref="TotalMinutes"/> is zero — a segment can be clipped down to nothing (a node
+/// rotated twice within the same UTC minute, or a brand-new assignment whose sliver of the window
+/// falls entirely outside a session) and 0/0 is not 0%, it is unmeasured.
+/// </param>
+public sealed record NodeConIdSegment(
+    int ConId,
+    DateTimeOffset AssignedFrom,
+    DateTimeOffset? AssignedTo,
+    DateTimeOffset MeasuredFromUtc,
+    DateTimeOffset MeasuredToUtc,
+    int MinutesWithData,
+    int TotalMinutes,
+    double? CoverageRatio);
+
+/// <summary>
+/// Coverage for one registered option-node ROLE (e.g. <c>7DTE-ATM-C</c>), aggregated across every
+/// conId that held the role during the window.
+/// </summary>
+/// <remarks>
+/// This, not a bare conId, is the unit the roadmap's 95% acceptance gate is actually about:
+/// <c>node_assignments</c> exists precisely so a node's identity survives a strike or expiry roll,
+/// and a rotation is not an outage. Reporting per conId instead — measuring a retired conId's brief
+/// tail and a new conId's long remainder each against the WHOLE window — is the exact defect this
+/// type replaces: it turned a flawlessly-recorded, merely-rotated node into two partial rows whose
+/// unweighted average reads roughly 50% no matter how healthy the recording was, and it made a node
+/// reassigned moments before the request read as freshly 0%. Summing <see cref="NodeConIdSegment"/>
+/// entries is safe without double- or under-counting because <c>node_assignments</c>' partial unique
+/// index guarantees at most one open row per node at a time, and the row that closes an old
+/// assignment and the row that opens the new one are written in the same transaction against the
+/// same <c>now()</c> — so one node's segments never overlap and never leave a gap between them
+/// inside the window.
+/// </remarks>
+/// <param name="CoverageRatio">NULL under the same zero-denominator rule as <see cref="NodeConIdSegment.CoverageRatio"/>.</param>
+public sealed record NodeCoverage(
+    short NodeId,
+    string Role,
+    int MinutesWithData,
+    int TotalMinutes,
+    double? CoverageRatio,
+    IReadOnlyList<NodeConIdSegment> ConIdSegments);
 
 /// <summary>
 /// One <c>research.sessions</c> row clipped to the report window, with the whole minutes it
@@ -123,13 +180,18 @@ public sealed record RecorderGapSummary(
 /// NULL whenever <see cref="CoverageBasis.Status"/> is not
 /// <see cref="CoverageBasisStatus.Measured"/> — an unmeasurable window reports no number rather than
 /// a plausible one. A weekend is not 0% covered and an unsynced calendar is not 100% covered; both
-/// were previously indistinguishable from a real reading.
+/// were previously indistinguishable from a real reading. The unweighted mean is taken over every
+/// <see cref="NodeCoverage"/> with a non-null ratio plus every <see cref="ConIdCoverage"/> in
+/// <paramref name="UnassignedConIds"/> — a node whose own denominator collapsed to zero (see
+/// <see cref="NodeCoverage.CoverageRatio"/>) contributes nothing to average rather than a
+/// fabricated number.
 /// </param>
 public sealed record CoverageReport(
     DateTimeOffset From,
     DateTimeOffset To,
     CoverageBasis Basis,
-    IReadOnlyList<ConIdCoverage> PerConId,
+    IReadOnlyList<NodeCoverage> PerNode,
+    IReadOnlyList<ConIdCoverage> UnassignedConIds,
     double? OverallCoverageRatio,
     int TotalMinutes,
     IReadOnlyList<RecorderGapSummary> Gaps);
@@ -137,7 +199,7 @@ public sealed record CoverageReport(
 /// <summary>
 /// Computes recording coverage from the raw event tables against the exchange sessions in
 /// <c>research.sessions</c>: the fraction of the window's expected session minutes that carry at
-/// least one recorded tick, per conId and overall.
+/// least one recorded tick, per node and overall.
 /// </summary>
 /// <remarks>
 /// <para>
@@ -166,13 +228,32 @@ public sealed record CoverageReport(
 /// this is a genuinely independent witness and not the same query asked twice.
 /// </para>
 /// <para>
-/// A conId is included even when it has ZERO ticks in the window, as long as it is a current
-/// option-node assignment: a plain <c>GROUP BY con_id</c> over the raw event tables cannot produce
+/// A node is included even when it has ZERO ticks in the window, for every conId that held its
+/// role during the window: a plain <c>GROUP BY con_id</c> over the raw event tables cannot produce
 /// a row for a conId that never ticked, which would make a fully-dead subscription — the worst
 /// case this whole report exists to catch — invisible instead of showing 0%. Core underlyings
 /// (SPX/VIX/SPY) are not tracked in <c>node_assignments</c>, so a fully-dead underlying
 /// subscription is not yet covered by this check; that gap is narrower (three fixed, easily
 /// resolved symbols vs. up to 54 option nodes) and left as a known residual for now.
+/// </para>
+/// <para>
+/// <b>The denominator is per-NODE assignment tenure, not per-conId window length.</b> Node
+/// rotation is routine, not exceptional: <c>RecorderOrchestrator</c> re-runs node selection every
+/// two minutes, and both the target expiry (advances at UTC midnight) and the target strike (moves
+/// whenever the nearest-5-point spot proxy crosses a boundary) can change on any pass, closing one
+/// <c>node_assignments</c> row and opening another. Measuring each resulting conId against the
+/// WHOLE window — the previous design — turns one flawlessly-recorded, merely-rotated node into two
+/// partial rows (a short-lived retiring conId and a long-lived new one) whose unweighted average
+/// reads roughly 50% regardless of how healthy the recording actually was, and made a node rotated
+/// moments before the request read as freshly 0/window = 0%. Both failures share one root: the
+/// denominator ignored <c>assigned_from</c>/<c>assigned_to</c>, which is exactly the interval
+/// <c>node_assignments</c> exists to record. <see cref="NodeCoverage"/> instead sums
+/// <see cref="NodeConIdSegment"/> entries — each conId's own tenure intersected with the window and
+/// the session union — so a rotation redistributes minutes between segments of the SAME node
+/// instead of fragmenting it into unrelated per-conId rows. The per-segment breakdown is kept
+/// alongside the aggregate (not collapsed away) specifically so a conId that goes dead the moment
+/// it becomes a node's assignment is still visible immediately, rather than waiting for enough of
+/// the window to elapse for the node's running average to show it.
 /// </para>
 /// </remarks>
 public sealed class CoverageMonitor(
@@ -259,21 +340,109 @@ public sealed class CoverageMonitor(
                 gaps);
         }
 
+        // The whole-window, per-conId tick count. Used directly for conIds node_assignments knows
+        // nothing about (the core underlyings); for conIds that ARE a node's assignment it is
+        // discarded in favour of the segment-scoped numerator below, which is bounded to the conId's
+        // own tenure rather than the whole window.
         var minutesByConId = await QueryMinuteCoverageAsync(connection, windowFrom, windowTo, sessions, cancellationToken);
-        var expectedConIds = await QueryExpectedConIdsAsync(connection, cancellationToken);
 
-        // Every conId with ticks, UNION every conId currently expected to be recording — so a node
-        // with zero ticks (total recording failure) still gets a 0% row instead of being absent.
-        var allConIds = new HashSet<int>(minutesByConId.Keys);
-        allConIds.UnionWith(expectedConIds);
+        // Every node_assignments row whose tenure overlaps the window — a rotated node contributes
+        // one row per conId that held it, not just the current one.
+        var assignments = await QueryAssignmentIntervalsAsync(connection, windowFrom, windowTo, cancellationToken);
 
-        var perConId = allConIds
+        var clippedSegments = assignments
+            .Select(assignment =>
+            {
+                // The same floor-both clipping SessionMinutes.Clip applies to a session, applied here
+                // to an assignment's tenure: floor the start down (can only ever ask for a minute the
+                // tenure partly covers) and the end down (can only ever drop a partial minute), so the
+                // boundary between two back-to-back segments of the same node lands on exactly one of
+                // them and is never double-counted or dropped between them.
+                var clippedFrom = SessionMinutes.FloorToMinute(
+                    assignment.AssignedFrom > windowFrom ? assignment.AssignedFrom : windowFrom);
+                var effectiveTo = assignment.AssignedTo ?? windowTo;
+                var clippedTo = SessionMinutes.FloorToMinute(effectiveTo < windowTo ? effectiveTo : windowTo);
+
+                var totalMinutes = clippedTo <= clippedFrom
+                    ? 0
+                    : SessionMinutes.IntersectMinutes(sessions, clippedFrom, clippedTo);
+
+                return (Assignment: assignment, From: clippedFrom, To: clippedTo, TotalMinutes: totalMinutes);
+            })
+            .ToArray();
+
+        // Only segments with a real (non-zero) denominator need a numerator query at all — a
+        // degenerate segment (clipped to nothing) trivially carries zero minutes with data.
+        var minutesBySegment = await QuerySegmentMinuteCoverageAsync(
+            connection,
+            windowFrom,
+            windowTo,
+            sessions,
+            clippedSegments
+                .Where(segment => segment.TotalMinutes > 0)
+                .Select(segment => (segment.Assignment.ConId, segment.From, segment.To))
+                .ToArray(),
+            cancellationToken);
+
+        var perNode = clippedSegments
+            .GroupBy(segment => (segment.Assignment.NodeId, segment.Assignment.Role))
+            .Select(group =>
+            {
+                var conIdSegments = group
+                    .Select(segment =>
+                    {
+                        var minutesWithData = segment.TotalMinutes == 0
+                            ? 0
+                            : minutesBySegment.GetValueOrDefault((segment.Assignment.ConId, segment.From, segment.To));
+
+                        return new NodeConIdSegment(
+                            segment.Assignment.ConId,
+                            segment.Assignment.AssignedFrom,
+                            segment.Assignment.AssignedTo,
+                            segment.From,
+                            segment.To,
+                            minutesWithData,
+                            segment.TotalMinutes,
+                            segment.TotalMinutes == 0 ? null : (double)minutesWithData / segment.TotalMinutes);
+                    })
+                    .OrderBy(segment => segment.AssignedFrom)
+                    .ToArray();
+
+                // Safe to sum rather than re-union: one node's segments are time-disjoint by
+                // construction (see NodeCoverage's remarks on the partial unique index).
+                var nodeTotalMinutes = conIdSegments.Sum(segment => segment.TotalMinutes);
+                var nodeMinutesWithData = conIdSegments.Sum(segment => segment.MinutesWithData);
+
+                return new NodeCoverage(
+                    group.Key.NodeId,
+                    group.Key.Role,
+                    nodeMinutesWithData,
+                    nodeTotalMinutes,
+                    nodeTotalMinutes == 0 ? null : (double)nodeMinutesWithData / nodeTotalMinutes,
+                    conIdSegments);
+            })
+            .OrderBy(node => node.NodeId)
+            .ToArray();
+
+        // A ticking conId that is not any node's assignment for this window (a core underlying, or a
+        // stray subscription with no assignment row at all) falls back to the whole-window
+        // denominator — the same measurement this report has always made for those conIds.
+        var assignedConIds = new HashSet<int>(assignments.Select(assignment => assignment.ConId));
+
+        var unassignedConIds = minutesByConId.Keys
+            .Where(conId => !assignedConIds.Contains(conId))
             .Select(conId =>
             {
-                var minutes = minutesByConId.GetValueOrDefault(conId);
+                var minutes = minutesByConId[conId];
                 return new ConIdCoverage(conId, minutes, expectedMinutes, (double)minutes / expectedMinutes);
             })
             .OrderBy(row => row.ConId)
+            .ToArray();
+
+        var ratios = perNode
+            .Where(node => node.CoverageRatio.HasValue)
+            .Select(node => node.CoverageRatio!.Value)
+            .Concat(unassignedConIds.Select(row => row.CoverageRatio))
             .ToArray();
 
         var basis = new CoverageBasis(
@@ -283,8 +452,15 @@ public sealed class CoverageMonitor(
             windowFrom,
             windowTo,
             basis,
-            perConId,
-            perConId.Length == 0 ? 0d : perConId.Average(row => row.CoverageRatio),
+            perNode,
+            unassignedConIds,
+            // NULL, not 0d, when there is nothing to average. An unweighted mean over an empty set is
+            // undefined, and reporting it as 0% says "every instrument is dead" when the truth is
+            // "no instrument is being measured" — a fresh deployment, or any window before the
+            // recorder acquired its first lease. Those are opposite operator actions, and the
+            // catastrophic-looking one is a false alarm; a gate that cries wolf is a gate nobody
+            // reads. Same reasoning as the weekend case above, which is why the field is nullable.
+            ratios.Length == 0 ? null : ratios.Average(),
             expectedMinutes,
             gaps);
     }
@@ -310,6 +486,7 @@ public sealed class CoverageMonitor(
             // GeneratedSessions to see how far the table has drifted, and clipping would net some of
             // the difference out.
             new CoverageBasis(status, calendars, expectedMinutes, persisted?.Count ?? 0, generated, sessions, detail),
+            [],
             [],
             null,
             expectedMinutes,
@@ -380,23 +557,59 @@ public sealed class CoverageMonitor(
         return sessions;
     }
 
-    private static async Task<List<int>> QueryExpectedConIdsAsync(NpgsqlConnection connection, CancellationToken cancellationToken)
+    /// <summary>One <c>research.node_assignments</c> row whose tenure overlaps the report window.</summary>
+    private sealed record NodeAssignmentInterval(
+        short NodeId, string Role, int ConId, DateTimeOffset AssignedFrom, DateTimeOffset? AssignedTo);
+
+    /// <summary>
+    /// Every node_assignments row whose tenure overlaps [<paramref name="from"/>,
+    /// <paramref name="to"/>) — not just the current (<c>assigned_to IS NULL</c>) row per node.
+    /// </summary>
+    /// <remarks>
+    /// The previous version queried only the current row, with no window filter at all, so a node
+    /// reassigned any time before "now" — including moments before an entirely historical report —
+    /// was measured as if it had held the assignment for the WHOLE window. This is a proper interval
+    /// overlap (<c>assigned_from &lt; to AND (assigned_to IS NULL OR assigned_to &gt; from)</c>), the
+    /// same shape as the session and gap overlap queries below, so a rotated node correctly yields
+    /// one row per conId that held it during the window and nothing for tenures outside it.
+    /// </remarks>
+    private static async Task<IReadOnlyList<NodeAssignmentInterval>> QueryAssignmentIntervalsAsync(
+        NpgsqlConnection connection, DateTimeOffset from, DateTimeOffset to, CancellationToken cancellationToken)
     {
         await using var command = new NpgsqlCommand(
-            "SELECT con_id FROM research.node_assignments WHERE assigned_to IS NULL", connection);
+            "SELECT na.node_id, n.role, na.con_id, na.assigned_from, na.assigned_to " +
+            "FROM research.node_assignments na " +
+            "JOIN research.option_nodes n ON n.node_id = na.node_id " +
+            "WHERE na.assigned_from < $2 AND (na.assigned_to IS NULL OR na.assigned_to > $1) " +
+            "ORDER BY na.node_id, na.assigned_from",
+            connection);
+        command.Parameters.AddWithValue(from);
+        command.Parameters.AddWithValue(to);
 
-        var conIds = new List<int>();
+        var rows = new List<NodeAssignmentInterval>();
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
 
         while (await reader.ReadAsync(cancellationToken))
         {
-            conIds.Add(reader.GetInt32(0));
+            rows.Add(new NodeAssignmentInterval(
+                reader.GetInt16(0),
+                reader.GetString(1),
+                reader.GetInt32(2),
+                reader.GetFieldValue<DateTimeOffset>(3),
+                reader.IsDBNull(4) ? null : reader.GetFieldValue<DateTimeOffset>(4)));
         }
 
-        return conIds;
+        return rows;
     }
 
-    /// <summary>Distinct in-session minutes carrying at least one tick, per conId, across both raw event tables.</summary>
+    /// <summary>
+    /// Distinct in-session minutes carrying at least one tick, per conId, across both raw event
+    /// tables, measured against the WHOLE window. Correct as-is for a conId with no node assignment
+    /// (a core underlying); for an assigned conId this whole-window count is discarded in favour of
+    /// <see cref="QuerySegmentMinuteCoverageAsync"/>, which bounds the count to the conId's own
+    /// assignment tenure so a tick recorded before the tenure started or after it ended cannot count
+    /// toward it.
+    /// </summary>
     private static async Task<Dictionary<int, int>> QueryMinuteCoverageAsync(
         NpgsqlConnection connection,
         DateTimeOffset from,
@@ -449,6 +662,84 @@ public sealed class CoverageMonitor(
         }
 
         return minutesByConId;
+    }
+
+    /// <summary>
+    /// Distinct in-session minutes carrying at least one tick for each (conId, tenure) segment,
+    /// bounded to that segment's OWN clipped interval — never the whole window.
+    /// </summary>
+    /// <remarks>
+    /// This is what makes a rotation measure each conId against its own tenure instead of the other
+    /// conId's: a tick recorded before the assignment started or after it ended (teardown lag on the
+    /// old lease, setup lag on the new one, both real async effects) falls outside <c>[segment_from,
+    /// segment_to)</c> and is excluded, which is also what keeps a segment's numerator a subset of
+    /// its own denominator by construction — the same guarantee <see cref="QueryMinuteCoverageAsync"/>
+    /// gives the whole-window numerator, narrowed to a sub-interval. Segments are looked up by exact
+    /// (conId, from, to) match on return, which <c>WITH ORDINALITY</c> makes safe even if two
+    /// segments happen to share a conId and bounds.
+    /// </remarks>
+    private static async Task<Dictionary<(int ConId, DateTimeOffset From, DateTimeOffset To), int>> QuerySegmentMinuteCoverageAsync(
+        NpgsqlConnection connection,
+        DateTimeOffset from,
+        DateTimeOffset to,
+        IReadOnlyList<CoverageSession> sessions,
+        IReadOnlyList<(int ConId, DateTimeOffset From, DateTimeOffset To)> segments,
+        CancellationToken cancellationToken)
+    {
+        var minutesBySegment = new Dictionary<(int, DateTimeOffset, DateTimeOffset), int>();
+
+        if (segments.Count == 0)
+        {
+            return minutesBySegment;
+        }
+
+        await using var command = new NpgsqlCommand(
+            """
+            WITH distinct_ticks AS (
+                SELECT DISTINCT con_id, minute
+                FROM (
+                    SELECT con_id, date_trunc('minute', observed_at, 'UTC') AS minute
+                    FROM gateway.option_quote_events
+                    WHERE observed_at >= $1 AND observed_at < $2
+                    UNION ALL
+                    SELECT con_id, date_trunc('minute', observed_at, 'UTC')
+                    FROM gateway.underlying_tick_events
+                    WHERE observed_at >= $1 AND observed_at < $2
+                ) AS t
+            ),
+            segments AS (
+                SELECT s.con_id, s.segment_from, s.segment_to, s.segment_ix
+                FROM unnest($3::integer[], $4::timestamptz[], $5::timestamptz[])
+                    WITH ORDINALITY AS s(con_id, segment_from, segment_to, segment_ix)
+            )
+            SELECT seg.segment_ix, count(DISTINCT t.minute)
+            FROM segments seg
+            JOIN distinct_ticks t
+                ON t.con_id = seg.con_id AND t.minute >= seg.segment_from AND t.minute < seg.segment_to
+            WHERE EXISTS (
+                SELECT 1
+                FROM unnest($6::timestamptz[], $7::timestamptz[]) AS sess(measured_from, measured_to)
+                WHERE t.minute >= sess.measured_from AND t.minute < sess.measured_to)
+            GROUP BY seg.segment_ix
+            """,
+            connection);
+        command.Parameters.AddWithValue(from);
+        command.Parameters.AddWithValue(to);
+        command.Parameters.AddWithValue(segments.Select(segment => segment.ConId).ToArray());
+        command.Parameters.AddWithValue(segments.Select(segment => segment.From).ToArray());
+        command.Parameters.AddWithValue(segments.Select(segment => segment.To).ToArray());
+        command.Parameters.AddWithValue(sessions.Select(session => session.MeasuredFromUtc).ToArray());
+        command.Parameters.AddWithValue(sessions.Select(session => session.MeasuredToUtc).ToArray());
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            var segment = segments[(int)reader.GetInt64(0) - 1]; // WITH ORDINALITY is 1-based
+            minutesBySegment[(segment.ConId, segment.From, segment.To)] = (int)reader.GetInt64(1);
+        }
+
+        return minutesBySegment;
     }
 
     private static async Task<IReadOnlyList<RecorderGapSummary>> QueryGapsAsync(
@@ -576,6 +867,55 @@ internal static class SessionMinutes
 
             total += (int)((session.MeasuredToUtc - start).Ticks / TimeSpan.TicksPerMinute);
             cursor = session.MeasuredToUtc;
+        }
+
+        return total;
+    }
+
+    /// <summary>
+    /// Minutes of <paramref name="sessions"/> (already clipped to the report window) that further
+    /// fall within [<paramref name="from"/>, <paramref name="to"/>) — the same clip-then-union-count
+    /// shape as <see cref="Clip"/> plus <see cref="DistinctMinutes"/>, generalised to an arbitrary
+    /// sub-interval so a node's own assignment tenure, not just the window as a whole, can be
+    /// measured against session minutes.
+    /// </summary>
+    /// <remarks>
+    /// Bounds are floored the same way <see cref="Clip"/> floors a session: flooring
+    /// <paramref name="from"/> down can only ever ask for a minute the sub-interval partly covers,
+    /// and flooring <paramref name="to"/> down can only ever drop one. Two segments of the same node
+    /// meeting at a sub-minute instant (the row that closes an old assignment and the row that opens
+    /// the new one share the same transaction <c>now()</c>, so they meet EXACTLY, never overlap by a
+    /// few microseconds) therefore attribute that boundary minute to exactly one of them — the new
+    /// segment, since its start floors down to include it while the old segment's end floors down to
+    /// exclude it — never to both and never to neither. A session nested inside another (CME_ES) is
+    /// still counted once here, for the same reason it is in <see cref="DistinctMinutes"/>.
+    /// </remarks>
+    internal static int IntersectMinutes(IReadOnlyList<CoverageSession> sessions, DateTimeOffset from, DateTimeOffset to)
+    {
+        var boundedFrom = FloorToMinute(from);
+        var boundedTo = FloorToMinute(to);
+
+        if (boundedTo <= boundedFrom)
+        {
+            return 0;
+        }
+
+        var total = 0;
+        var cursor = DateTimeOffset.MinValue;
+
+        foreach (var session in sessions.OrderBy(session => session.MeasuredFromUtc))
+        {
+            var start = session.MeasuredFromUtc > boundedFrom ? session.MeasuredFromUtc : boundedFrom;
+            start = start > cursor ? start : cursor;
+            var end = session.MeasuredToUtc < boundedTo ? session.MeasuredToUtc : boundedTo;
+
+            if (end <= start)
+            {
+                continue;
+            }
+
+            total += (int)((end - start).Ticks / TimeSpan.TicksPerMinute);
+            cursor = end;
         }
 
         return total;

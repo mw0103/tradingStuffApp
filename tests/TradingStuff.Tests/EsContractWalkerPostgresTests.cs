@@ -89,6 +89,18 @@ public sealed class EsContractWalkerPostgresTests
         return (string)(await command.ExecuteScalarAsync())!;
     }
 
+    private static async Task ExecuteAsync(string connectionString, string sql)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand(sql, connection);
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private static BackfillJobDefinition EsDefinition() => new(
+        EsContractWalker.JobName, BackfillJobKinds.Historical, InstrumentId: 6, "ES", "TRADES", "1 min",
+        UseRth: false, new DateTimeOffset(2008, 1, 1, 0, 0, 0, TimeSpan.Zero), TargetTo: null, Priority: 60);
+
     /// <summary>Pre-warms the head-timestamp cache for a contract exactly as a prior scan would have left it.</summary>
     private static Task SeedHeadAsync(BackfillStore store, int conId, DateTimeOffset head) =>
         store.RecordHeadTimestampAsync(
@@ -239,6 +251,96 @@ public sealed class EsContractWalkerPostgresTests
         Assert.True(result.SlicesInserted > 0);
         Assert.Equal(0L, await CountRequestsAsync(connectionString, $"con_id = {FrontMonthContract.ConId}"));
         Assert.True(await CountRequestsAsync(connectionString, $"con_id = {ExpiredContract.ConId}") > 0);
+    }
+
+    // ---- completion: "some contracts planned" is not "the job is done" ----------------------------
+
+    [Fact]
+    public async Task A_scan_that_could_not_plan_every_contract_never_marks_the_job_complete()
+    {
+        // The defect, in the shape it actually shipped: completion was derived from
+        // IsJobSettledAsync, which counts rows in research.backfill_requests — and a contract whose
+        // head could not be resolved writes NO rows, so it lowers no count and is invisible to that
+        // query. `total > 0` proves ONE contract was planned, never that all 29 were. With
+        // es-1min-trades holding the lowest priority in the system, a handful of contracts planning
+        // while the rest were paced away was enough to report the job complete at 100% with most of
+        // the intended ES history never requested.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var store = StoreFor(connectionString);
+
+        await SeedHeadAsync(store, ExpiredContract.ConId, new DateTimeOffset(2020, 6, 1, 0, 0, 0, TimeSpan.Zero));
+        // FrontMonthContract's head is deliberately left un-cached and the gateway is unreachable,
+        // so it is skipped exactly the way a paced head probe skips one.
+
+        var job = await store.EnsureJobAsync(EsDefinition(), conId: null, CancellationToken.None);
+
+        var result = await WalkerFor(connectionString).SeedAsync(
+            job!, [ExpiredContract, FrontMonthContract], CancellationToken.None);
+
+        Assert.Equal(1, result.UnplannedContractCount);
+        Assert.False(result.PlanningComplete);
+
+        // Settle every row that WAS planned — the state the old code read as "nothing outstanding".
+        await ExecuteAsync(connectionString, "UPDATE research.backfill_requests SET state = 'succeeded', bars_landed = 1");
+        Assert.True(await store.IsJobSettledAsync(job!.JobId, 5, CancellationToken.None));
+
+        // A second scan in the same condition must still refuse to call it finished.
+        var second = await WalkerFor(connectionString).SeedAsync(
+            job, [ExpiredContract, FrontMonthContract], CancellationToken.None);
+
+        Assert.False(second.PlanningComplete);
+        Assert.Equal("running", await JobStatusAsync(connectionString, job.JobId));
+
+        // ...and once the missing contract's head resolves, the job completes on its own.
+        await SeedHeadAsync(store, FrontMonthContract.ConId, new DateTimeOffset(2023, 8, 20, 0, 0, 0, TimeSpan.Zero));
+        var third = await WalkerFor(connectionString).SeedAsync(
+            job, [ExpiredContract, FrontMonthContract], CancellationToken.None);
+
+        Assert.True(third.PlanningComplete);
+        Assert.Equal("running", await JobStatusAsync(connectionString, job.JobId)); // its new slices are pending
+
+        await ExecuteAsync(connectionString, "UPDATE research.backfill_requests SET state = 'succeeded', bars_landed = 1");
+        await WalkerFor(connectionString).SeedAsync(job, [ExpiredContract, FrontMonthContract], CancellationToken.None);
+
+        Assert.Equal("complete", await JobStatusAsync(connectionString, job.JobId));
+    }
+
+    [Fact]
+    public async Task A_contract_missing_from_this_scans_family_listing_holds_the_job_open()
+    {
+        // The walker's expectation cannot be only "the list TWS just handed me": a short listing
+        // would otherwise shrink the expected set to match itself and declare victory. Contracts
+        // already carrying request rows are remembered, so an incomplete enumeration is visible.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var store = StoreFor(connectionString);
+
+        await SeedHeadAsync(store, ExpiredContract.ConId, new DateTimeOffset(2020, 6, 1, 0, 0, 0, TimeSpan.Zero));
+        await SeedHeadAsync(store, FrontMonthContract.ConId, new DateTimeOffset(2023, 8, 20, 0, 0, 0, TimeSpan.Zero));
+
+        var job = await store.EnsureJobAsync(EsDefinition(), conId: null, CancellationToken.None);
+
+        var full = await WalkerFor(connectionString).SeedAsync(
+            job!, [ExpiredContract, FrontMonthContract], CancellationToken.None);
+        Assert.True(full.PlanningComplete);
+
+        await ExecuteAsync(connectionString, "UPDATE research.backfill_requests SET state = 'succeeded', bars_landed = 1");
+
+        // The next scan's enumeration comes back short of one contract this walker already knows.
+        var partial = await WalkerFor(connectionString).SeedAsync(job!, [ExpiredContract], CancellationToken.None);
+
+        Assert.Equal(1, partial.ForgottenContractCount);
+        Assert.False(partial.PlanningComplete);
+        Assert.Equal("running", await JobStatusAsync(connectionString, job!.JobId));
     }
 
     [Fact]

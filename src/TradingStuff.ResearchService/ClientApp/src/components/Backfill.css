@@ -293,6 +293,19 @@
   min-width: 90px;
 }
 
+/* Terminal, but holed: finished only in the sense that nothing further will be attempted. Amber
+   rather than the plain inherited colour of 'complete', because the two are not the same outcome. */
+.status-complete-with-gaps {
+  color: #e65100;
+  cursor: help;
+}
+
+@media (prefers-color-scheme: dark) {
+  .status-complete-with-gaps {
+    color: #ffb74d;
+  }
+}
+
 .slices-cell {
   text-align: right;
   font-family: 'Courier New', monospace;
@@ -492,7 +505,22 @@
   text-align: right;
   font-family: 'Courier New', monospace;
   font-weight: 500;
-  min-width: 80px;
+  min-width: 110px;
+  cursor: help;
+}
+
+.bars-landed {
+  display: block;
+}
+
+/* Pre-dedup count, subordinate on purpose: it is a measure of request budget spent re-fetching,
+   not a count of data held. */
+.bars-returned {
+  display: block;
+  font-size: 0.75rem;
+  opacity: 0.7;
+  font-weight: normal;
+  margin-top: 0.25rem;
 }
 
 .timestamp-cell {

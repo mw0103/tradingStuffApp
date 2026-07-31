@@ -503,6 +503,99 @@ not, because `QuoteRequest` echoes the contract it was ASKED for rather than TWS
 (verified live: requested SMART, returned SMART). Worth remembering before anyone "simplifies" that
 echo into using the resolved contract.
 
+### Phase 2 adversarial review — 19 confirmed defects fixed, 7 refuted
+
+Two review passes, 89 agents: one over the committed Phase 2 diff (11 confirmed of 22 raised), one
+over the gap-detection package (8 confirmed of 20). Structure was deliberately adversarial — diverse
+finder lenses, then a **three-lens refutation panel per finding** (read-the-code, reproduce-it,
+does-it-actually-mislead), defaulting to refuted and killing anything ≥2 reviewers rejected. That
+killed 7 findings, and on one survivor a dissenter established that exhausted-counts-as-settled is
+deliberate, documented and tested, which scoped the fix to four narrow faults instead of tearing out
+a working design. A single reviewer both generating and judging its own claims would have done
+neither.
+
+**One theme accounts for most of it: a subsystem reporting "finished" or "clean" over work that was
+never done.** Six instances, all fixed:
+
+- **The gap detector had a hole exactly where losses accumulate.** A historical job's audit ceiling
+  was its frozen `target_to` and a top-up's was a 2-day lookback, so the band between them widened by
+  a day per day of operation and no job's analysis covered it. Reproduced: three deliberately-emptied
+  RTH sessions reported `checked` with zero gaps, and asking for those days explicitly returned
+  `window-rejected` on both jobs. Fixed by auditing to `now` and adding `GapReport.Series`, a
+  cross-job reconciliation grouped on `(conId, whatToShow, barSize, useRth)` that subtracts audited
+  from claimed windows, plus per-job `Unaudited` ranges — a window nothing looked at can no longer
+  render as an empty gap list. **Verified live**: SPX's historical and top-up jobs now reconcile as
+  one series with no unaudited remainder.
+- **Nothing planned that band either.** `PlanHistorical` walked backward from the frozen `target_to`
+  and `PlanTopUp` planned only the current 15-minute bucket, so any outage longer than an hour lost
+  minute bars permanently. Added `PlanForward` (to a floored UTC midnight, so same-day reruns still
+  add zero rows) and a bounded top-up catch-up window. **Verified live**: the forward anchor returns
+  390 SPX bars for exactly the band nothing used to request.
+- **The ES walker declared 100% with 25 of 29 contracts unplanned.** Completion was derived from
+  request-row counts, and a contract skipped on a failed head probe contributes no rows, so it cannot
+  lower any count. It now counts contracts it could not plan and forces `running` when planning was
+  partial.
+- **Exhausted slices flipped a job to `complete` at 100%.** Kept the exhausted-is-settled accounting;
+  added terminal status `complete_with_gaps` (migration 009), made `PercentComplete` count only
+  resolved slices, and made status derived each pass rather than latched. The operator path back is
+  raising `MaxAttempts` — which already makes exhausted rows claimable, and now reopens the job too.
+- **A transient failure burned an attempt with no backoff.** Added `GatewayOutcome.Unreachable` split
+  on `HttpRequestError`: a connection/DNS/TLS failure provably never reached TWS, so it refunds the
+  attempt like `Paced` does; genuinely ambiguous failures stay `Transient` and now back off instead of
+  spinning. `BrokenCircuitException` was escaping the catch filter and stranding `inflight` rows.
+- **Coverage capped a flawless day near 50%.** Every conId was measured against the whole window
+  regardless of how long it held its node assignment, and node rotation is routine (every 2 minutes,
+  and at every UTC date roll). Now reported **per node role** — the identity the 95 % gate is actually
+  about — summing each conId's own tenure intersected with session minutes, with per-conId segments
+  kept visible underneath so a contract that dies on assignment still shows 0 % rather than being
+  smoothed into a healthy average. A latent bug fell out of this: the expected-conId query had **no
+  window filter at all**, so a historical report mixed in current assignments.
+
+**Order safety.** The fill-settle grace added earlier the same day was itself defective: it completed
+on the first execution per leg, so a 5-lot vertical would persist 2 fills totalling 7 contracts
+instead of 3 totalling 10 — and its comment claimed distinct-leg counting was what made it correct,
+which is backwards. The sound predicate needed information the tracker did not have: `orderStatus`
+counts a BAG in **spreads** while `execDetails` counts each leg in **contracts**, so leg *i* owes
+`filled × ratio[i]` and the combo ratio now travels with the leg index. It sums stored fill
+quantities (not TWS's cumulative field — the question is whether the list about to be persisted is
+complete) and only evaluates once terminal, since a predicate satisfied mid-partial-fill would latch
+a `TaskCompletionSource` that cannot be un-set. It fails safe: if `filled` were ever in leg contracts
+the expected total is only too high, giving a timeout and a warning rather than a truncated record.
+
+**Lease lifetime, rewritten rather than patched.** `ActiveLease` is now an encapsulated state machine
+— ticker, line lease, heartbeat and terminated flag private behind one lock, reachable only through
+check-and-mutate-as-one-step methods. Four defects fell out of that: `ReleaseAsync` never bounded its
+gap (the eviction-path fix had been applied to only one of two termination paths, and release runs
+every 2 minutes on rotation); replay and teardown raced through `ContainsKey` check-then-act, leaking
+a market-data line and a live TWS subscription per occurrence against a budget of 80; a lease granted
+*during* a replay pass was never replayed and silently recorded nothing for the session; and
+`OnSinkFailed` fired its gap-open loose, so with `FailAll` faulting ~54 sinks at once the INSERT could
+land after termination had already looked for something to close. The structural claim holds:
+`TryClaimTermination` is the only way to obtain the state needed to unwind, and one `TerminateAsync`
+is its only caller, so a future third termination path cannot skip the gap close.
+
+**Also fixed:** `reqHeadTimeStamp` classified a genuine no-data 162 as transient and re-probed forever
+at one paced request per attempt (162 is overloaded — the existing bars-path discriminator now
+applies); basis priority ranked `empty`/`permanent` above `exhausted`, so an abandoned range read as
+benign; the daily-bar path compared date-overlap expectations against instant-containment landings,
+fabricating `succeeded_but_absent` for present data; an in-progress session flagged as the
+checkpoint-lied alarm on every poll during market hours; the reported bars figure summed pre-dedup
+TWS counts (migration 009 adds `bars_landed`, populated from the insert's row count); and the overall
+coverage ratio returned a fabricated 0 % when *no instrument was being measured at all* — a fresh
+deployment reading as total failure, the loudest possible false alarm.
+
+**Two verification notes worth keeping.** Every agent verified its regression tests by reintroducing
+the defect and confirming they fail — the negative control that distinguishes a test which would have
+caught the bug from one that merely encodes it. And the lease agent caught its own false-green from a
+stale incremental build by probing rather than trusting the run. Both practices are now the standard
+for this project.
+
+**Unfixed, deliberately.** `CBOE_VIX_GTH` is not added to `exchange-calendars.json` despite the live
+measurement (VIX 1-min runs 02:15–15:59 CT, not `CBOE_INDEX_GTH`'s 19:15–08:15): that file is the
+ground truth every downstream artifact is validated against (CLAUDE.md class (b)) and one day's
+observation is not a published schedule. The evidence is recorded in `InstrumentCalendars` for
+whoever writes it. The RTH expectation currently under-flags, which is the safe direction.
+
 ## Left
 
 Milestone 2 (research platform — sequenced in `docs/plans/ibkr-edge-research-roadmap.md`):

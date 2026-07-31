@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import type { BackfillStatusReport } from '../types/backfill';
+import type { BackfillJobStatus, BackfillStatusReport } from '../types/backfill';
 import './Backfill.css';
 
 interface LoadingState {
@@ -47,12 +47,33 @@ const Backfill: React.FC = () => {
     return () => clearInterval(interval);
   }, [autoRefresh]);
 
-  const getProgressColor = (percentComplete: number, totalSlices: number): string => {
+  // A job carrying exhausted slices is never rendered in the success colour, however high its
+  // percentage climbs. percentComplete deliberately excludes exhausted slices, so such a job sits
+  // just short of 1.0 forever — near enough to the old >= 0.95 threshold to read as green, which is
+  // the exact misreading the backend change exists to prevent. Green here has to mean "we hold this
+  // data", not "we stopped asking for it".
+  const hasGaps = (job: BackfillJobStatus): boolean =>
+    job.status === 'complete_with_gaps' || job.exhaustedCount > 0;
+
+  const getProgressColor = (job: BackfillJobStatus): string => {
     // Zero slices: waiting/disabled state, not an error, not success
-    if (totalSlices === 0) return 'waiting';
-    if (percentComplete >= 0.95) return 'good';
-    if (percentComplete >= 0.5) return 'warning';
+    if (job.totalSlices === 0) return 'waiting';
+    if (job.percentComplete >= 0.95) return hasGaps(job) ? 'warning' : 'good';
+    if (job.percentComplete >= 0.5) return 'warning';
     return 'bad';
+  };
+
+  // 'complete_with_gaps' -> 'complete with gaps'; the cell capitalises it in CSS.
+  const formatStatus = (status: string): string => status.replace(/_/g, ' ');
+
+  const describeStatus = (job: BackfillJobStatus): string | undefined => {
+    if (job.status !== 'complete_with_gaps') return undefined;
+
+    return (
+      `Terminal, but incomplete: ${job.exhaustedCount} slice(s) spent their attempt budget and ` +
+      'will never be fetched. GET /research/backfill/gaps names the ranges; raising ' +
+      'Backfill:MaxAttempts makes them claimable again.'
+    );
   };
 
   const formatPercent = (percent: number): string => {
@@ -143,13 +164,15 @@ const Backfill: React.FC = () => {
                       <th>Total Slices</th>
                       <th>Progress by State</th>
                       <th>Complete</th>
-                      <th>Bars</th>
+                      <th title="Rows actually persisted to research.bars. Slices overlap by design, so TWS returns more bars than land — the pre-dedup count is shown underneath.">
+                        Bars landed
+                      </th>
                       <th>Last Update</th>
                     </tr>
                   </thead>
                   <tbody>
                     {sortedJobs.map((job) => {
-                      const progressColor = getProgressColor(job.percentComplete, job.totalSlices);
+                      const progressColor = getProgressColor(job);
                       const isDisabled = !data.enabled;
                       const isZeroSlices = job.totalSlices === 0;
 
@@ -162,7 +185,12 @@ const Backfill: React.FC = () => {
                             <code>{job.name}</code>
                           </td>
                           <td className="kind-cell">{job.kind}</td>
-                          <td className="status-cell">{job.status}</td>
+                          <td
+                            className={`status-cell status-${job.status.replace(/_/g, '-')}`}
+                            title={describeStatus(job)}
+                          >
+                            {formatStatus(job.status)}
+                          </td>
                           <td className="slices-cell">
                             <span className="slice-count">{job.totalSlices}</span>
                             {isZeroSlices && <span className="zero-slices-note">waiting for plan</span>}
@@ -230,8 +258,16 @@ const Backfill: React.FC = () => {
                               </>
                             )}
                           </td>
-                          <td className="bars-cell">
-                            {job.barsLanded.toLocaleString()}
+                          <td
+                            className="bars-cell"
+                            title={`${job.barsLanded.toLocaleString()} landed in research.bars; ${job.barsReturned.toLocaleString()} returned pre-dedup`}
+                          >
+                            <span className="bars-landed">{job.barsLanded.toLocaleString()}</span>
+                            {job.barsReturned > job.barsLanded && (
+                              <span className="bars-returned">
+                                {job.barsReturned.toLocaleString()} returned
+                              </span>
+                            )}
                           </td>
                           <td className="timestamp-cell">
                             {job.earliestLeaseExpiry ? (

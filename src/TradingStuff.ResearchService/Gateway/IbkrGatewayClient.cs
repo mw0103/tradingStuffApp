@@ -1,5 +1,6 @@
 using System.Net.Http.Json;
 using System.Text.Json;
+using Polly.CircuitBreaker;
 using TradingStuff.Contracts;
 using TradingStuff.ResearchContracts;
 
@@ -178,11 +179,10 @@ public sealed class IbkrGatewayClient(HttpClient httpClient, ILogger<IbkrGateway
         {
             response = await httpClient.PostAsJsonAsync("/ibkr/history/bars", request, cancellationToken);
         }
-        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException && !cancellationToken.IsCancellationRequested)
+        catch (Exception ex) when (IsTransportFailure(ex, cancellationToken))
         {
-            // Unreachable gateway or a client-side timeout. Indistinguishable from a slow TWS from
-            // here, and retryable either way.
-            return new HistoricalBarsResult(GatewayOutcome.Transient, [], null, null, ex.Message);
+            var (outcome, detail) = ClassifyTransportFailure(ex);
+            return new HistoricalBarsResult(outcome, [], null, null, detail);
         }
 
         using (response)
@@ -217,9 +217,10 @@ public sealed class IbkrGatewayClient(HttpClient httpClient, ILogger<IbkrGateway
                 "/ibkr/history/head-timestamp", new { Contract = contract, WhatToShow = whatToShow, UseRth = useRth },
                 cancellationToken);
         }
-        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException && !cancellationToken.IsCancellationRequested)
+        catch (Exception ex) when (IsTransportFailure(ex, cancellationToken))
         {
-            return new HeadTimestampResult(GatewayOutcome.Transient, null, null, null, ex.Message);
+            var (outcome, detail) = ClassifyTransportFailure(ex);
+            return new HeadTimestampResult(outcome, null, null, null, detail);
         }
 
         using (response)
@@ -237,6 +238,65 @@ public sealed class IbkrGatewayClient(HttpClient httpClient, ILogger<IbkrGateway
             return new HeadTimestampResult(outcome, null, retryAfter, errorCode, detail);
         }
     }
+
+    /// <summary>
+    /// Whether an exception thrown by the send is a transport failure this classifier owns, rather
+    /// than the caller's own cancellation.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately wider than <c>HttpRequestException or TaskCanceledException</c>. The resilience
+    /// pipeline this client is built on (see <c>ServiceClientConfiguration.DisableAutomaticRetries</c>)
+    /// carries a circuit breaker, and an open circuit throws <see cref="BrokenCircuitException"/> —
+    /// which matched neither arm of the original filter, escaped this method entirely, and surfaced
+    /// at the coordinator's outermost catch. That path never writes an outcome, so the claimed row
+    /// stayed <c>inflight</c> until a reaper turned it into <c>failed</c> with its attempt already
+    /// burned: the one failure shape that both loses the slice AND spends its retry budget. Anything
+    /// this method fails to recognise now still leaves this class as a classified outcome instead of
+    /// a stranded claim, which is the property that was actually missing.
+    /// </remarks>
+    private static bool IsTransportFailure(Exception ex, CancellationToken cancellationToken)
+    {
+        if (cancellationToken.IsCancellationRequested)
+        {
+            // The caller asked to stop; this is not a failure to classify, and swallowing it would
+            // hide a shutdown behind a retryable outcome.
+            return false;
+        }
+
+        // A TaskCanceledException raised while the CALLER's token is still live is the resilience
+        // pipeline's own attempt timeout, which is a transport failure. Any other
+        // OperationCanceledException belongs to a cancellation this method has no business claiming.
+        return ex is not OperationCanceledException || ex is TaskCanceledException;
+    }
+
+    /// <summary>
+    /// Splits a transport failure into "provably never reached TWS" and "may have reached TWS".
+    /// </summary>
+    /// <remarks>
+    /// The distinction is the whole point, and it is not cosmetic: the coordinator refunds the
+    /// slice's attempt for <see cref="GatewayOutcome.Unreachable"/> and burns it for
+    /// <see cref="GatewayOutcome.Transient"/>. <see cref="HttpRequestException.HttpRequestError"/> is
+    /// what makes the split precise rather than a guess — a connection refused, an unresolvable
+    /// host, or a failed TLS handshake all happen before a single byte reaches the gateway (let
+    /// alone TWS), whereas <c>ResponseEnded</c>/<c>InvalidResponse</c>/a client-side timeout all
+    /// mean the request was accepted and may well have consumed a paced request slot.
+    /// </remarks>
+    private static (GatewayOutcome Outcome, string Detail) ClassifyTransportFailure(Exception ex) => ex switch
+    {
+        BrokenCircuitException => (
+            GatewayOutcome.Unreachable,
+            $"The gateway circuit is open; the request was not sent. {ex.Message}"),
+
+        HttpRequestException
+        {
+            HttpRequestError: HttpRequestError.ConnectionError
+                or HttpRequestError.NameResolutionError
+                or HttpRequestError.SecureConnectionError
+                or HttpRequestError.ProxyTunnelError,
+        } => (GatewayOutcome.Unreachable, $"The gateway could not be reached. {ex.Message}"),
+
+        _ => (GatewayOutcome.Transient, ex.Message),
+    };
 
     /// <summary>Maps the gateway's documented history error surface onto <see cref="GatewayOutcome"/>.</summary>
     private static async Task<(GatewayOutcome Outcome, TimeSpan? RetryAfter, int? ErrorCode, string? Detail)> ClassifyFailureAsync(

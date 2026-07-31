@@ -157,6 +157,24 @@ public sealed class GapArithmeticTests
         Assert.Equal(GapBasis.SucceededButAbsent, GapArithmetic.DetermineBasis(covering, maxAttempts: 5));
     }
 
+    [Theory]
+    [InlineData("permanent")]
+    [InlineData("empty")]
+    public void An_abandoned_range_is_not_hidden_behind_an_explained_one(string explainedState)
+    {
+        // `empty` and `permanent` are EXPLAINED — TWS said the data is not there, or said the request
+        // can never succeed — and callers are told to treat both as resolved. `exhausted` means
+        // nobody established anything: the coordinator tried N times and stopped. Ranking the
+        // explained pair above it reported a range the platform had abandoned as benign.
+        var covering = new[]
+        {
+            new RequestWindow(Utc(2024, 1, 1), Utc(2024, 1, 2), explainedState, Attempts: 1),
+            new RequestWindow(Utc(2024, 1, 1), Utc(2024, 1, 2), "failed", Attempts: 5),
+        };
+
+        Assert.Equal(GapBasis.Exhausted, GapArithmetic.DetermineBasis(covering, maxAttempts: 5));
+    }
+
     [Fact]
     public void Succeeded_beats_permanent_and_exhausted_too()
     {
@@ -306,5 +324,95 @@ public sealed class GapArithmeticTests
 
         Assert.Equal(3, ranges.Count);
         Assert.True(truncated);
+    }
+
+    // ------------------------------------------------------------------ TradingDatesInRange
+
+    private static TradingSession RthSession(DateOnly date) => new(
+        SessionId: date.DayNumber,
+        Calendar: "CBOE_INDEX_RTH",
+        TradingDate: date,
+        OpenUtc: new DateTimeOffset(date.ToDateTime(new TimeOnly(14, 30)), TimeSpan.Zero),
+        CloseUtc: new DateTimeOffset(date.ToDateTime(new TimeOnly(21, 15)), TimeSpan.Zero),
+        Label: "RTH",
+        IsHalfDay: false);
+
+    [Fact]
+    public void A_daily_expectation_uses_the_same_bound_convention_as_the_landed_query()
+    {
+        // The expected set and the landed set MUST agree on what "in range" means, because one is
+        // measured against the other. BackfillStore.GetLandedTradingDatesAsync filters on the bar's
+        // instant (ts_utc >= from AND ts_utc < to), and a daily bar's instant is its trading date's
+        // UTC midnight. The previous rule here was whole-day OVERLAP, so a window starting mid-day —
+        // which every head-clamped lower bound does — expected a date whose bar that query could not
+        // return, and reported succeeded_but_absent over data that is present and correct.
+        var sessions = new[]
+        {
+            RthSession(new DateOnly(2024, 1, 8)),
+            RthSession(new DateOnly(2024, 1, 9)),
+            RthSession(new DateOnly(2024, 1, 10)),
+        };
+
+        // Starts inside Monday, so Monday's midnight instant is BELOW the window: its bar is not in
+        // range, and must not be expected.
+        var dates = GapArithmetic.TradingDatesInRange(sessions, Utc(2024, 1, 8, 14, 30), Utc(2024, 1, 10, 12, 0));
+
+        Assert.Equal([new DateOnly(2024, 1, 9), new DateOnly(2024, 1, 10)], dates);
+    }
+
+    [Fact]
+    public void A_daily_expectation_is_half_open_at_both_ends()
+    {
+        var sessions = new[] { RthSession(new DateOnly(2024, 1, 8)), RthSession(new DateOnly(2024, 1, 9)) };
+
+        // [Monday midnight, Tuesday midnight) — Monday in, Tuesday out.
+        Assert.Equal(
+            [new DateOnly(2024, 1, 8)],
+            GapArithmetic.TradingDatesInRange(sessions, Utc(2024, 1, 8), Utc(2024, 1, 9)));
+    }
+
+    // ------------------------------------------------------------------ Union / Subtract
+
+    [Fact]
+    public void Overlapping_and_touching_spans_merge_into_one()
+    {
+        var union = GapArithmetic.Union(
+        [
+            new(Utc(2024, 1, 3), Utc(2024, 1, 5)),
+            new(Utc(2024, 1, 1), Utc(2024, 1, 3)), // touches the first exactly
+            new(Utc(2024, 1, 4), Utc(2024, 1, 6)), // overlaps
+            new(Utc(2024, 1, 9), Utc(2024, 1, 9)), // empty — dropped
+        ]);
+
+        Assert.Equal([new GapArithmetic.Span(Utc(2024, 1, 1), Utc(2024, 1, 6))], union);
+    }
+
+    [Fact]
+    public void The_seam_between_two_audited_windows_is_what_subtract_reports()
+    {
+        // The reconciliation the report was missing, in miniature: a historical job audited up to
+        // Jan 10 and a top-up job audited from Jan 20, both of them cleanly. Nothing looked at the
+        // ten days between, and no per-job check could ever say so.
+        var unaudited = GapArithmetic.Subtract(
+            [new(Utc(2024, 1, 1), Utc(2024, 1, 31))],
+            [new(Utc(2024, 1, 1), Utc(2024, 1, 10)), new(Utc(2024, 1, 20), Utc(2024, 1, 31))]);
+
+        Assert.Equal([new GapArithmetic.Span(Utc(2024, 1, 10), Utc(2024, 1, 20))], unaudited);
+    }
+
+    [Fact]
+    public void A_fully_audited_claim_subtracts_to_nothing()
+    {
+        Assert.Empty(GapArithmetic.Subtract(
+            [new(Utc(2024, 1, 1), Utc(2024, 1, 10))],
+            [new(Utc(2023, 1, 1), Utc(2024, 6, 1))]));
+    }
+
+    [Fact]
+    public void A_claim_nothing_audited_survives_subtraction_whole()
+    {
+        Assert.Equal(
+            [new GapArithmetic.Span(Utc(2024, 1, 1), Utc(2024, 1, 10))],
+            GapArithmetic.Subtract([new(Utc(2024, 1, 1), Utc(2024, 1, 10))], []));
     }
 }

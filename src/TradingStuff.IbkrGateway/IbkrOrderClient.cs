@@ -117,18 +117,22 @@ public sealed class IbkrOrderClient(
 
         // Registered BEFORE transmitting. A crash between placeOrder and the first orderStatus would
         // otherwise leave a live order nothing in this process knows about.
-        var legIndexByConId = new Dictionary<int, int>();
+        //
+        // The ratio travels with the leg index because the tracker cannot decide when an order's
+        // fills are fully reported without it: orderStatus counts a BAG's fills in spreads, while
+        // execDetails counts each leg in contracts (see TrackedComboLeg).
+        var legsByConId = new Dictionary<int, TrackedComboLeg>();
 
         for (var index = 0; index < request.Legs.Count; index++)
         {
-            legIndexByConId[conIds[request.Legs[index].Contract.Key()]] = index;
+            legsByConId[conIds[request.Legs[index].Contract.Key()]] = new TrackedComboLeg(index, plan.Ratios[index]);
         }
 
         // Claiming the internal order id and registering the order are one atomic step. If the claim
         // is already held, this internal order has been transmitted before — a caller retry, a
         // duplicate request — and placing again would put a second live order on the book under a
         // different broker id, with the caller only ever seeing the last one.
-        if (!tracker.TryTrack(ibkrOrderId, request.ClientOrderId, internalOrderId, legIndexByConId))
+        if (!tracker.TryTrack(ibkrOrderId, request.ClientOrderId, internalOrderId, legsByConId))
         {
             var existing = tracker.FindByInternalOrderId(internalOrderId)
                            ?? throw new InvalidOperationException(

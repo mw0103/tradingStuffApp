@@ -69,7 +69,7 @@ public sealed class IbkrHistoricalClient(
             return new HistoricalBarsResponse([.. bars.Select(MapBar)], HasData: true);
         }
         catch (IbkrRequestException ex)
-            when (ex.ErrorCode == IbkrErrorCodes.NoHistoricalData && IsGenuinelyNoData(ex.Message))
+            when (ex.ErrorCode == IbkrErrorCodes.NoHistoricalData && IsGenuinelyNoData(ex.TwsMessage))
         {
             // Error 162 ("HMDS query returned no data") means this slice is empty, not that the
             // request failed — a different date range on the same contract can still have data.
@@ -128,6 +128,26 @@ public sealed class IbkrHistoricalClient(
             // than assume — midnight UTC on that date is the closest honest instant.
             return new HeadTimestampResponse(
                 timestamp ?? new DateTimeOffset(tradingDate!.Value.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero));
+        }
+        catch (IbkrRequestException ex) when (ex.ErrorCode == IbkrErrorCodes.NoHistoricalData)
+        {
+            if (AsMissingHeadTimestamp(ex) is not { } permanent)
+            {
+                // Pacing, or wording nobody has seen before. Stays transient and gets retried: the
+                // cost of a needless retry is one paced request, while the cost of retiring a head
+                // timestamp that does exist is every job on that contract planned against the wrong
+                // floor.
+                throw;
+            }
+
+            logger.LogInformation(
+                "TWS reports no historical data at all for {Contract} ({WhatToShow}), so it has no head " +
+                "timestamp: {Message}",
+                Describe(query.Contract),
+                whatToShow,
+                ex.TwsMessage);
+
+            throw permanent;
         }
         finally
         {
@@ -226,6 +246,30 @@ public sealed class IbkrHistoricalClient(
         return message.Contains("no data", StringComparison.OrdinalIgnoreCase)
                || message.Contains("no historical", StringComparison.OrdinalIgnoreCase);
     }
+
+    /// <summary>
+    /// Reclassifies a <c>reqHeadTimeStamp</c> rejection that genuinely means "this contract has no
+    /// history" as a permanent failure; returns null for any other 162, which must stay retryable.
+    /// </summary>
+    /// <remarks>
+    /// The bars path answers a genuine 162 with <c>HasData: false</c> — a confirmed-empty SLICE,
+    /// which says nothing about the contract, because a different date range may still have data.
+    /// A head timestamp has no other date range to try: it IS the question "where does this
+    /// contract's data start", and "no historical market data for SPX/IND@CBOE MidPoint" answers it
+    /// permanently (RUNTIME-verified for SPX MIDPOINT — see
+    /// <c>docs/research/ibkr-data-capability-matrix.md</c>).
+    /// <para>
+    /// Left transient, that answer is an unbounded probe loop rather than a slow retry: the backfill
+    /// coordinator declines to plan the job without a head timestamp, does not cache the failure,
+    /// and re-probes on every pass — one paced historical request each time, forever, with the job
+    /// never planning a single slice. Permanent maps to 400, which both callers already handle by
+    /// degrading honestly (plan the full declared range unclamped, or skip the contract this scan).
+    /// </para>
+    /// </remarks>
+    internal static IbkrRequestException? AsMissingHeadTimestamp(IbkrRequestException ex) =>
+        ex.ErrorCode == IbkrErrorCodes.NoHistoricalData && IsGenuinelyNoData(ex.TwsMessage)
+            ? new IbkrRequestException(ex.ErrorCode, ex.TwsMessage, permanent: true)
+            : null;
 
     private static string Describe(HistoricalContractSpec contract) =>
         $"{contract.Symbol} {contract.SecType} {contract.LastTradeDateOrContractMonth} " +

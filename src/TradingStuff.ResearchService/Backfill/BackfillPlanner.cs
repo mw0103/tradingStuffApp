@@ -67,6 +67,14 @@ public sealed record SliceCadence(SliceCadenceUnit Unit, int Count)
         SliceCadenceUnit.Week => boundary.AddDays(-7 * Count),
         _ => boundary.AddYears(-Count),
     };
+
+    /// <summary>The next boundary forward from <paramref name="boundary"/>, staying on the same grid.</summary>
+    public DateTimeOffset Next(DateTimeOffset boundary) => Unit switch
+    {
+        SliceCadenceUnit.Day => boundary.AddDays(Count),
+        SliceCadenceUnit.Week => boundary.AddDays(7 * Count),
+        _ => boundary.AddYears(Count),
+    };
 }
 
 /// <summary>
@@ -263,8 +271,80 @@ public static class BackfillPlanner
     }
 
     /// <summary>
-    /// The one slice a top-up run issues: the tail ending at the 15-minute bucket
-    /// <paramref name="nowUtc"/> falls in.
+    /// The slices covering the band between a job's frozen <c>target_to</c> and today's UTC midnight
+    /// — the range <see cref="PlanHistorical"/> walks away from and <see cref="PlanTopUp"/> never
+    /// reaches back to.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>The hole this closes.</b> <c>target_to</c> is fixed at the UTC midnight of the day the job
+    /// row was created and deliberately never moves (that fixed far end is what makes lowering
+    /// <c>target_from</c> a pure extension — see <c>BackfillStore.EnsureJobAsync</c>). Historical
+    /// planning walks BACKWARD from it and the top-up only ever plans the current bucket, so
+    /// everything after <c>target_to</c> was requested by neither: enable backfill at 14:07Z and SPX
+    /// minute bars for 00:00Z–13:00Z that day were planned by nothing, ever, and re-planning
+    /// re-derived the same slices and added nothing. The band widened by a day per day of operation.
+    /// </para>
+    /// <para>
+    /// <b>Why it is anchored on <c>target_to</c> rather than on the cadence's own calendar grid.</b>
+    /// The newest historical slice ends exactly at <c>target_to</c>, so stepping forward from that
+    /// same instant makes the two sequences contiguous by construction, with no reasoning about
+    /// phase. It does mean a weekly cadence's forward slices need not land on Mondays the way its
+    /// backward ones do — which costs nothing, because both are fixed instants derived only from
+    /// persisted job columns, and that is the entire requirement the idempotency key imposes.
+    /// </para>
+    /// <para>
+    /// <b>Why the ceiling is a UTC midnight and not <paramref name="nowUtc"/>.</b> A slice ending at
+    /// "now" is a different row every run — precisely the drift that would make a rerun add rows
+    /// forever. Flooring to the day means two runs on the same UTC date plan the identical set and
+    /// add zero rows, while crossing midnight adds exactly one genuinely new slice, which is exactly
+    /// one genuinely new day of data. The trailing slice is what covers a cadence coarser than a day
+    /// (a "1 Y" daily-bar job would otherwise plan nothing new until January): it re-requests the
+    /// same wide window once per day, and <c>research.bars</c> absorbs the overlap for one paced
+    /// request. The cost of the whole mechanism is about one extra request per job per day.
+    /// </para>
+    /// <para>
+    /// The current partial day is NOT covered here — it cannot be, without an anchor that moves —
+    /// so it is the top-up's job until the next midnight makes it the forward extension's. That is
+    /// the division of labour: the top-up keeps the last hours fresh, this closes the day behind it
+    /// permanently, and after an outage of any length every missed day is planned on the next pass.
+    /// </para>
+    /// </remarks>
+    public static IReadOnlyList<BackfillSlice> PlanForward(
+        BackfillJob job, int conId, DateTimeOffset nowUtc, SliceCadence cadence)
+    {
+        var targetTo = job.TargetTo.ToUniversalTime();
+        var ceiling = FloorToBucket(nowUtc, TimeSpan.FromDays(1));
+
+        if (ceiling <= targetTo)
+        {
+            return [];
+        }
+
+        var slices = new List<BackfillSlice>();
+
+        for (var end = cadence.Next(targetTo); end <= ceiling && slices.Count < MaxSlicesPerJob; end = cadence.Next(end))
+        {
+            slices.Add(SliceAt(job, conId, end, cadence.Duration));
+        }
+
+        // Coarser than a day: the loop above stops short of the ceiling (possibly without emitting
+        // anything at all), so one trailing slice ending at today's midnight carries the remainder.
+        // It over-reaches backward past the previous boundary exactly the way PlanHistorical's
+        // leading slice does, and for the same reason — the overlap is free and keeps the covered
+        // range contiguous.
+        if (slices.Count < MaxSlicesPerJob && (slices.Count == 0 || slices[^1].EndTimeUtc != ceiling))
+        {
+            slices.Add(SliceAt(job, conId, ceiling, cadence.Duration));
+        }
+
+        return slices;
+    }
+
+    /// <summary>
+    /// The slices a top-up run issues: the tail ending at the 15-minute bucket
+    /// <paramref name="nowUtc"/> falls in, plus the <paramref name="catchUpBuckets"/> buckets behind
+    /// it, so a run the coordinator missed is re-planned rather than skipped forever.
     /// </summary>
     /// <remarks>
     /// This is the resolution of the top-up idempotency contradiction migration 004 shipped. That
@@ -281,13 +361,43 @@ public static class BackfillPlanner
     /// re-issue the identical TWS call from the row months later, which a NULL "whenever this ran"
     /// anchor could never support.
     /// </para>
+    /// <para>
+    /// <b>Why the run plans a window of buckets rather than only the current one.</b> The original
+    /// single-bucket version never re-planned a bucket it missed, and nothing else did either:
+    /// <see cref="PlanHistorical"/> walks away from the recent end, so an outage from 22:00Z to
+    /// 07:00Z left nine hours of minute bars requested by nothing at all until the forward extension
+    /// reached them at the next UTC midnight. Planning the trailing buckets closes the common cases
+    /// — a restart, a deploy, a pacing storm — within one plan pass instead of within a day.
+    /// Idempotency is untouched: every bucket is a fixed instant on the same epoch-anchored grid, so
+    /// two runs inside one bucket still derive the identical set and add zero rows, and crossing a
+    /// bucket still adds exactly one.
+    /// </para>
     /// </remarks>
+    /// <param name="catchUpBuckets">
+    /// How many buckets BEHIND the current one to re-plan. Bounded rather than "back to whatever is
+    /// missing" on purpose: an unbounded look-back would turn a week-long outage into a burst of
+    /// hundreds of top-up requests at the highest priority in the system, starving the historical
+    /// drain to re-fetch data the forward extension covers with one request per day anyway.
+    /// </param>
+    public static IReadOnlyList<BackfillSlice> PlanTopUp(
+        BackfillJob job, int conId, DateTimeOffset nowUtc, int catchUpBuckets)
+    {
+        var duration = job.SliceDuration is { Length: > 0 } explicitDuration ? explicitDuration : DefaultTopUpDuration;
+        var current = FloorToBucket(nowUtc, TopUpBucket);
+
+        var slices = new List<BackfillSlice>(Math.Max(1, catchUpBuckets + 1));
+
+        for (var i = 0; i <= Math.Max(0, catchUpBuckets); i++)
+        {
+            slices.Add(SliceAt(job, conId, current - (TopUpBucket * i), duration));
+        }
+
+        return slices;
+    }
+
+    /// <summary>The single current-bucket top-up slice, with no catch-up window.</summary>
     public static BackfillSlice PlanTopUp(BackfillJob job, int conId, DateTimeOffset nowUtc) =>
-        SliceAt(
-            job,
-            conId,
-            FloorToBucket(nowUtc, TopUpBucket),
-            job.SliceDuration is { Length: > 0 } duration ? duration : DefaultTopUpDuration);
+        PlanTopUp(job, conId, nowUtc, catchUpBuckets: 0)[0];
 
     /// <summary>Floors <paramref name="instant"/> down to a whole multiple of <paramref name="bucket"/> from the epoch.</summary>
     public static DateTimeOffset FloorToBucket(DateTimeOffset instant, TimeSpan bucket)

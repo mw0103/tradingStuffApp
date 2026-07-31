@@ -7,10 +7,15 @@ interface LoadingState {
   error: string | null;
 }
 
+interface ExpandedState {
+  [nodeId: number]: boolean;
+}
+
 const Coverage: React.FC = () => {
   const [data, setData] = useState<CoverageReport | null>(null);
   const [state, setState] = useState<LoadingState>({ isLoading: true, error: null });
   const [autoRefresh, setAutoRefresh] = useState(true);
+  const [expandedNodes, setExpandedNodes] = useState<ExpandedState>({});
   const REFRESH_INTERVAL = 30000; // 30 seconds
 
   const fetchCoverage = async () => {
@@ -47,9 +52,22 @@ const Coverage: React.FC = () => {
     return () => clearInterval(interval);
   }, [autoRefresh]);
 
+  // The same rule the backfill table follows: green has to mean "we hold this data", not "the
+  // number is high". Two things leave a high ratio unbacked, and neither is visible in the ratio
+  // itself. A basis other than 'measured' means the denominator cannot be believed — and since a
+  // missing session row SHRINKS the denominator, an out-of-sync session table reads as near-perfect
+  // rather than as broken. An open gap means minutes are being lost right now, and a trailing
+  // window absorbs a fresh outage almost without moving, so recording can be down at 99.9%.
+  // Gap scopes are lease- and writer-keyed, not node-keyed, so an open gap cannot be attributed to
+  // individual rows; it is withheld from every row, because none of them can be called healthy
+  // while the recorder that feeds them all is down.
+  const openGaps = data?.gaps.filter((gap) => !gap.endedAt) ?? [];
+  const coverageIsBacked =
+    data !== null && data.basis.status === 'measured' && openGaps.length === 0;
+
   const getCoverageColor = (ratio: number | null): string => {
     if (ratio === null) return 'warning';
-    if (ratio >= 0.95) return 'good';
+    if (ratio >= 0.95) return coverageIsBacked ? 'good' : 'warning';
     if (ratio >= 0.8) return 'warning';
     return 'bad';
   };
@@ -65,7 +83,21 @@ const Coverage: React.FC = () => {
     'calendar-unknown': 'A configured calendar key is not in the shipped calendar dataset.',
   };
 
-  const formatRatio = (ratio: number): string => {
+  /** Why a ratio at or above the threshold is not being shown as healthy. */
+  const describeWithheldGood = (ratio: number | null): string | undefined => {
+    if (data === null || ratio === null || ratio < 0.95 || coverageIsBacked) return undefined;
+    if (data.basis.status !== 'measured') {
+      return `Above the threshold, but not measurable: ${statusExplanation[data.basis.status]}`;
+    }
+
+    return (
+      `Above the threshold, but ${openGaps.length} recording gap(s) are still open — this window ` +
+      'is still losing minutes, and the ratio lags the outage.'
+    );
+  };
+
+  const formatRatio = (ratio: number | null): string => {
+    if (ratio === null) return 'Not measured';
     return (ratio * 100).toFixed(2);
   };
 
@@ -85,8 +117,29 @@ const Coverage: React.FC = () => {
     }
   };
 
-  const sortedConIds = data?.perConId
-    ? [...data.perConId].sort((a, b) => a.coverageRatio - b.coverageRatio)
+  const toggleNodeExpanded = (nodeId: number) => {
+    setExpandedNodes((prev) => ({
+      ...prev,
+      [nodeId]: !prev[nodeId],
+    }));
+  };
+
+  const withheldOverall = describeWithheldGood(data?.overallCoverageRatio ?? null);
+
+  const sortedNodes = data?.perNode
+    ? [...data.perNode].sort((a, b) => {
+        // Sort by coverage ratio, putting null values (unmeasured) at the end
+        const aRatio = a.coverageRatio ?? -1;
+        const bRatio = b.coverageRatio ?? -1;
+        if (aRatio === -1 && bRatio === -1) return 0;
+        if (aRatio === -1) return 1;
+        if (bRatio === -1) return -1;
+        return aRatio - bRatio;
+      })
+    : [];
+
+  const sortedUnassigned = data?.unassignedConIds
+    ? [...data.unassignedConIds].sort((a, b) => a.coverageRatio - b.coverageRatio)
     : [];
 
   const sortedGaps = data?.gaps
@@ -146,6 +199,7 @@ const Coverage: React.FC = () => {
               {data.overallCoverageRatio !== null && data.overallCoverageRatio < 0.95 && (
                 <div className="coverage-flag">Below 95% acceptance threshold</div>
               )}
+              {withheldOverall && <div className="coverage-flag">{withheldOverall}</div>}
             </div>
           </section>
 
@@ -159,10 +213,111 @@ const Coverage: React.FC = () => {
             </div>
           </section>
 
-          {/* Per-ConId Coverage Table */}
-          {sortedConIds.length > 0 && (
+          {/* Nodes Coverage Table */}
+          {sortedNodes.length > 0 && (
             <section className="coverage-section">
-              <h2>Coverage by Contract ({sortedConIds.length})</h2>
+              <h2>Option Nodes ({sortedNodes.length})</h2>
+              <div className="table-wrapper">
+                <table className="coverage-table">
+                  <thead>
+                    <tr>
+                      <th style={{ width: '40px' }}></th>
+                      <th>Node</th>
+                      <th>Role</th>
+                      <th>Minutes with Data</th>
+                      <th>Total Minutes</th>
+                      <th>Coverage</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {sortedNodes.map((node) => (
+                      <React.Fragment key={node.nodeId}>
+                        <tr
+                          className={getCoverageColor(node.coverageRatio)}
+                          title={describeWithheldGood(node.coverageRatio)}
+                        >
+                          <td className="expand-cell">
+                            {node.conIdSegments.length > 0 && (
+                              <button
+                                className="expand-button"
+                                onClick={() => toggleNodeExpanded(node.nodeId)}
+                                title={expandedNodes[node.nodeId] ? 'Collapse' : 'Expand'}
+                              >
+                                {expandedNodes[node.nodeId] ? '▼' : '▶'}
+                              </button>
+                            )}
+                          </td>
+                          <td className="conid-cell">{node.nodeId}</td>
+                          <td className="role-cell">{node.role}</td>
+                          <td className="number-cell">{node.minutesWithData}</td>
+                          <td className="number-cell">{node.totalMinutes}</td>
+                          <td className="coverage-cell">
+                            {node.coverageRatio !== null ? (
+                              <>
+                                <div className="coverage-bar">
+                                  <div
+                                    className="coverage-fill"
+                                    style={{ width: `${node.coverageRatio * 100}%` }}
+                                  ></div>
+                                </div>
+                                <span className="coverage-percent">{formatRatio(node.coverageRatio)}%</span>
+                              </>
+                            ) : (
+                              <span className="coverage-not-measured">Not measured</span>
+                            )}
+                          </td>
+                        </tr>
+                        {expandedNodes[node.nodeId] && node.conIdSegments.length > 0 && (
+                          <>
+                            {node.conIdSegments.map((segment) => (
+                              // Keyed on assignedFrom, not conId: a node that rotates off a conId
+                              // and back onto it inside the window has two segments for that conId,
+                              // and the partial unique index makes assignedFrom the unique one.
+                              <tr key={`segment-${node.nodeId}-${segment.assignedFrom}`} className="segment-row">
+                                <td></td>
+                                <td></td>
+                                <td className="segment-conid-cell">
+                                  <span className="segment-label">ConId {segment.conId}</span>
+                                </td>
+                                <td className="number-cell">{segment.minutesWithData}</td>
+                                <td className="number-cell">{segment.totalMinutes}</td>
+                                <td className="coverage-cell">
+                                  {segment.coverageRatio !== null ? (
+                                    <>
+                                      <div className="coverage-bar segment-bar">
+                                        <div
+                                          className="coverage-fill"
+                                          style={{ width: `${segment.coverageRatio * 100}%` }}
+                                        ></div>
+                                      </div>
+                                      <span className="coverage-percent segment-percent">
+                                        {formatRatio(segment.coverageRatio)}%
+                                      </span>
+                                    </>
+                                  ) : (
+                                    <span className="coverage-not-measured">Not measured</span>
+                                  )}
+                                </td>
+                              </tr>
+                            ))}
+                          </>
+                        )}
+                      </React.Fragment>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </section>
+          )}
+
+          {/* Unassigned ConIds Table */}
+          {sortedUnassigned.length > 0 && (
+            <section className="coverage-section">
+              <h2>Core Underlyings ({sortedUnassigned.length})</h2>
+              <p className="section-note">
+                These are core underlyings (SPX, VIX, SPY) measured across the entire reporting window,
+                not assigned to a specific node.
+              </p>
               <div className="table-wrapper">
                 <table className="coverage-table">
                   <thead>
@@ -174,8 +329,12 @@ const Coverage: React.FC = () => {
                     </tr>
                   </thead>
                   <tbody>
-                    {sortedConIds.map((conId) => (
-                      <tr key={conId.conId} className={getCoverageColor(conId.coverageRatio)}>
+                    {sortedUnassigned.map((conId) => (
+                      <tr
+                        key={conId.conId}
+                        className={getCoverageColor(conId.coverageRatio)}
+                        title={describeWithheldGood(conId.coverageRatio)}
+                      >
                         <td className="conid-cell">{conId.conId}</td>
                         <td className="number-cell">{conId.minutesWithData}</td>
                         <td className="number-cell">{conId.totalMinutes}</td>

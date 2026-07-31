@@ -330,6 +330,144 @@ public sealed class BackfillPlannerTests
         Assert.Equal(boundary, BackfillPlanner.FloorToBucket(boundary, TimeSpan.FromMinutes(15)));
     }
 
+    [Fact]
+    public void A_top_up_run_replans_the_buckets_behind_it_so_a_missed_run_is_not_skipped_forever()
+    {
+        // PlanTopUp used to plan ONLY the current bucket and nothing re-planned a bucket it missed,
+        // while PlanHistorical walks away from the recent end — so an outage from 22:00Z to 07:00Z
+        // left nine hours of minute bars requested by nothing at all.
+        var job = Job(Utc(2026, 1, 1), Utc(2035, 1, 1), kind: BackfillJobKinds.TopUp);
+
+        var slices = BackfillPlanner.PlanTopUp(job, 416904, Utc(2026, 7, 31, 14, 37), catchUpBuckets: 16);
+
+        Assert.Equal(17, slices.Count);
+        Assert.Equal(Utc(2026, 7, 31, 14, 30), slices[0].EndTimeUtc);
+        Assert.Equal(Utc(2026, 7, 31, 10, 30), slices[^1].EndTimeUtc); // 16 buckets = four hours back
+
+        // Every anchor stays on the same epoch grid and none reaches into the future.
+        Assert.All(slices, slice =>
+        {
+            Assert.Equal(slice.EndTimeUtc, BackfillPlanner.FloorToBucket(slice.EndTimeUtc!.Value, BackfillPlanner.TopUpBucket));
+            Assert.True(slice.EndTimeUtc <= Utc(2026, 7, 31, 14, 37));
+        });
+    }
+
+    [Fact]
+    public void Two_catch_up_top_up_runs_inside_one_bucket_produce_the_identical_slice_set()
+    {
+        // The catch-up window must not cost the idempotency guarantee it was added around: same
+        // bucket, byte-identical set, zero new rows.
+        var job = Job(Utc(2026, 1, 1), Utc(2035, 1, 1), kind: BackfillJobKinds.TopUp);
+
+        var early = BackfillPlanner.PlanTopUp(job, 416904, Utc(2026, 7, 31, 14, 30), 16).Select(Render);
+        var late = BackfillPlanner.PlanTopUp(job, 416904, Utc(2026, 7, 31, 14, 44), 16).Select(Render);
+
+        Assert.Equal(early, late);
+    }
+
+    [Fact]
+    public void Crossing_a_bucket_adds_exactly_one_new_top_up_slice()
+    {
+        var job = Job(Utc(2026, 1, 1), Utc(2035, 1, 1), kind: BackfillJobKinds.TopUp);
+
+        var before = BackfillPlanner.PlanTopUp(job, 416904, Utc(2026, 7, 31, 14, 44), 16).Select(Render).ToHashSet();
+        var after = BackfillPlanner.PlanTopUp(job, 416904, Utc(2026, 7, 31, 14, 45), 16).Select(Render).ToArray();
+
+        Assert.Single(after.Except(before));
+    }
+
+    // ---- the band forward of target_to ----------------------------------------------------------
+
+    [Fact]
+    public void The_band_between_target_to_and_today_is_planned_rather_than_left_to_nobody()
+    {
+        // target_to is frozen at the creation day's UTC midnight and PlanHistorical walks BACKWARD
+        // from it, so everything after it belonged to no planner at all: enable backfill at 14:07Z
+        // and that day's earlier bars were requested by nothing, ever, with the hole widening by a
+        // day per day of operation.
+        var targetTo = Utc(2026, 7, 1);
+        var job = Job(Utc(2026, 6, 1), targetTo);
+        var cadence = CadenceOf(job);
+
+        var forward = BackfillPlanner.PlanForward(job, 416904, Utc(2026, 7, 6, 14, 7), cadence);
+
+        Assert.Equal(
+            [Utc(2026, 7, 2), Utc(2026, 7, 3), Utc(2026, 7, 4), Utc(2026, 7, 5), Utc(2026, 7, 6)],
+            forward.Select(slice => slice.EndTimeUtc));
+    }
+
+    [Fact]
+    public void Forward_slices_are_contiguous_with_the_newest_historical_slice()
+    {
+        // The two sequences meet exactly at target_to: the newest backward slice ends there and the
+        // oldest forward slice covers the cadence step immediately after it, with no instant
+        // belonging to neither.
+        var targetTo = Utc(2026, 7, 1);
+        var job = Job(Utc(2026, 6, 1), targetTo);
+        var cadence = CadenceOf(job);
+
+        var backward = BackfillPlanner.PlanHistorical(job, 416904, null, cadence);
+        var forward = BackfillPlanner.PlanForward(job, 416904, Utc(2026, 7, 6), cadence);
+
+        Assert.Equal(targetTo, backward.Max(slice => slice.EndTimeUtc));
+        Assert.Equal(targetTo, cadence.Previous(forward.Min(slice => slice.EndTimeUtc)!.Value));
+    }
+
+    [Fact]
+    public void Two_forward_plans_on_the_same_utc_day_are_identical_and_crossing_midnight_adds_one()
+    {
+        // The determinism requirement, restated for the one planner that legitimately reads the
+        // clock: an anchor at `now` would be a new row every run, so the ceiling is floored to a UTC
+        // midnight. Same day, same set; next day, exactly one more day of data.
+        var job = Job(Utc(2026, 6, 1), Utc(2026, 7, 1));
+        var cadence = CadenceOf(job);
+
+        var morning = BackfillPlanner.PlanForward(job, 416904, Utc(2026, 7, 6, 0, 1), cadence).Select(Render).ToArray();
+        var evening = BackfillPlanner.PlanForward(job, 416904, Utc(2026, 7, 6, 23, 59), cadence).Select(Render).ToArray();
+        var tomorrow = BackfillPlanner.PlanForward(job, 416904, Utc(2026, 7, 7, 0, 1), cadence).Select(Render).ToArray();
+
+        Assert.Equal(morning, evening);
+        Assert.Single(tomorrow.Except(morning));
+    }
+
+    [Fact]
+    public void A_forward_plan_never_anchors_a_slice_in_the_future()
+    {
+        var job = Job(Utc(2026, 6, 1), Utc(2026, 7, 1));
+        var now = Utc(2026, 7, 6, 14, 7);
+
+        Assert.All(
+            BackfillPlanner.PlanForward(job, 416904, now, CadenceOf(job)),
+            slice => Assert.True(slice.EndTimeUtc!.Value <= now));
+    }
+
+    [Fact]
+    public void A_cadence_coarser_than_a_day_still_gets_a_trailing_slice_covering_the_band()
+    {
+        // The daily-bars job slices a YEAR at a time, so stepping the grid forward from target_to
+        // produces nothing at all until next January — and every VIX daily bar since the job was
+        // created would sit unrequested until then. One trailing slice ending at today's midnight
+        // carries the remainder for one paced request a day.
+        var job = Job(Utc(2020, 1, 1), Utc(2026, 7, 1), barSize: "1 day");
+        var cadence = CadenceOf(job);
+
+        var forward = BackfillPlanner.PlanForward(job, 13455763, Utc(2026, 7, 6, 14, 7), cadence);
+
+        var slice = Assert.Single(forward);
+        Assert.Equal(Utc(2026, 7, 6), slice.EndTimeUtc);
+        Assert.Equal("1 Y", slice.Duration);
+    }
+
+    [Fact]
+    public void A_job_created_today_plans_nothing_forward_yet()
+    {
+        // target_to IS today's midnight, so there is no whole day behind it to extend into. The
+        // current partial day belongs to the top-up until the next midnight makes it this planner's.
+        var job = Job(Utc(2026, 6, 1), Utc(2026, 7, 6));
+
+        Assert.Empty(BackfillPlanner.PlanForward(job, 416904, Utc(2026, 7, 6, 14, 7), CadenceOf(job)));
+    }
+
     // ---- guards --------------------------------------------------------------------------------
 
     [Fact]

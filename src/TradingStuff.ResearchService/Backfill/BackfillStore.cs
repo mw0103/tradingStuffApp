@@ -60,7 +60,30 @@ public sealed record InstrumentRow(
         IncludeExpired: SecType == "FUT");
 }
 
-/// <summary>Per-job progress, derived entirely from <c>research.backfill_requests</c>.</summary>
+/// <summary>
+/// Per-job progress, derived entirely from <c>research.backfill_requests</c>.
+/// </summary>
+/// <param name="BarsLanded">
+/// Rows this job's requests actually inserted into <c>research.bars</c>. This is the honest figure
+/// and the one to render: overlap is designed into three separate places in this pipeline (the
+/// leading historical slice, the 4x top-up window, the daily forward re-request), so it is strictly
+/// less than <paramref name="BarsReturned"/> by an amount no reader can infer.
+/// </param>
+/// <param name="BarsReturned">
+/// Bars TWS handed back, summed BEFORE <c>research.bars</c>' primary key deduplicated them. Kept
+/// alongside rather than dropped because the ratio between the two is the only visible measure of
+/// how much of the paced request budget is being spent re-fetching bars already held — but it must
+/// never be presented as a count of data owned.
+/// </param>
+/// <param name="PercentComplete">
+/// Fraction of this job's slices with a CONFIRMED outcome: succeeded, empty (TWS says there is
+/// nothing there), or permanent (TWS says retrying cannot help). Exhausted slices are deliberately
+/// NOT in the numerator even though <see cref="IsJobSettledAsync"/> counts them as settled — an
+/// exhausted slice is a hole with no explanation behind it, and a progress bar that reaches 100%
+/// over one is the exact misreading this figure exists to prevent. Consequently a job with a single
+/// dead slice sits just short of 1.0 forever, which is the truth about it; whether that state is
+/// final is what <see cref="Status"/> (<c>complete_with_gaps</c>) answers.
+/// </param>
 public sealed record BackfillJobStatus(
     long JobId,
     string Name,
@@ -84,6 +107,7 @@ public sealed record BackfillJobStatus(
     int PermanentCount,
     int NowAnchoredCount,
     long BarsLanded,
+    long BarsReturned,
     double PercentComplete,
     DateTimeOffset? LowWaterMarkUtc,
     DateTimeOffset? HighWaterMarkUtc,
@@ -124,6 +148,23 @@ public sealed class BackfillStore(IConfiguration configuration, ILogger<Backfill
 {
     /// <summary>Every state a slice can rest in and never be attempted again (given the attempt cap).</summary>
     private const string TerminalStates = "'succeeded', 'empty', 'permanent'";
+
+    /// <summary>
+    /// Job statuses whose request rows are still eligible to be claimed and executed.
+    /// </summary>
+    /// <remarks>
+    /// <c>complete_with_gaps</c> is in here on purpose, and it is the operator's way back into a job
+    /// that has stalled on exhausted slices. Raising <c>Backfill:MaxAttempts</c> makes those rows
+    /// claimable again by <see cref="ClaimAsync"/>'s <c>attempts &lt; $3</c> predicate — but while the
+    /// terminal status was plain <c>complete</c>, the JOB was filtered out here and the newly-eligible
+    /// rows were unreachable anyway. The job returns to <c>running</c> by itself on the next
+    /// <see cref="RefreshJobStatusAsync"/>, because status is derived from the counts, not latched.
+    /// <para>
+    /// <c>complete</c> stays out: a job with no exhausted rows has nothing an attempt-cap change could
+    /// reach, and re-admitting it would put every finished job back through the claim query forever.
+    /// </para>
+    /// </remarks>
+    private const string ClaimableJobStatuses = "'pending', 'running', 'complete_with_gaps'";
 
     public string? ConnectionString => configuration.GetConnectionString("trading");
 
@@ -190,7 +231,15 @@ public sealed class BackfillStore(IConfiguration configuration, ILogger<Backfill
         return await reader.ReadAsync(cancellationToken) ? ReadJob(reader) : null;
     }
 
-    /// <summary>Jobs the coordinator should be working: not paused, not already complete.</summary>
+    /// <summary>
+    /// Jobs the coordinator should be working: not paused, not cleanly complete.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately the SAME status set <see cref="ClaimAsync"/> filters on. These two must agree:
+    /// this list is what <c>BackfillCoordinator.ExecuteSliceAsync</c> rebuilds its job cache from, so
+    /// a status that can be claimed but is missing here produces a claimed slice for an "unknown job"
+    /// that is released and re-claimed on a loop.
+    /// </remarks>
     public async Task<IReadOnlyList<BackfillJob>> GetActiveJobsAsync(CancellationToken cancellationToken)
     {
         await using var connection = await OpenAsync(cancellationToken);
@@ -198,7 +247,7 @@ public sealed class BackfillStore(IConfiguration configuration, ILogger<Backfill
         await using var command = new NpgsqlCommand(
             "SELECT job_id, name, instrument_id, con_id, what_to_show, bar_size, use_rth, " +
             "       target_from, target_to, priority, status, kind, slice_duration " +
-            "FROM research.backfill_jobs WHERE status IN ('pending', 'running') " +
+            "FROM research.backfill_jobs WHERE status IN (" + ClaimableJobStatuses + ") " +
             "ORDER BY priority DESC, job_id",
             connection);
 
@@ -343,7 +392,7 @@ public sealed class BackfillStore(IConfiguration configuration, ILogger<Backfill
             "    SELECT br.request_id " +
             "    FROM research.backfill_requests br " +
             "    JOIN research.backfill_jobs bj ON bj.job_id = br.job_id " +
-            "    WHERE bj.status IN ('pending', 'running') " +
+            "    WHERE bj.status IN (" + ClaimableJobStatuses + ") " +
             "      AND br.end_time_utc IS NOT NULL " +
             "      AND br.end_time_utc <= now() " +
             "      AND br.attempts < $3 " +
@@ -444,7 +493,8 @@ public sealed class BackfillStore(IConfiguration configuration, ILogger<Backfill
         FinishAsync(
             requestId, owner,
             "SET state = $3, claimed_by = NULL, lease_expires_at = NULL, completed_at = now(), " +
-            "    bars_returned = COALESCE(r.bars_returned, 0), error_code = $4, error_message = $5",
+            "    bars_returned = COALESCE(r.bars_returned, 0), bars_landed = COALESCE(r.bars_landed, 0), " +
+            "    error_code = $4, error_message = $5",
             [
                 new NpgsqlParameter { Value = StateName(state), NpgsqlDbType = NpgsqlDbType.Text },
                 new NpgsqlParameter { Value = (object?)errorCode ?? DBNull.Value, NpgsqlDbType = NpgsqlDbType.Integer },
@@ -524,6 +574,13 @@ public sealed class BackfillStore(IConfiguration configuration, ILogger<Backfill
         await using var connection = await OpenAsync(cancellationToken);
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
 
+        // How many of this request's bars were genuinely new, as opposed to how many TWS returned.
+        // The INSERT's own row count is the exact answer and the only cheap one — research.bars has
+        // no index on request_id — and the difference is not a rounding error: three separate parts
+        // of this pipeline overlap on purpose, so summing bars_returned per job reports a job that
+        // landed a quarter of its data as if it were full. See migration 009.
+        var landedRows = 0;
+
         if (timestamps.Count > 0)
         {
             await using var insert = new NpgsqlCommand(
@@ -555,13 +612,14 @@ public sealed class BackfillStore(IConfiguration configuration, ILogger<Backfill
             AddArray(insert, waps.ToArray(), NpgsqlDbType.Numeric);
             AddArray(insert, counts.ToArray(), NpgsqlDbType.Integer);
 
-            await insert.ExecuteNonQueryAsync(cancellationToken);
+            landedRows = await insert.ExecuteNonQueryAsync(cancellationToken);
         }
 
         await using var complete = new NpgsqlCommand(
             "UPDATE research.backfill_requests AS r " +
             "SET state = 'succeeded', claimed_by = NULL, lease_expires_at = NULL, completed_at = now(), " +
-            "    bars_returned = $3, first_bar_utc = $4, last_bar_utc = $5, error_code = NULL, error_message = NULL " +
+            "    bars_returned = $3, bars_landed = $6, first_bar_utc = $4, last_bar_utc = $5, " +
+            "    error_code = NULL, error_message = NULL " +
             "WHERE r.request_id = $1 AND r.state = 'inflight' AND r.claimed_by = $2",
             connection, transaction);
 
@@ -570,6 +628,7 @@ public sealed class BackfillStore(IConfiguration configuration, ILogger<Backfill
         complete.Parameters.AddWithValue(timestamps.Count);
         AddNullable(complete, timestamps.Count == 0 ? null : timestamps.Min(), NpgsqlDbType.TimestampTz);
         AddNullable(complete, timestamps.Count == 0 ? null : timestamps.Max(), NpgsqlDbType.TimestampTz);
+        complete.Parameters.AddWithValue(landedRows);
 
         if (await complete.ExecuteNonQueryAsync(cancellationToken) == 0)
         {
@@ -689,7 +748,9 @@ public sealed class BackfillStore(IConfiguration configuration, ILogger<Backfill
     /// of 0 and a completion of 0%, which is the truth about it.
     /// <para>
     /// For the same reason <c>PercentComplete</c> is 0 rather than 100 (or NaN) when there is nothing
-    /// to do: "no slices" must never round up to "finished".
+    /// to do: "no slices" must never round up to "finished" — and, since the same review that found
+    /// that also found its mirror image, an exhausted slice does not count toward completion either.
+    /// See <see cref="BackfillJobStatus.PercentComplete"/>.
     /// </para>
     /// </remarks>
     public async Task<IReadOnlyList<BackfillJobStatus>> GetStatusAsync(int maxAttempts, CancellationToken cancellationToken)
@@ -701,7 +762,7 @@ public sealed class BackfillStore(IConfiguration configuration, ILogger<Backfill
             "       j.target_from, j.target_to, j.priority, j.status, " +
             "       COALESCE(r.total, 0), COALESCE(r.pending, 0), COALESCE(r.inflight, 0), COALESCE(r.succeeded, 0), " +
             "       COALESCE(r.empty, 0), COALESCE(r.retryable, 0), COALESCE(r.exhausted, 0), COALESCE(r.permanent, 0), " +
-            "       COALESCE(r.now_anchored, 0), COALESCE(r.bars, 0), " +
+            "       COALESCE(r.now_anchored, 0), COALESCE(r.bars_landed, 0), COALESCE(r.bars_returned, 0), " +
             "       r.low_water, r.high_water, r.earliest_lease " +
             "FROM research.backfill_jobs j " +
             "LEFT JOIN LATERAL ( " +
@@ -714,7 +775,8 @@ public sealed class BackfillStore(IConfiguration configuration, ILogger<Backfill
             "           count(*) FILTER (WHERE br.state = 'failed' AND br.attempts >= $1) AS exhausted, " +
             "           count(*) FILTER (WHERE br.state = 'permanent') AS permanent, " +
             "           count(*) FILTER (WHERE br.end_time_utc IS NULL) AS now_anchored, " +
-            "           COALESCE(sum(br.bars_returned), 0) AS bars, " +
+            "           COALESCE(sum(br.bars_landed), 0) AS bars_landed, " +
+            "           COALESCE(sum(br.bars_returned), 0) AS bars_returned, " +
             "           min(br.first_bar_utc) AS low_water, " +
             "           max(br.last_bar_utc) AS high_water, " +
             "           min(br.lease_expires_at) FILTER (WHERE br.state = 'inflight') AS earliest_lease " +
@@ -735,7 +797,12 @@ public sealed class BackfillStore(IConfiguration configuration, ILogger<Backfill
             var empty = (int)reader.GetInt64(16);
             var exhausted = (int)reader.GetInt64(18);
             var permanent = (int)reader.GetInt64(19);
-            var settled = succeeded + empty + exhausted + permanent;
+
+            // Exhausted is settled (IsJobSettledAsync counts it, and that is deliberate — such a
+            // slice is genuinely never coming back) but it is NOT resolved: nothing confirmed the
+            // data is absent, the coordinator simply stopped asking. Including it here is what let a
+            // job with dead slices in it render at 100% on a green progress bar.
+            var resolved = succeeded + empty + permanent;
 
             rows.Add(new BackfillJobStatus(
                 reader.GetInt64(0),
@@ -760,10 +827,11 @@ public sealed class BackfillStore(IConfiguration configuration, ILogger<Backfill
                 permanent,
                 (int)reader.GetInt64(20),
                 reader.GetInt64(21),
-                total == 0 ? 0d : (double)settled / total,
-                reader.IsDBNull(22) ? null : reader.GetFieldValue<DateTimeOffset>(22),
+                reader.GetInt64(22),
+                total == 0 ? 0d : (double)resolved / total,
                 reader.IsDBNull(23) ? null : reader.GetFieldValue<DateTimeOffset>(23),
-                reader.IsDBNull(24) ? null : reader.GetFieldValue<DateTimeOffset>(24)));
+                reader.IsDBNull(24) ? null : reader.GetFieldValue<DateTimeOffset>(24),
+                reader.IsDBNull(25) ? null : reader.GetFieldValue<DateTimeOffset>(25)));
         }
 
         return rows;
@@ -796,6 +864,103 @@ public sealed class BackfillStore(IConfiguration configuration, ILogger<Backfill
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
 
         return await reader.ReadAsync(cancellationToken) && reader.GetInt64(0) > 0 && reader.GetInt64(1) == 0;
+    }
+
+    /// <summary>
+    /// Re-derives a job's status from its checkpoint counts and writes it if it changed.
+    /// </summary>
+    /// <param name="planningComplete">
+    /// False when the CALLER knows its own planning was partial — a contract whose head timestamp it
+    /// could not resolve this pass, say. Such a job is forced to <c>running</c> no matter what the
+    /// counts say, because the counts cannot see it: a contract that produced no request rows lowers
+    /// no total and no outstanding count, so "nothing outstanding" is a statement about the slices
+    /// that WERE planned and nothing at all about the ones that were not. That inference is right for
+    /// a single-conId job, where one planner call derives the whole range, and wrong for a job whose
+    /// planning is routinely partial by design (<see cref="EsContractWalker"/>).
+    /// </param>
+    /// <returns>The new status when it changed, else null — so a caller logs a transition, not a tick.</returns>
+    /// <remarks>
+    /// One statement, deriving and writing together, for the same reason <see cref="ClaimAsync"/> is:
+    /// the caller's cached <c>BackfillJob.Status</c> can be stale by the time it acts on it, and a
+    /// status decided from one read and written by another can move a job the writer never saw.
+    /// <para>
+    /// <c>paused</c> and <c>failed</c> are never overwritten. Both are decisions somebody made — an
+    /// operator pause, or the planner refusing a job whose slice duration it cannot put on a grid —
+    /// and a count-derived status has no business relitigating either. A job with zero request rows
+    /// is left alone as well: <c>pending</c> is the truth about it, and calling it <c>running</c>
+    /// would claim work exists that nothing has planned.
+    /// </para>
+    /// </remarks>
+    public async Task<string?> RefreshJobStatusAsync(
+        long jobId, int maxAttempts, bool planningComplete, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+
+        await using var command = new NpgsqlCommand(
+            """
+            WITH counts AS (
+                SELECT count(*) AS total,
+                       count(*) FILTER (
+                           WHERE state NOT IN ('succeeded', 'empty', 'permanent')
+                             AND NOT (state = 'failed' AND attempts >= $2)) AS outstanding,
+                       count(*) FILTER (WHERE state = 'failed' AND attempts >= $2) AS exhausted
+                FROM research.backfill_requests
+                WHERE job_id = $1
+            ), derived AS (
+                SELECT CASE
+                           WHEN NOT $3 OR c.outstanding > 0 THEN 'running'
+                           WHEN c.exhausted > 0             THEN 'complete_with_gaps'
+                           ELSE                                  'complete'
+                       END AS status,
+                       c.total
+                FROM counts c
+            )
+            UPDATE research.backfill_jobs j
+            SET status = d.status, updated_at = now()
+            FROM derived d
+            WHERE j.job_id = $1
+              AND d.total > 0
+              AND j.status IN ('pending', 'running', 'complete', 'complete_with_gaps')
+              AND j.status IS DISTINCT FROM d.status
+            RETURNING j.status
+            """,
+            connection);
+
+        command.Parameters.AddWithValue(jobId);
+        command.Parameters.AddWithValue(maxAttempts);
+        command.Parameters.AddWithValue(planningComplete);
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+
+        return await reader.ReadAsync(cancellationToken) ? reader.GetString(0) : null;
+    }
+
+    /// <summary>
+    /// Every distinct <c>con_id</c> this job has request rows for.
+    /// </summary>
+    /// <remarks>
+    /// The durable half of the ES walker's coverage check. A contract that a previous scan planned
+    /// and this scan's family enumeration did not return is not evidence that the contract stopped
+    /// mattering — it is evidence that this enumeration was incomplete — and without this query the
+    /// walker has no memory of a contract outside the list it was just handed.
+    /// </remarks>
+    public async Task<HashSet<int>> GetPlannedConIdsAsync(long jobId, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+
+        await using var command = new NpgsqlCommand(
+            "SELECT DISTINCT con_id FROM research.backfill_requests WHERE job_id = $1", connection);
+        command.Parameters.AddWithValue(jobId);
+
+        var conIds = new HashSet<int>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            conIds.Add(reader.GetInt32(0));
+        }
+
+        return conIds;
     }
 
     // ---- gap detection --------------------------------------------------------------------------
@@ -927,12 +1092,38 @@ public sealed class BackfillStore(IConfiguration configuration, ILogger<Backfill
         command.Parameters.AddWithValue(useRth);
 
         var counts = new int[windowFrom.Count];
+        var seen = new bool[windowFrom.Count];
+        var returned = 0;
+
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
 
         while (await reader.ReadAsync(cancellationToken))
         {
             // WITH ORDINALITY is 1-based.
-            counts[(int)reader.GetInt64(0) - 1] = (int)reader.GetInt64(1);
+            var index = (int)reader.GetInt64(0) - 1;
+            counts[index] = (int)reader.GetInt64(1);
+            seen[index] = true;
+            returned++;
+        }
+
+        // The negative claim, asserted rather than assumed. A caller-allocated array is zero-filled,
+        // so a query shape that emits NO row for a window with no bars — a GROUP BY starting from
+        // research.bars, the exact regression the SQL above is written against — produces an
+        // indistinguishable, entirely plausible 0. The array's length proves nothing either: it is
+        // fixed by C#, not by the database. Only counting which ordinals the engine actually returned
+        // can tell "measured, and it is zero" from "never measured".
+        //
+        // The query above cannot trip this, which is the point: it is the invariant that makes the
+        // zero trustworthy, and it fires the moment a rewrite stops guaranteeing it. The
+        // corresponding test therefore pins the DIFFERENCE — it runs the naive shape against the same
+        // fixture and shows it answers with fewer rows — because the old test asserted only the
+        // array's length and its middle value, both of which the naive shape satisfies too.
+        if (returned != windowFrom.Count)
+        {
+            throw new InvalidOperationException(
+                $"The landed-bar-count query returned {returned} row(s) for {windowFrom.Count} window(s); " +
+                $"the first unmeasured window starts at {windowFrom[Array.IndexOf(seen, false)]:O}. Every window " +
+                "must produce a row, including one with no bars — otherwise absence is reported as a count of zero.");
         }
 
         return counts;

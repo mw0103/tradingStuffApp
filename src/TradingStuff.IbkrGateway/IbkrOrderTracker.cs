@@ -19,6 +19,20 @@ public sealed record OpenOrderSummary(
     string Status,
     string Account);
 
+/// <summary>
+/// One leg of a tracked combo: where it sits in the original request, and how many contracts of that
+/// leg a single spread carries.
+/// </summary>
+/// <remarks>
+/// The ratio is load-bearing, not decoration. TWS reports <c>orderStatus.filled</c> for a BAG in
+/// <em>spreads</em> (it is in the units of <c>Order.TotalQuantity</c>, which
+/// <see cref="IbkrOrderBuilder.Build"/> sets to the spread count) while every <c>execDetails</c>
+/// reports its leg in <em>contracts</em>. Contracts owed by leg <c>i</c> is therefore
+/// <c>filled × ratio[i]</c>, and without the ratio there is no way to tell a leg that has finished
+/// from one that is halfway through. Ratios come from <see cref="IbkrOrderBuilder.Ratios"/>.
+/// </remarks>
+public readonly record struct TrackedComboLeg(int LegIndex, int Ratio);
+
 /// <summary>Live state of one order placed through this gateway.</summary>
 public sealed record IbkrOrderState(
     int IbkrOrderId,
@@ -64,22 +78,22 @@ public sealed class IbkrOrderTracker(ILogger<IbkrOrderTracker> logger)
     /// so two concurrent attempts cannot both win it. Returns false when the internal order already
     /// has a broker order, in which case the caller must not place.
     /// </remarks>
-    /// <param name="legIndexByConId">
-    /// Maps each leg's IBKR conId to its index in the original request, so executions can be
-    /// attributed to the right leg.
+    /// <param name="legsByConId">
+    /// Maps each leg's IBKR conId to its index in the original request and its combo ratio, so
+    /// executions can be attributed to the right leg and measured against what that leg owes.
     /// </param>
     public bool TryTrack(
         int ibkrOrderId,
         Guid? clientOrderId,
         Guid internalOrderId,
-        IReadOnlyDictionary<int, int> legIndexByConId)
+        IReadOnlyDictionary<int, TrackedComboLeg> legsByConId)
     {
         if (!_orderIdByInternalId.TryAdd(internalOrderId, ibkrOrderId))
         {
             return false;
         }
 
-        _orders[ibkrOrderId] = new TrackedOrder(ibkrOrderId, clientOrderId, internalOrderId, legIndexByConId);
+        _orders[ibkrOrderId] = new TrackedOrder(ibkrOrderId, clientOrderId, internalOrderId, legsByConId);
         return true;
     }
 
@@ -168,14 +182,16 @@ public sealed class IbkrOrderTracker(ILogger<IbkrOrderTracker> logger)
             catch (TimeoutException)
             {
                 // Deliberately not fatal: the order really did fill, and reporting it with partial
-                // fills beats failing a completed order. Loud, because a persisted fill record that
-                // silently disagrees with `filled` is a reconciliation problem later.
+                // fills beats failing a completed order. Loud AND specific, because a persisted fill
+                // record that silently disagrees with `filled` is a reconciliation problem later,
+                // and "incomplete" on its own does not tell an operator which leg to go and look at.
                 logger.LogWarning(
-                    "Order {OrderId} reported filled but its per-leg executions and commissions did " +
-                    "not all arrive within {Grace}s. The returned fills/commission are incomplete; " +
-                    "reconcile against the broker before trusting them for cost analysis.",
+                    "Order {OrderId} reported a terminal fill but its per-leg executions and commissions " +
+                    "did not all arrive within {Grace}s ({Shortfall}). The returned fills/commission are " +
+                    "incomplete; reconcile against the broker before trusting them for cost analysis.",
                     ibkrOrderId,
-                    fillGrace.TotalSeconds);
+                    fillGrace.TotalSeconds,
+                    order.DescribeFillShortfall());
             }
         }
 
@@ -257,7 +273,7 @@ public sealed class IbkrOrderTracker(ILogger<IbkrOrderTracker> logger)
         int ibkrOrderId,
         Guid? clientOrderId,
         Guid internalOrderId,
-        IReadOnlyDictionary<int, int> legIndexByConId)
+        IReadOnlyDictionary<int, TrackedComboLeg> legsByConId)
     {
         private readonly Lock _gate = new();
         private readonly Dictionary<string, FillReport> _fillsByExecId = [];
@@ -275,20 +291,30 @@ public sealed class IbkrOrderTracker(ILogger<IbkrOrderTracker> logger)
         public TaskCompletionSource Settled { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
         /// <summary>
-        /// Completes once every leg has an execution and every execution has its commission — the
-        /// real "this order's cost is known" signal, distinct from <see cref="Settled"/> (which
-        /// only means TWS reported a terminal status).
+        /// Completes once every contract TWS says filled has an execution report and every execution
+        /// has its commission — the real "this order's cost is known" signal, distinct from
+        /// <see cref="Settled"/> (which only means TWS reported a terminal status).
         /// </summary>
         public TaskCompletionSource FillsSettled { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
-        /// <summary>True once TWS says the order filled, so per-leg executions are owed.</summary>
+        /// <summary>
+        /// True once TWS says this order is done filling and reported a filled quantity, so a known
+        /// number of per-leg contracts is still owed.
+        /// </summary>
+        /// <remarks>
+        /// Deliberately requires a terminal status rather than merely <c>filled &gt; 0</c>. A working
+        /// order that has filled part of its size is not waiting for anything: its remaining
+        /// executions arrive as it continues to fill, and there is no total to check them against
+        /// yet. Waiting on one would burn the whole grace and then warn about incomplete fills on an
+        /// order that is simply still working.
+        /// </remarks>
         public bool ExpectsFills
         {
             get
             {
                 lock (_gate)
                 {
-                    return _filled > 0m && legIndexByConId.Count > 0;
+                    return IbkrOrderBuilder.IsTerminal(_status) && _filled > 0m && legsByConId.Count > 0;
                 }
             }
         }
@@ -301,6 +327,8 @@ public sealed class IbkrOrderTracker(ILogger<IbkrOrderTracker> logger)
             long permId,
             string whyHeld)
         {
+            bool fillsComplete;
+
             lock (_gate)
             {
                 // A terminal outcome is final; late status chatter must not resurrect the order.
@@ -328,11 +356,22 @@ public sealed class IbkrOrderTracker(ILogger<IbkrOrderTracker> logger)
                 }
 
                 _updatedAt = DateTimeOffset.UtcNow;
+
+                // The status is half of the completion question, so it has to ask it too: on an order
+                // whose executions all arrived BEFORE the terminal status, this is the only callback
+                // left to notice that nothing is outstanding. Without it such an order would always
+                // sit out the full grace and then warn about fills it already has.
+                fillsComplete = IsFillReportingComplete();
             }
 
             if (IbkrOrderBuilder.IsTerminal(_status))
             {
                 Settled.TrySetResult();
+            }
+
+            if (fillsComplete)
+            {
+                FillsSettled.TrySetResult();
             }
         }
 
@@ -352,8 +391,8 @@ public sealed class IbkrOrderTracker(ILogger<IbkrOrderTracker> logger)
 
                 // Attribute by conId. Legs do not fill in request order — one leg can fill in several
                 // executions while another has not started — so a running counter would mislabel them.
-                var legIndex = legIndexByConId.TryGetValue(contract.ConId, out var index)
-                    ? index
+                var legIndex = legsByConId.TryGetValue(contract.ConId, out var leg)
+                    ? leg.LegIndex
                     : _fillsByExecId.Count;
 
                 _fillsByExecId[execution.ExecId] = new FillReport(
@@ -397,28 +436,102 @@ public sealed class IbkrOrderTracker(ILogger<IbkrOrderTracker> logger)
         }
 
         /// <summary>
-        /// True once every leg has an execution AND every execution has its commission — the point
-        /// at which the order's cost is fully known.
+        /// True once every contract TWS reported filled has an execution behind it AND every one of
+        /// those executions has its commission — the point at which the order's cost is fully known.
         /// </summary>
         /// <remarks>
-        /// Leg coverage counts DISTINCT leg indices rather than executions, which is what makes it
-        /// correct when one leg fills in several pieces while another has not started.
+        /// The predicate is a QUANTITY check, and it has to be. An earlier version asked whether
+        /// every leg index had been seen at least once, on the reasoning that counting distinct legs
+        /// rather than executions handled a leg filling in several pieces. That reasoning is exactly
+        /// backwards: a counter of leg indices cannot express "this leg still owes contracts", so
+        /// both it and the commissions-vs-executions count reach equality mid-stream and settlement
+        /// completes on a truncated fill list. A 5-lot 2-leg vertical delivered as
+        /// leg0×5 → commission → leg1×2 → commission → leg1×3 → commission completed at the SECOND
+        /// commission with 7 of 10 contracts recorded and one execution's fee missing; the last
+        /// execDetails landed seconds later and was never re-read, and ExecutionService persisted
+        /// the truncated version as the permanent record.
+        /// <para>
+        /// What TWS does give us is the order's own filled quantity — in spreads for a BAG, so leg
+        /// <c>i</c> owes <c>filled × ratio[i]</c> contracts. Summing the STORED fill quantities (not
+        /// <c>Execution.CumQty</c>) is deliberate: the question being answered is whether the fill
+        /// list about to be handed to the caller accounts for the whole fill, and a cumulative field
+        /// would report a leg complete while the rows carrying it were still missing.
+        /// </para>
+        /// <para>
+        /// Only asked once the order is terminal. Before that, <c>filled</c> is still climbing, and a
+        /// predicate satisfied by a partial fill would latch <see cref="FillsSettled"/> early — the
+        /// same defect by another route, since the latch cannot be un-set when the rest fills. It
+        /// also fails in the safe direction: if TWS ever reported <c>filled</c> in leg contracts
+        /// rather than spreads, the expected total would only ever be too high, which costs a grace
+        /// timeout and a warning rather than a silently truncated record.
+        /// </para>
         /// </remarks>
         private bool IsFillReportingComplete()
         {
-            if (legIndexByConId.Count == 0 || _fillsByExecId.Count == 0)
+            if (legsByConId.Count == 0 || _fillsByExecId.Count == 0 || _filled <= 0m)
             {
                 return false;
             }
 
-            var legsCovered = _fillsByExecId.Values.Select(fill => fill.LegIndex).Distinct().Count();
+            if (!IbkrOrderBuilder.IsTerminal(_status))
+            {
+                return false;
+            }
 
-            return legsCovered >= legIndexByConId.Count
-                   && _commissionByExecId.Count >= _fillsByExecId.Count;
+            foreach (var leg in legsByConId.Values)
+            {
+                if (ReportedContracts(leg.LegIndex) < _filled * leg.Ratio)
+                {
+                    return false;
+                }
+            }
+
+            return _commissionByExecId.Count >= _fillsByExecId.Count;
+        }
+
+        /// <summary>Contracts reported so far for one leg. Callers must hold <see cref="_gate"/>.</summary>
+        private decimal ReportedContracts(int legIndex)
+        {
+            var reported = 0m;
+
+            foreach (var fill in _fillsByExecId.Values)
+            {
+                if (fill.LegIndex == legIndex)
+                {
+                    reported += fill.Quantity;
+                }
+            }
+
+            return reported;
+        }
+
+        /// <summary>
+        /// Names exactly what is still outstanding, for the warning logged when the grace expires.
+        /// </summary>
+        /// <remarks>
+        /// "The fills are incomplete" is not actionable on its own — an operator reconciling against
+        /// the broker needs to know which leg is short and by how much, and whether the gap is
+        /// missing executions or missing commissions on executions already in hand.
+        /// </remarks>
+        public string DescribeFillShortfall()
+        {
+            lock (_gate)
+            {
+                var legs = string.Join(
+                    ", ",
+                    legsByConId.Values
+                        .OrderBy(leg => leg.LegIndex)
+                        .Select(leg => $"leg {leg.LegIndex} {ReportedContracts(leg.LegIndex)}/{_filled * leg.Ratio}"));
+
+                return $"filled {_filled}, status {_rawStatus}; contracts reported [{legs}]; " +
+                       $"{_commissionByExecId.Count} of {_fillsByExecId.Count} execution(s) have a commission report";
+            }
         }
 
         public void ApplyError(int errorCode, string message)
         {
+            var fillsComplete = false;
+
             lock (_gate)
             {
                 // Once terminal, stay terminal. Trailing notices — "cancel attempted when order is
@@ -448,11 +561,21 @@ public sealed class IbkrOrderTracker(ILogger<IbkrOrderTracker> logger)
 
                 _rawStatus = $"Error{errorCode}";
                 _updatedAt = DateTimeOffset.UtcNow;
+
+                // A cancel or rejection ends the fill stream just as surely as "Filled" does, and an
+                // order cancelled after a partial fill still owes executions for the part that did
+                // fill. Same question, same reason as in ApplyStatus.
+                fillsComplete = IsFillReportingComplete();
             }
 
             if (IbkrOrderBuilder.IsTerminal(_status))
             {
                 Settled.TrySetResult();
+            }
+
+            if (fillsComplete)
+            {
+                FillsSettled.TrySetResult();
             }
         }
 

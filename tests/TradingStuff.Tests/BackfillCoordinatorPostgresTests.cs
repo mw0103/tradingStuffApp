@@ -794,10 +794,10 @@ public sealed class BackfillCoordinatorPostgresTests
 
         Assert.False(await store.IsJobSettledAsync(job!.JobId, MaxAttempts, CancellationToken.None));
 
-        await ExecuteAsync(connectionString, "UPDATE research.backfill_requests SET state = 'empty'");
+        await ExecuteAsync(connectionString, "UPDATE research.backfill_requests SET state = 'empty', bars_landed = 0");
         await ExecuteAsync(
             connectionString,
-            "UPDATE research.backfill_requests SET state = 'succeeded', bars_returned = 390, " +
+            "UPDATE research.backfill_requests SET state = 'succeeded', bars_returned = 390, bars_landed = 390, " +
             "first_bar_utc = end_time_utc - interval '1 day', last_bar_utc = end_time_utc " +
             "WHERE end_time_utc = (SELECT max(end_time_utc) FROM research.backfill_requests)");
 
@@ -822,5 +822,204 @@ public sealed class BackfillCoordinatorPostgresTests
         Assert.Equal(1, withExhausted.ExhaustedCount);
         Assert.Equal(0, withExhausted.RetryableCount);
         Assert.True(await store.IsJobSettledAsync(job.JobId, MaxAttempts, CancellationToken.None));
+
+        // ...and "counted separately" is not enough on its own: the two figures an operator actually
+        // reads are the status and the progress bar, and BOTH used to say the job was clean. A slice
+        // nothing will ever fetch again cannot count toward completion.
+        Assert.True(withExhausted.PercentComplete < 1d);
+    }
+
+    // ---- complete-with-holes must never render as complete ---------------------------------------
+
+    [Fact]
+    public async Task A_settled_job_with_exhausted_slices_completes_WITH_GAPS_rather_than_clean()
+    {
+        // The defect this pins: exhausted-is-settled is deliberate, but it fed a one-way "settled ⇒
+        // complete" transition, so a job whose newest slices died during a gateway outage reported
+        // status 'complete' at 100%. Both signals said finished; neither said "with holes in it".
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var store = StoreFor(connectionString);
+        var job = await store.EnsureJobAsync(HistoricalDefinition(), SpxConId, CancellationToken.None);
+
+        await store.InsertSlicesAsync(
+            BackfillPlanner.PlanHistorical(job!, SpxConId, null, CadenceOf(job!)), CancellationToken.None);
+
+        await ExecuteAsync(connectionString, "UPDATE research.backfill_requests SET state = 'succeeded', bars_landed = 390");
+        await ExecuteAsync(
+            connectionString,
+            $"UPDATE research.backfill_requests SET state = 'failed', attempts = {MaxAttempts}, bars_landed = NULL " +
+            "WHERE end_time_utc = (SELECT min(end_time_utc) FROM research.backfill_requests)");
+
+        Assert.Equal(
+            "complete_with_gaps",
+            await store.RefreshJobStatusAsync(job!.JobId, MaxAttempts, planningComplete: true, CancellationToken.None));
+
+        var status = (await store.GetStatusAsync(MaxAttempts, CancellationToken.None)).Single();
+
+        Assert.Equal("complete_with_gaps", status.Status);
+        Assert.Equal(1, status.ExhaustedCount);
+        Assert.True(status.PercentComplete < 1d);
+
+        // A rerun of the same derivation is a no-op, not a status flap.
+        Assert.Null(await store.RefreshJobStatusAsync(job.JobId, MaxAttempts, planningComplete: true, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task Raising_the_attempt_cap_is_a_working_way_back_into_a_complete_with_gaps_job()
+    {
+        // The operator path back. Under the old design the ROWS became claimable when the cap went
+        // up while the JOB stayed outside ClaimAsync's status filter, so the natural remedy did
+        // nothing at all and re-planning could not help either (an unchanged job re-derives
+        // identical slices and inserts zero rows).
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var store = StoreFor(connectionString);
+        var job = await store.EnsureJobAsync(HistoricalDefinition(), SpxConId, CancellationToken.None);
+
+        await store.InsertSlicesAsync(
+            BackfillPlanner.PlanHistorical(job!, SpxConId, null, CadenceOf(job!)), CancellationToken.None);
+
+        await ExecuteAsync(
+            connectionString,
+            $"UPDATE research.backfill_requests SET state = 'failed', attempts = {MaxAttempts}, " +
+            "completed_at = now() - interval '1 day'");
+
+        await store.RefreshJobStatusAsync(job!.JobId, MaxAttempts, planningComplete: true, CancellationToken.None);
+        Assert.Equal("complete_with_gaps", (await store.GetStatusAsync(MaxAttempts, CancellationToken.None)).Single().Status);
+
+        // Nothing is claimable at the current cap...
+        Assert.Empty(await store.ClaimAsync("owner-a", Lease, MaxAttempts, 10, CancellationToken.None));
+
+        // ...and raising it reopens the job, not just its rows.
+        var raised = MaxAttempts + 3;
+        Assert.NotEmpty(await store.ClaimAsync("owner-a", Lease, raised, 1, CancellationToken.None));
+        Assert.Equal(
+            "running", await store.RefreshJobStatusAsync(job.JobId, raised, planningComplete: true, CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task A_job_with_nothing_planned_yet_is_never_moved_off_pending_by_a_status_refresh()
+    {
+        // The absent-row rule applied to the status derivation itself: zero request rows means
+        // nothing has planned this job, and calling that 'running' (or worse, 'complete') would
+        // claim work exists that nothing has enqueued.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var store = StoreFor(connectionString);
+        var job = await store.EnsureJobAsync(HistoricalDefinition(), SpxConId, CancellationToken.None);
+
+        Assert.Null(await store.RefreshJobStatusAsync(job!.JobId, MaxAttempts, planningComplete: true, CancellationToken.None));
+        Assert.Equal("pending", (await store.GetStatusAsync(MaxAttempts, CancellationToken.None)).Single().Status);
+    }
+
+    [Fact]
+    public async Task A_paused_job_is_never_resurrected_by_a_status_refresh()
+    {
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var store = StoreFor(connectionString);
+        var job = await store.EnsureJobAsync(HistoricalDefinition(), SpxConId, CancellationToken.None);
+
+        await store.InsertSlicesAsync(
+            BackfillPlanner.PlanHistorical(job!, SpxConId, null, CadenceOf(job!)), CancellationToken.None);
+        await ExecuteAsync(connectionString, "UPDATE research.backfill_jobs SET status = 'paused'");
+
+        Assert.Null(await store.RefreshJobStatusAsync(job!.JobId, MaxAttempts, planningComplete: true, CancellationToken.None));
+        Assert.Equal("paused", (await store.GetStatusAsync(MaxAttempts, CancellationToken.None)).Single().Status);
+    }
+
+    [Fact]
+    public async Task Partial_planning_holds_a_job_open_even_when_every_planned_slice_is_settled()
+    {
+        // The ES-walker shape, pinned at the store level: a caller whose planning was partial cannot
+        // have that fact inferred from the checkpoint counts, because the contracts it skipped wrote
+        // no rows to count. It has to say so, and saying so has to win.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var store = StoreFor(connectionString);
+        var job = await store.EnsureJobAsync(HistoricalDefinition(), SpxConId, CancellationToken.None);
+
+        await store.InsertSlicesAsync(
+            BackfillPlanner.PlanHistorical(job!, SpxConId, null, CadenceOf(job!)), CancellationToken.None);
+        await ExecuteAsync(connectionString, "UPDATE research.backfill_requests SET state = 'succeeded', bars_landed = 1");
+
+        Assert.Equal(
+            "running",
+            await store.RefreshJobStatusAsync(job!.JobId, MaxAttempts, planningComplete: false, CancellationToken.None));
+
+        Assert.Equal(
+            "complete",
+            await store.RefreshJobStatusAsync(job.JobId, MaxAttempts, planningComplete: true, CancellationToken.None));
+    }
+
+    // ---- the bars figure -------------------------------------------------------------------------
+
+    [Fact]
+    public async Task The_reported_bars_figure_counts_rows_persisted_not_bars_returned()
+    {
+        // Overlap is designed into this pipeline in three separate places, so summing what TWS
+        // returned is not an approximation of what landed — it exceeds it by an amount no reader can
+        // infer. A job that landed a quarter of its bars could report a full-looking total.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var store = StoreFor(connectionString);
+        var job = await store.EnsureJobAsync(HistoricalDefinition(), SpxConId, CancellationToken.None);
+        await store.InsertSlicesAsync(
+            BackfillPlanner.PlanHistorical(job!, SpxConId, null, CadenceOf(job!)), CancellationToken.None);
+
+        var first = new DateTimeOffset(2024, 1, 10, 14, 30, 0, TimeSpan.Zero);
+
+        HistoricalBarDto[] BarsFrom(DateTimeOffset start, int count) =>
+            [.. Enumerable.Range(0, count).Select(i =>
+                new HistoricalBarDto(start.AddMinutes(i), null, 100m, 101m, 99m, 100.5m, -1m, 12, 100.2m))];
+
+        var one = (await store.ClaimAsync("owner-a", Lease, MaxAttempts, 1, CancellationToken.None)).Single();
+        Assert.True(await store.LandBarsAsync(one, "owner-a", 1, BarsFrom(first, 10), "backfill", CancellationToken.None));
+
+        // The next slice's window overlaps the first by six bars — exactly what the leading slice,
+        // the 4x top-up window, and the daily forward re-request all do on purpose.
+        var two = (await store.ClaimAsync("owner-a", Lease, MaxAttempts, 1, CancellationToken.None)).Single();
+        Assert.True(await store.LandBarsAsync(
+            two, "owner-a", 1, BarsFrom(first.AddMinutes(4), 10), "backfill", CancellationToken.None));
+
+        var status = (await store.GetStatusAsync(MaxAttempts, CancellationToken.None)).Single();
+
+        Assert.Equal(20L, status.BarsReturned);
+        Assert.Equal(14L, status.BarsLanded);
+        Assert.Equal(status.BarsLanded, await CountBarsAsync(connectionString));
+    }
+
+    private static async Task<long> CountBarsAsync(string connectionString)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand("SELECT count(*) FROM research.bars", connection);
+
+        return (long)(await command.ExecuteScalarAsync())!;
     }
 }

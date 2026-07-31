@@ -309,6 +309,36 @@
   border-left: 3px solid var(--row-accent);
 }
 
+.expand-cell {
+  width: 40px;
+  text-align: center;
+  padding: 0 0.5rem;
+}
+
+.expand-button {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 0.85rem;
+  padding: 0;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #0066cc;
+  transition: color 0.2s;
+}
+
+.expand-button:hover {
+  color: #0052a3;
+}
+
+.role-cell {
+  font-weight: 500;
+  font-family: 'Courier New', monospace;
+}
+
 .conid-cell {
   font-weight: 500;
   font-family: 'Courier New', monospace;
@@ -357,6 +387,60 @@
   font-size: 0.85rem;
   font-weight: 500;
   font-family: 'Courier New', monospace;
+}
+
+.coverage-not-measured {
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: #f57c00;
+}
+
+@media (prefers-color-scheme: dark) {
+  .coverage-not-measured {
+    color: #ffb74d;
+  }
+}
+
+/* Segment rows (nested under expanded nodes) */
+.segment-row {
+  background: #fafafa;
+  font-size: 0.9rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  .segment-row {
+    background: #1f1f1f;
+  }
+}
+
+.segment-row td {
+  padding-top: 0.5rem;
+  padding-bottom: 0.5rem;
+}
+
+.segment-conid-cell {
+  padding-left: 2rem;
+}
+
+.segment-label {
+  opacity: 0.85;
+  font-size: 0.85rem;
+}
+
+.segment-bar {
+  height: 16px;
+  margin-bottom: 0.15rem;
+}
+
+.segment-percent {
+  font-size: 0.8rem;
+}
+
+.section-note {
+  font-size: 0.9rem;
+  opacity: 0.75;
+  margin: -0.5rem 0 1rem 0;
+  font-style: italic;
 }
 
 /* Gaps Table */

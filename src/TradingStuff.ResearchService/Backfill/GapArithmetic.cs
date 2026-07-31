@@ -33,37 +33,13 @@ public readonly record struct BarSizeShape(BarSizeKind Kind, int? IntervalMinute
 /// </summary>
 public readonly record struct RequestWindow(DateTimeOffset Start, DateTimeOffset End, string State, int Attempts);
 
-/// <summary>
-/// Which calendars describe a given instrument's trading sessions, for gap detection.
-/// </summary>
-/// <remarks>
-/// A lookup table, not a second session authority: every calendar key named here is resolved through
-/// <see cref="ISessionClock"/> exactly the way <see cref="CoverageOptions.Calendars"/> is, and nothing
-/// here ever touches <see cref="TimeZoneInfo"/>. It exists because a backfill job is keyed by
-/// <c>instrument_id</c>, not by calendar, and — per <see cref="CoverageOptions"/>'s own remarks on its
-/// single shared Cboe pair — that mapping does not exist anywhere else in the platform yet.
-/// </remarks>
-internal static class GapCalendars
-{
-    public static bool TryGetCalendars(string symbol, out IReadOnlyList<string> calendars)
-    {
-        calendars = symbol switch
-        {
-            "SPX" or "VIX" => ["CBOE_INDEX_RTH", "CBOE_INDEX_GTH"],
-            "SPY" => ["NYSE"],
-            // CME_ES carries both labels under ONE calendar key, with GTH nesting RTH for the same
-            // trading date (see CoverageMonitor.SessionMinutes.DistinctMinutes's remarks on why that
-            // matters for a denominator). Harmless here today because GapDetector refuses ES's actual
-            // job before this mapping is ever consulted for it — that job walks many rolled contracts
-            // under one NULL-conId job row (see EsContractWalker), and per-unit nesting is not handled
-            // below. Left in for the day a single-contract futures job exists.
-            "ES" => ["CME_ES"],
-            _ => Array.Empty<string>(),
-        };
-
-        return calendars.Count > 0;
-    }
-}
+// The instrument -> calendar mapping this file used to carry privately now lives in
+// TradingStuff.ResearchService.Sessions.InstrumentCalendars. Two copies of that mapping is what
+// produced the defect it was moved to fix: this one mapped VIX to the 780-minute Cboe index-OPTION
+// GTH session, against which every correct VIX overnight session reported succeeded_but_absent, and
+// CoverageMonitor independently used one shared Cboe pair as the denominator for every conId
+// including NYSE-listed SPY. It is a statement about instruments and exchange calendars, so it
+// belongs beside ISessionClock, and there must be exactly one of it.
 
 /// <summary>
 /// The pure range arithmetic behind gap detection: classifying a bar size, deriving a request row's
@@ -139,10 +115,21 @@ internal static class GapArithmetic
     /// request row window(s) whose nominal span overlaps it.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Ordered most-alarming first. Two covering rows for the same range is rare — only a historical
     /// job's newest ("leading") slice is allowed to overlap its neighbour — but when it happens, the
     /// worse explanation must win: an operator reading <see cref="GapBasis.SucceededButAbsent"/> must
     /// never have the same range ALSO carry a covering <c>pending</c> row that could have masked it.
+    /// </para>
+    /// <para>
+    /// <b><see cref="GapBasis.Exhausted"/> outranks <see cref="GapBasis.Permanent"/> and
+    /// <see cref="GapBasis.Empty"/>, and the order is not a matter of taste.</b> Those two are
+    /// EXPLAINED — TWS said the data is not there, or said the request can never succeed — and a
+    /// caller is told to treat them as resolved. Exhausted means nobody established anything: the
+    /// coordinator tried N times and stopped. Ranking the explained pair above it let a range the
+    /// platform had abandoned report as benign-and-resolved, which is the same class of overstatement
+    /// as a job reporting <c>complete</c> with dead slices in it, one level down.
+    /// </para>
     /// </remarks>
     public static string DetermineBasis(IReadOnlyList<RequestWindow> covering, int maxAttempts)
     {
@@ -156,6 +143,11 @@ internal static class GapArithmetic
             return GapBasis.SucceededButAbsent;
         }
 
+        if (covering.Any(w => w.State == "failed" && w.Attempts >= maxAttempts))
+        {
+            return GapBasis.Exhausted;
+        }
+
         if (covering.Any(w => w.State == "permanent"))
         {
             return GapBasis.Permanent;
@@ -164,11 +156,6 @@ internal static class GapArithmetic
         if (covering.Any(w => w.State == "empty"))
         {
             return GapBasis.Empty;
-        }
-
-        if (covering.Any(w => w.State == "failed" && w.Attempts >= maxAttempts))
-        {
-            return GapBasis.Exhausted;
         }
 
         if (covering.Any(w => w.State == "failed"))
@@ -227,13 +214,26 @@ internal static class GapArithmetic
         }
     }
 
-    /// <summary>Every RTH-labelled trading date whose session overlaps [from, to) — the daily-bar expectation unit.</summary>
+    /// <summary>Every RTH-labelled trading date whose daily bar would fall in [from, to) — the daily-bar expectation unit.</summary>
     /// <remarks>
-    /// RTH specifically, not "any label": daily bars are not RTH/GTH-specific (a "1 day" bar is one row
-    /// per trading date, full stop), and the RTH calendar covers the full history for every family
-    /// <see cref="GapCalendars"/> maps, whereas a GTH counterpart may start decades later (Cboe's GTH
-    /// calendar is only effective from 2022-11-21) — enumerating from GTH would under-report trading
-    /// dates for all of that earlier history.
+    /// <para>
+    /// RTH specifically, not "any label": daily bars are not RTH/GTH-specific (a "1 day" bar is one
+    /// row per trading date, full stop), and the RTH calendar covers the full history for every
+    /// family <c>InstrumentCalendars</c> maps, whereas a GTH counterpart may start decades later
+    /// (Cboe's GTH calendar is only effective from 2022-11-21) — enumerating from GTH would
+    /// under-report trading dates for all of that earlier history.
+    /// </para>
+    /// <para>
+    /// <b>A date is in range iff its bar's INSTANT is</b> — that is, iff its UTC midnight lies in
+    /// [from, to). This is the identical predicate
+    /// <see cref="BackfillStore.GetLandedTradingDatesAsync"/> applies (<c>ts_utc &gt;= from AND ts_utc
+    /// &lt; to</c>), and the two must match exactly, because one builds the expected set and the
+    /// other measures reality against it. The previous rule here was whole-day OVERLAP
+    /// (<c>start &lt; to AND start + 1d &gt; from</c>), which for any non-midnight <c>from</c> —
+    /// including every head-clamped lower bound, which is where this bites in practice — expected a
+    /// date whose bar the landed query could not return, and reported
+    /// <see cref="GapBasis.SucceededButAbsent"/> over data that is present and correct.
+    /// </para>
     /// </remarks>
     public static IReadOnlyList<DateOnly> TradingDatesInRange(
         IReadOnlyList<TradingSession> rawSessions, DateTimeOffset from, DateTimeOffset to) =>
@@ -242,7 +242,7 @@ internal static class GapArithmetic
             .Select(s => s.TradingDate)
             .Distinct()
             .Select(date => (Date: date, Start: new DateTimeOffset(date.ToDateTime(TimeOnly.MinValue), TimeSpan.Zero)))
-            .Where(x => x.Start < to && x.Start.AddDays(1) > from)
+            .Where(x => x.Start >= from && x.Start < to)
             .OrderBy(x => x.Date)
             .Select(x => x.Date)
             .ToArray();
@@ -265,6 +265,73 @@ internal static class GapArithmetic
         var filtered = useRth ? rawSessions.Where(s => s.Label == "RTH").ToArray() : rawSessions;
 
         return SessionMinutes.Clip(filtered, from, to);
+    }
+
+    /// <summary>A half-open [From, To) instant span. Used for the audited-versus-claimed reconciliation.</summary>
+    public readonly record struct Span(DateTimeOffset From, DateTimeOffset To)
+    {
+        public bool IsEmpty => To <= From;
+    }
+
+    /// <summary>Merges overlapping and touching spans into a minimal ascending set.</summary>
+    public static IReadOnlyList<Span> Union(IEnumerable<Span> spans)
+    {
+        var merged = new List<Span>();
+
+        foreach (var span in spans.Where(s => !s.IsEmpty).OrderBy(s => s.From))
+        {
+            if (merged.Count > 0 && span.From <= merged[^1].To)
+            {
+                merged[^1] = merged[^1] with { To = span.To > merged[^1].To ? span.To : merged[^1].To };
+                continue;
+            }
+
+            merged.Add(span);
+        }
+
+        return merged;
+    }
+
+    /// <summary>
+    /// Everything in <paramref name="claimed"/> that no span in <paramref name="audited"/> covers.
+    /// </summary>
+    /// <remarks>
+    /// The reconciliation the gap report was missing. Every check in this file measures ONE job's
+    /// window against ONE job's data, so the seam BETWEEN two jobs covering the same series — a
+    /// historical job whose ceiling stopped advancing and a top-up job that only looks back two days
+    /// — was audited by neither, and both reported themselves clean over it. Subtracting what was
+    /// actually audited from what the jobs collectively claim is the only statement that can catch
+    /// that, because it is the only one computed across jobs rather than within one.
+    /// </remarks>
+    public static IReadOnlyList<Span> Subtract(IEnumerable<Span> claimed, IEnumerable<Span> audited)
+    {
+        var covered = Union(audited);
+        var remaining = new List<Span>();
+
+        foreach (var span in Union(claimed))
+        {
+            var cursor = span.From;
+
+            foreach (var cover in covered.Where(c => c.To > span.From && c.From < span.To))
+            {
+                if (cover.From > cursor)
+                {
+                    remaining.Add(new Span(cursor, cover.From));
+                }
+
+                if (cover.To > cursor)
+                {
+                    cursor = cover.To;
+                }
+            }
+
+            if (cursor < span.To)
+            {
+                remaining.Add(new Span(cursor, span.To));
+            }
+        }
+
+        return remaining;
     }
 
     /// <summary>

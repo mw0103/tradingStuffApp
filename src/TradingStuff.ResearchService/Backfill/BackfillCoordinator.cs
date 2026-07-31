@@ -50,6 +50,26 @@ public sealed class BackfillOptions
 
     /// <summary>How long to wait when the gateway reports it is not connected to TWS.</summary>
     public int DisconnectedBackoffSeconds { get; set; } = 30;
+
+    /// <summary>
+    /// How long to wait after a failure that MAY have reached TWS.
+    /// </summary>
+    /// <remarks>
+    /// Non-zero because the per-slice exponential backoff does not restrain this loop at all: it
+    /// backs off the slice that just failed, so the next claim simply returns the NEXT slice and the
+    /// loop walks down the job at HTTP-failure speed, spending one attempt per slice on a condition
+    /// that has nothing to do with any of them. That is how a twenty-second gateway outage retired
+    /// roughly a hundred distinct slices.
+    /// </remarks>
+    public int TransientBackoffSeconds { get; set; } = 15;
+
+    /// <summary>
+    /// How many 15-minute buckets behind the current one a top-up run re-plans, so a missed run is
+    /// caught up rather than skipped. 16 buckets is four hours — long enough to cover a restart, a
+    /// deploy, or a pacing storm, short enough that a longer outage is left to the daily forward
+    /// extension rather than flooding the highest-priority queue in the system.
+    /// </summary>
+    public int TopUpCatchUpBuckets { get; set; } = 16;
 }
 
 /// <summary>
@@ -261,12 +281,13 @@ public sealed class BackfillCoordinator(
 
         if (job.Kind == BackfillJobKinds.TopUp)
         {
-            var slice = BackfillPlanner.PlanTopUp(job, conId, DateTimeOffset.UtcNow);
+            var topUps = BackfillPlanner.PlanTopUp(
+                job, conId, DateTimeOffset.UtcNow, _options.TopUpCatchUpBuckets);
 
-            if (await store.InsertSlicesAsync([slice], cancellationToken) > 0)
+            if (await store.InsertSlicesAsync(topUps, cancellationToken) > 0)
             {
                 await store.SetJobStatusAsync(job.JobId, "running", cancellationToken);
-                logger.LogDebug("Top-up slice for {Job} anchored at {End:O}.", job.Name, slice.EndTimeUtc);
+                logger.LogDebug("Top-up slice for {Job} anchored at {End:O}.", job.Name, topUps[0].EndTimeUtc);
             }
 
             // A top-up job is never complete by construction, so it is never marked so — doing it
@@ -277,7 +298,7 @@ public sealed class BackfillCoordinator(
         if (_historicalPlannedAt.TryGetValue(job.JobId, out var plannedAt) &&
             DateTimeOffset.UtcNow - plannedAt < TimeSpan.FromHours(_options.HistoricalPlanIntervalHours))
         {
-            await UpdateHistoricalJobStatusAsync(job, cancellationToken);
+            await RefreshJobStatusAsync(job, cancellationToken);
             return;
         }
 
@@ -312,30 +333,59 @@ public sealed class BackfillCoordinator(
                 job.Name, BackfillPlanner.MaxSlicesPerJob, slices[^1].EndTimeUtc, cadence.Duration);
         }
 
-        var inserted = await store.InsertSlicesAsync(slices, cancellationToken);
+        // The band after the job's frozen target_to. Planned every pass alongside the backward walk
+        // rather than in a job of its own, because it is the same grid, the same conId, and the same
+        // idempotency key — see BackfillPlanner.PlanForward for why nothing covered it before.
+        var forward = BackfillPlanner.PlanForward(job, conId, DateTimeOffset.UtcNow, cadence);
+
+        var inserted = await store.InsertSlicesAsync(slices, cancellationToken)
+                     + await store.InsertSlicesAsync(forward, cancellationToken);
+
         _historicalPlannedAt[job.JobId] = DateTimeOffset.UtcNow;
 
         logger.LogInformation(
-            "Planned {Total} slice(s) for {Job} ({New} new) from {From:O} at a '{Duration}' cadence.",
-            slices.Count, job.Name, inserted, head.HeadUtc ?? job.TargetFrom, cadence.Duration);
+            "Planned {Total} slice(s) for {Job} ({New} new, {Forward} of them forward of target_to {TargetTo:O}) " +
+            "from {From:O} at a '{Duration}' cadence.",
+            slices.Count + forward.Count, job.Name, inserted, forward.Count, job.TargetTo,
+            head.HeadUtc ?? job.TargetFrom, cadence.Duration);
 
-        // Only genuinely new slices move the job back to 'running' — which is what reopens a job an
-        // operator has deepened. Setting it on every plan pass would flip a finished job between
-        // 'running' and 'complete' every six hours for no reason.
-        if (inserted > 0)
-        {
-            await store.SetJobStatusAsync(job.JobId, "running", cancellationToken);
-        }
-
-        await UpdateHistoricalJobStatusAsync(job, cancellationToken);
+        await RefreshJobStatusAsync(job, cancellationToken);
     }
 
-    private async Task UpdateHistoricalJobStatusAsync(BackfillJob job, CancellationToken cancellationToken)
+    /// <summary>
+    /// Re-derives this job's status from its checkpoint counts.
+    /// </summary>
+    /// <remarks>
+    /// Replaces a one-way "settled ⇒ complete" transition. That version could only ever move a job
+    /// forward, so a job that reached <c>complete</c> with exhausted slices in it was stuck there:
+    /// raising the attempt cap made its rows claimable while the job itself stayed outside the claim
+    /// query's status filter, and re-planning could not rescue it either because an unchanged job
+    /// re-derives identical slices and inserts nothing. Deriving the status every pass instead means
+    /// the job follows its own rows in both directions, and <c>complete_with_gaps</c> keeps the
+    /// distinction an operator actually needs: finished, versus finished with holes in it.
+    /// </remarks>
+    private async Task RefreshJobStatusAsync(BackfillJob job, CancellationToken cancellationToken)
     {
-        if (await store.IsJobSettledAsync(job.JobId, _options.MaxAttempts, cancellationToken) &&
-            await store.SetJobStatusAsync(job.JobId, "complete", cancellationToken))
+        var status = await store.RefreshJobStatusAsync(
+            job.JobId, _options.MaxAttempts, planningComplete: true, cancellationToken);
+
+        switch (status)
         {
-            logger.LogInformation("Job {Job} has no outstanding slices; marking it complete.", job.Name);
+            case "complete":
+                logger.LogInformation("Job {Job} has no outstanding slices; marking it complete.", job.Name);
+                break;
+
+            case "complete_with_gaps":
+                logger.LogWarning(
+                    "Job {Job} has no outstanding slices, but some exhausted their {Max} attempts and will never " +
+                    "be fetched. Marking it complete_with_gaps — GET /research/backfill/gaps names the ranges, and " +
+                    "raising Backfill__MaxAttempts makes them claimable again.",
+                    job.Name, _options.MaxAttempts);
+                break;
+
+            case { } reopened:
+                logger.LogInformation("Job {Job} has outstanding slices again; back to '{Status}'.", job.Name, reopened);
+                break;
         }
     }
 
@@ -403,6 +453,19 @@ public sealed class BackfillCoordinator(
                 logger.LogWarning("The gateway is not connected to TWS; backfill is paused.");
                 return TimeSpan.FromSeconds(_options.DisconnectedBackoffSeconds);
 
+            case GatewayOutcome.Unreachable:
+                // The same treatment as Paced and NotConnected, and for the identical reason: the
+                // request never reached TWS, so charging the slice a retry for it is charging it for
+                // something it did not do. `attempts` has NO reset path — the only two writers are
+                // +1 at claim and -1 at release — so an attempt burned here is burned forever, and a
+                // gateway that is down long enough to cost five of them retires the slice
+                // permanently while the job goes on to report itself finished.
+                await store.ReleaseAsync(slice.RequestId, OwnerId, cancellationToken);
+                logger.LogWarning(
+                    "The gateway could not be reached ({Detail}); backing off without spending the slice's attempt.",
+                    result.Detail);
+                return TimeSpan.FromSeconds(_options.DisconnectedBackoffSeconds);
+
             case GatewayOutcome.Permanent:
                 logger.LogWarning(
                     "Slice {RequestId} of {Job} ending {End:O} failed permanently (IBKR {Code}): {Detail}. " +
@@ -415,6 +478,12 @@ public sealed class BackfillCoordinator(
                 return TimeSpan.Zero;
 
             default:
+                // The attempt IS spent here, unlike the branches above: a 502, a 504, or a client
+                // timeout may well have consumed a paced TWS request slot, and refunding on that
+                // basis would let a request that genuinely reaches TWS and genuinely fails retry
+                // without limit. The backoff is what stops the loop walking the whole job at
+                // failure speed — MarkOutcomeAsync backs off only THIS slice, so returning zero here
+                // meant the next pass immediately claimed the next one.
                 logger.LogInformation(
                     "Slice {RequestId} of {Job} failed transiently on attempt {Attempt}: {Detail}",
                     slice.RequestId, job.Name, slice.Attempts, result.Detail);
@@ -422,7 +491,7 @@ public sealed class BackfillCoordinator(
                 await store.MarkOutcomeAsync(
                     slice.RequestId, OwnerId, BackfillRequestState.Failed, result.IbkrErrorCode, result.Detail,
                     cancellationToken);
-                return TimeSpan.Zero;
+                return TimeSpan.FromSeconds(_options.TransientBackoffSeconds);
         }
     }
 

@@ -121,12 +121,19 @@ public sealed class GapDetectorPostgresTests
     // ---- GetLandedBarCountsAsync: the absent-row check for intraday bar sizes ---------------------
 
     [Fact]
-    public async Task GetLandedBarCountsAsync_reports_zero_for_a_window_with_no_bars_rather_than_omitting_it()
+    public async Task GetLandedBarCountsAsync_measures_the_empty_window_rather_than_defaulting_it_to_zero()
     {
-        // The exact mechanism the class doc names: an INNER JOIN or a GROUP BY starting from
-        // research.bars produces no row at all for the window with zero bars, and the caller would
-        // then have to notice a SHORT array rather than read a genuine zero. Asserting the array
-        // LENGTH here is the point, not just its middle value.
+        // THE HEADLINE SAFETY PROPERTY OF THIS PACKAGE, and the previous version of this test could
+        // not fail. It asserted `counts.Length == 3` and `counts[1] == 0` — but the array is
+        // allocated `new int[windowFrom.Count]` by C# and zero-filled, so BOTH assertions hold
+        // verbatim under the naive GROUP BY the test claimed to guard against: that query simply
+        // returns two rows, index 1 is never written, and the default 0 reads exactly like a measured
+        // 0. The test was asserting the language, not the SQL.
+        //
+        // Two things fix it. The store now counts which ordinals the engine actually returned and
+        // throws when any window went unmeasured; and the second half below runs the naive shape
+        // against the same fixture to prove the fixture genuinely distinguishes them — without that,
+        // the store's guard could be passing for the wrong reason.
         if (ServerConnectionString is not { } server)
         {
             return;
@@ -148,10 +155,57 @@ public sealed class GapDetectorPostgresTests
 
         var counts = await store.GetLandedBarCountsAsync(SpxConId, "TRADES", "1 min", true, froms, tos, CancellationToken.None);
 
-        Assert.Equal(3, counts.Length); // NOT 2 — the empty middle window must still produce an entry.
+        Assert.Equal(3, counts.Length);
         Assert.Equal(405, counts[0]);
         Assert.Equal(0, counts[1]);
         Assert.Equal(405, counts[2]);
+
+        // The fixture really does separate the two query shapes: grouping from research.bars emits a
+        // row only for windows that HAVE bars, so it answers this same question with two rows and no
+        // way to tell which window is missing. If the store's SQL were ever rewritten this way, its
+        // ordinal check now throws instead of returning a plausible zero.
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+
+        await using var naive = new NpgsqlCommand(
+            """
+            SELECT s.idx, count(*)
+            FROM unnest($1::timestamptz[], $2::timestamptz[]) WITH ORDINALITY AS s(from_utc, to_utc, idx)
+            JOIN research.bars b
+              ON b.con_id = $3 AND b.what_to_show = 'TRADES' AND b.bar_size = '1 min' AND b.use_rth
+             AND b.ts_utc >= s.from_utc AND b.ts_utc < s.to_utc
+            GROUP BY s.idx
+            """,
+            connection);
+
+        naive.Parameters.AddWithValue(froms);
+        naive.Parameters.AddWithValue(tos);
+        naive.Parameters.AddWithValue(SpxConId);
+
+        var naiveRows = 0;
+        await using (var reader = await naive.ExecuteReaderAsync())
+        {
+            while (await reader.ReadAsync())
+            {
+                naiveRows++;
+            }
+        }
+
+        Assert.Equal(2, naiveRows); // NOT 3 — Tuesday cannot produce a row it has no bars for.
+    }
+
+    [Fact]
+    public async Task No_windows_asked_about_means_no_counts_and_no_complaint()
+    {
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+
+        Assert.Empty(await StoreFor(connectionString).GetLandedBarCountsAsync(
+            SpxConId, "TRADES", "1 min", true, [], [], CancellationToken.None));
     }
 
     [Fact]
@@ -446,6 +500,335 @@ public sealed class GapDetectorPostgresTests
         var report = await DetectorFor(connectionString).GetReportAsync(999_999, null, null, CancellationToken.None);
 
         Assert.Empty(report.Jobs);
+    }
+
+    // ---- the seam between a historical job and its top-up ----------------------------------------
+
+    [Fact]
+    public async Task Sessions_after_a_historical_jobs_frozen_target_to_are_audited_rather_than_belonging_to_nobody()
+    {
+        // The reported defect, end to end. A historical job's target_to is frozen at the UTC midnight
+        // of the day the job row was created, and the detector used it as the audit CEILING; a
+        // top-up job only looks back two days. The band between them widened by one day per day of
+        // operation and no job's analysis covered it — three complete RTH sessions with zero rows in
+        // research.bars produced status=checked, gaps=0 from BOTH jobs, and no query could surface
+        // them. The caller could not rescue it either: `from` clamps up to the lower bound and `to`
+        // clamps down to the ceiling, so asking explicitly for the lost days returned window-rejected.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var store = StoreFor(connectionString);
+
+        var now = DateTimeOffset.UtcNow;
+        var createdOn = new DateTimeOffset(now.UtcDateTime.Date, TimeSpan.Zero).AddDays(-30);
+
+        // A job created 30 days ago: target_from 40 days back, target_to frozen at creation.
+        var definition = new BackfillJobDefinition(
+            "spx-1min-trades-seam", BackfillJobKinds.Historical, SpxInstrumentId, "SPX", "TRADES", "1 min",
+            UseRth: true, createdOn.AddDays(-10), createdOn, Priority: 100);
+
+        var job = await store.EnsureJobAsync(definition, SpxConId, CancellationToken.None);
+
+        // A real RTH session comfortably inside the band — after target_to, before the top-up's
+        // two-day lookback — with nothing planned and nothing landed for it.
+        var abandoned = new SessionClock()
+            .SessionsBetween("CBOE_INDEX_RTH", DateOnly.FromDateTime(createdOn.UtcDateTime).AddDays(5),
+                DateOnly.FromDateTime(now.UtcDateTime).AddDays(-5))
+            .First(s => s.Label == "RTH" && s.CloseUtc < now.AddDays(-4) && s.OpenUtc > createdOn.AddDays(4));
+
+        var report = await DetectorFor(connectionString).GetReportAsync(job!.JobId, null, null, CancellationToken.None);
+        var jobReport = Assert.Single(report.Jobs);
+
+        Assert.Equal(GapCheckStatus.Checked, jobReport.CheckStatus);
+        Assert.True(jobReport.To > createdOn, "The audited ceiling must not be the frozen planning anchor.");
+        Assert.Contains(jobReport.Gaps, gap => gap.From <= abandoned.OpenUtc && gap.To >= abandoned.CloseUtc);
+    }
+
+    [Fact]
+    public async Task A_series_whose_jobs_between_them_leave_a_window_unaudited_says_so_explicitly()
+    {
+        // The negative claim was measured per job and never across the job set, so the seam BETWEEN
+        // two jobs covering the same series was precisely where nothing looked. Here the historical
+        // job's window is rejected outright (its span exceeds MaxWindowDays) while its top-up sibling
+        // audits only the last two days — the per-job reports are individually defensible and the
+        // series is not covered, which only a cross-job reconciliation can state.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var store = StoreFor(connectionString);
+
+        var now = DateTimeOffset.UtcNow;
+
+        await store.EnsureJobAsync(
+            new BackfillJobDefinition(
+                "spx-1min-trades-wide", BackfillJobKinds.Historical, SpxInstrumentId, "SPX", "TRADES", "1 min",
+                UseRth: true, now.AddDays(-60), now, Priority: 100),
+            SpxConId, CancellationToken.None);
+
+        await store.EnsureJobAsync(
+            new BackfillJobDefinition(
+                "spx-1min-trades-wide-topup", BackfillJobKinds.TopUp, SpxInstrumentId, "SPX", "TRADES", "1 min",
+                UseRth: true, now.AddDays(-60), now.AddYears(5), Priority: 1000),
+            SpxConId, CancellationToken.None);
+
+        var detector = new GapDetector(
+            StoreFor(connectionString),
+            new SessionClock(),
+            Options.Create(new GapOptions { TopUpDefaultLookbackDays = 2, MaxWindowDays = 10 }),
+            Options.Create(new BackfillOptions { MaxAttempts = MaxAttempts }),
+            NullLogger<GapDetector>.Instance);
+
+        var report = await detector.GetReportAsync(null, null, null, CancellationToken.None);
+
+        Assert.Equal(2, report.Jobs.Count);
+
+        // Both jobs write the same (con_id, what_to_show, bar_size, use_rth) rows, so they are one
+        // series and are jointly responsible for it.
+        var series = Assert.Single(report.Series);
+
+        Assert.False(series.Reconciled);
+        Assert.Equal(["spx-1min-trades-wide", "spx-1min-trades-wide-topup"], series.JobNames);
+        Assert.All(series.Unaudited, range => Assert.Equal(GapAuditReasons.NoJobAuditedIt, range.Reason));
+
+        // ~58 of the 60 claimed days: everything except the top-up's two-day tail.
+        Assert.True(series.Unaudited.Sum(r => (r.To - r.From).TotalDays) > 50);
+    }
+
+    [Fact]
+    public async Task Two_jobs_on_different_instruments_are_never_reconciled_against_each_other()
+    {
+        // A union across instruments would let SPY's audited window "cover" an SPX hole, which is
+        // worse than not reconciling at all.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var store = StoreFor(connectionString);
+        var now = DateTimeOffset.UtcNow;
+
+        await store.EnsureJobAsync(SpxHistorical("spx-series", targetFrom: now.AddDays(-5)), SpxConId, CancellationToken.None);
+        await store.EnsureJobAsync(
+            new BackfillJobDefinition(
+                "spy-series", BackfillJobKinds.Historical, InstrumentId: 5, "SPY", "TRADES", "1 min",
+                UseRth: true, now.AddDays(-5), now, Priority: 90),
+            756733, CancellationToken.None);
+
+        var report = await DetectorFor(connectionString).GetReportAsync(null, null, null, CancellationToken.None);
+
+        Assert.Equal(2, report.Series.Count);
+        Assert.Equal([SpxConId, 756733], report.Series.Select(s => s.ConId).Order());
+    }
+
+    // ---- the in-progress tail ---------------------------------------------------------------------
+
+    [Fact]
+    public async Task The_session_currently_in_progress_is_excluded_from_the_expectation_and_reported_as_such()
+    {
+        // A top-up job's data necessarily lags the clock, so measuring the running session against
+        // its full elapsed minutes reported succeeded_but_absent — the basis that is supposed to mean
+        // "the checkpoint lied" — on every poll during market hours. Excluding it is only half the
+        // fix: the excluded tail has to be visible, or "not checked yet" starts passing for "checked
+        // and clean".
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var store = StoreFor(connectionString);
+
+        var definition = new BackfillJobDefinition(
+            "spx-1min-trades-topup-grace", BackfillJobKinds.TopUp, SpxInstrumentId, "SPX", "TRADES", "1 min",
+            UseRth: true, DateTimeOffset.UtcNow.AddYears(-1), DateTimeOffset.UtcNow.AddYears(5), Priority: 1000);
+
+        var job = await store.EnsureJobAsync(definition, SpxConId, CancellationToken.None);
+
+        var before = DateTimeOffset.UtcNow;
+        var report = await DetectorFor(connectionString).GetReportAsync(job!.JobId, null, null, CancellationToken.None);
+        var jobReport = Assert.Single(report.Jobs);
+
+        Assert.NotNull(jobReport.To);
+        Assert.True(
+            jobReport.To <= before.AddMinutes(-59),
+            $"The audited ceiling ({jobReport.To:O}) must stop short of now by the in-progress grace.");
+
+        var inProgress = Assert.Single(jobReport.Unaudited, range => range.Reason == GapAuditReasons.InProgress);
+        Assert.Equal(jobReport.To, inProgress.From);
+        Assert.Equal(jobReport.NominalTo, inProgress.To);
+    }
+
+    // ---- "nothing was checked" must not render as "everything passed" ------------------------------
+
+    [Fact]
+    public async Task A_window_the_calendar_produces_no_session_for_is_not_reported_as_checked_and_clean()
+    {
+        // `checked` with an empty gap list was emitted identically for "every session verified
+        // complete" — the strongest statement this report can make — and "the calendar produced zero
+        // expectation units", the weakest.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var store = StoreFor(connectionString);
+        var job = await store.EnsureJobAsync(
+            SpxHistorical(targetFrom: new DateTimeOffset(2024, 1, 1, 0, 0, 0, TimeSpan.Zero)),
+            SpxConId, CancellationToken.None);
+
+        // Saturday 2024-01-06 into Sunday 2024-01-07: no Cboe index RTH session exists at all.
+        var report = await DetectorFor(connectionString).GetReportAsync(
+            job!.JobId,
+            new DateTimeOffset(2024, 1, 6, 0, 0, 0, TimeSpan.Zero),
+            new DateTimeOffset(2024, 1, 7, 12, 0, 0, TimeSpan.Zero),
+            CancellationToken.None);
+
+        var jobReport = Assert.Single(report.Jobs);
+
+        Assert.Equal(GapCheckStatus.NoExpectationUnits, jobReport.CheckStatus);
+        Assert.Equal(0, jobReport.UnitsChecked);
+        Assert.Empty(jobReport.Gaps);
+        Assert.NotEmpty(jobReport.Unaudited);
+    }
+
+    [Fact]
+    public async Task A_checked_job_reports_how_many_expectation_units_it_actually_verified()
+    {
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var store = StoreFor(connectionString);
+        var job = await store.EnsureJobAsync(SpxHistorical(), SpxConId, CancellationToken.None);
+
+        var report = await DetectorFor(connectionString).GetReportAsync(job!.JobId, Monday, WeekEnd, CancellationToken.None);
+        var jobReport = Assert.Single(report.Jobs);
+
+        Assert.Equal(GapCheckStatus.Checked, jobReport.CheckStatus);
+        Assert.Equal(5, jobReport.UnitsChecked); // Monday through Friday, one RTH session each
+    }
+
+    [Fact]
+    public async Task A_job_whose_analysis_throws_reports_its_whole_window_as_unaudited_not_as_zero_gaps()
+    {
+        // The error path had no test and reported an empty gap list, which is exactly what a clean
+        // job reports. A connection that fails mid-analysis must not be able to render as health.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var store = StoreFor(connectionString);
+        var job = await store.EnsureJobAsync(SpxHistorical(), SpxConId, CancellationToken.None);
+
+        // The job row is read through a working store; the per-job analysis then hits a database that
+        // no longer answers. Dropping the table it queries is the least contrived way to get there.
+        await ExecuteAsync(connectionString, "ALTER TABLE research.bars RENAME TO bars_hidden");
+
+        var report = await DetectorFor(connectionString).GetReportAsync(job!.JobId, Monday, WeekEnd, CancellationToken.None);
+        var jobReport = Assert.Single(report.Jobs);
+
+        Assert.Equal(GapCheckStatus.Error, jobReport.CheckStatus);
+        Assert.NotNull(jobReport.CheckDetail);
+        Assert.Empty(jobReport.Gaps);
+
+        var unaudited = Assert.Single(jobReport.Unaudited);
+        Assert.Equal(GapAuditReasons.JobNotChecked, unaudited.Reason);
+        Assert.Equal(jobReport.NominalFrom, unaudited.From);
+
+        // ...and the series it belongs to must inherit that: nothing audited this window.
+        var series = Assert.Single(report.Series);
+        Assert.False(series.Reconciled);
+    }
+
+    [Fact]
+    public async Task Every_job_is_reported_when_no_job_id_is_requested_including_ones_that_cannot_be_checked()
+    {
+        // The multi-job path had no test at all, and it is the path the UI actually calls.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var store = StoreFor(connectionString);
+
+        await store.EnsureJobAsync(SpxHistorical("spx-checkable"), SpxConId, CancellationToken.None);
+        await store.EnsureJobAsync(
+            new BackfillJobDefinition(
+                "es-uncheckable", BackfillJobKinds.Historical, EsInstrumentId, "ES", "TRADES", "1 min",
+                UseRth: false, Monday, WeekEnd, Priority: 60),
+            conId: null, CancellationToken.None);
+
+        var report = await DetectorFor(connectionString).GetReportAsync(null, Monday, WeekEnd, CancellationToken.None);
+
+        Assert.Equal(2, report.Jobs.Count);
+        Assert.Contains(report.Jobs, j => j.JobName == "spx-checkable" && j.CheckStatus == GapCheckStatus.Checked);
+        Assert.Contains(
+            report.Jobs,
+            j => j.JobName == "es-uncheckable" && j.CheckStatus == GapCheckStatus.MultiContractJobUnsupported);
+    }
+
+    // ---- the instrument -> calendar mapping ---------------------------------------------------------
+
+    [Fact]
+    public async Task A_vix_intraday_job_is_not_judged_against_the_index_option_overnight_session()
+    {
+        // CBOE_INDEX_GTH describes the 19:15-08:15 CT index-OPTION session — 780 minutes — and VIX
+        // index values are not published across it (the capability matrix records VIX 1-minute GTH
+        // bars beginning at 02:15 CT, roughly 360). Expecting 780 where 360 exist reported every
+        // correct VIX overnight session as succeeded_but_absent, forever. A report that cries wolf on
+        // every session of an instrument trains its operator to ignore it.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var store = StoreFor(connectionString);
+
+        const int vixConId = 13455763;
+        const short vixInstrumentId = 4;
+
+        var job = await store.EnsureJobAsync(
+            new BackfillJobDefinition(
+                "vix-1min-trades-test", BackfillJobKinds.Historical, vixInstrumentId, "VIX", "TRADES", "1 min",
+                UseRth: false, Monday, WeekEnd, Priority: 70),
+            vixConId, CancellationToken.None);
+
+        // Land a complete RTH session and nothing overnight — the shape real, correct VIX data has.
+        await ExecuteAsync(
+            connectionString,
+            "INSERT INTO research.bars (con_id, instrument_id, bar_size, what_to_show, use_rth, ts_utc, open, high, low, close, source) " +
+            "SELECT @con, @instrument, '1 min', 'TRADES', false, gs, 14, 14, 14, 14, 'backfill' " +
+            "FROM generate_series(@from::timestamptz, @to::timestamptz - interval '1 minute', interval '1 minute') AS gs",
+            ("con", vixConId), ("instrument", vixInstrumentId),
+            ("from", RthWindowFrom(MondayDate)), ("to", RthWindowTo(MondayDate)));
+
+        await InsertDailySliceAsync(connectionString, job!.JobId, MondayDate, "succeeded", barsReturned: 405);
+
+        var report = await DetectorFor(connectionString).GetReportAsync(
+            job.JobId, RthWindowFrom(MondayDate), RthWindowTo(MondayDate), CancellationToken.None);
+
+        var jobReport = Assert.Single(report.Jobs);
+
+        Assert.Equal(GapCheckStatus.Checked, jobReport.CheckStatus);
+        Assert.Empty(jobReport.Gaps);
+
+        // The genuine absence — VIX's real overnight window has no calendar and is therefore not
+        // audited — is stated rather than silently passing.
+        Assert.Contains(jobReport.Unaudited, range => range.Reason.StartsWith(GapAuditReasons.NoSessionDefinition));
     }
 
     // ---- window helpers: the RTH session bounds for a given trading date in the fixed test week ----

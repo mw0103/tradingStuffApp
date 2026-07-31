@@ -57,6 +57,10 @@ public sealed class ObservationRecorder : IObservationSink, IAsyncDisposable
     private readonly Counter<long> _writeFailures;
     private readonly Counter<long> _bufferOverflows;
 
+    // Only for logging: the orphan reconciliation is retried until it succeeds, and one error per
+    // retry every sweep interval would bury the rest of the log.
+    private int _orphanReconcileFailures;
+
     public ObservationRecorder(IConfiguration configuration, IMeterFactory meterFactory, ILogger<ObservationRecorder> logger)
     {
         _logger = logger;
@@ -158,7 +162,8 @@ public sealed class ObservationRecorder : IObservationSink, IAsyncDisposable
 
     /// <summary>
     /// Bounds every gap left open by a previous process, which by definition cannot still be
-    /// ongoing: this process holds no subscriptions yet, so nothing it does could close them.
+    /// ongoing: no gap this recorder holds open is touched, and every other open row belongs to a
+    /// process that is gone. Returns false when the attempt failed and is worth retrying.
     /// </summary>
     /// <remarks>
     /// Only the recorder that opened a gap ever closes it, so a process that dies mid-gap — crash,
@@ -172,30 +177,53 @@ public sealed class ObservationRecorder : IObservationSink, IAsyncDisposable
     /// outage rather than a measurement of it. Study-time filters need that distinction.
     /// </para>
     /// <para>
+    /// Retryable, and retried by <c>SubscriptionManager.ExecuteAsync</c> until it succeeds. This is
+    /// the crash-recovery path, and the crashes it recovers from (host OOM, a container stop, an
+    /// Aspire cold start the gateway wins the race to) are exactly the ones that also leave Postgres
+    /// down or still starting — a one-shot whose failure is merely logged therefore fails precisely
+    /// in the scenario it exists for, and every orphaned row then stays open forever anyway.
+    /// </para>
+    /// <para>
+    /// Because a retry can land long after this process has opened gaps of its own, the statement
+    /// excludes the gap ids this recorder still holds. Earlier this was justified by "this process
+    /// holds no subscriptions yet", which is only true of the very first attempt — the assumption
+    /// that a retry would have quietly violated.
+    /// </para>
+    /// <para>
     /// Safe to run with other gateways live only because gap scope is per-LEASE and lease ids are
     /// fresh per process: no row this reconciliation can see belongs to a subscription anyone still
     /// holds. If gap scope ever becomes per-conId, this becomes wrong and needs an owner column.
     /// </para>
     /// </remarks>
-    public async Task ReconcileOrphanedGapsAsync(CancellationToken cancellationToken)
+    public async Task<bool> ReconcileOrphanedGapsAsync(CancellationToken cancellationToken)
     {
         if (_dataSource is null)
         {
-            return;
+            return true;
         }
+
+        // Snapshot of what this process owns. A gap opened between this read and the UPDATE below
+        // would be bounded as though it were an orphan — a window of one round trip, and one that
+        // heals itself: the scope stays in _openGapIdByScope, so this recorder's own CloseGapAsync
+        // still runs when recording resumes and rewrites ended_at/closed_by to the observed values.
+        var owned = _openGapIdByScope.Values.ToArray();
 
         try
         {
             await using var command = _dataSource.CreateCommand(
                 "UPDATE gateway.recorder_gaps SET ended_at = now(), closed_by = 'inferred' " +
-                "WHERE ended_at IS NULL RETURNING gap_id");
+                "WHERE ended_at IS NULL AND NOT (gap_id = ANY($1)) RETURNING gap_id");
+            // An empty array is the common (startup) case and behaves correctly: `x = ANY('{}')` is
+            // false rather than NULL, so nothing is excluded. NOT IN would not have been safe here.
+            command.Parameters.AddWithValue(owned);
 
             var reconciled = new List<long>();
-            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
-
-            while (await reader.ReadAsync(cancellationToken))
+            await using (var reader = await command.ExecuteReaderAsync(cancellationToken))
             {
-                reconciled.Add(reader.GetInt64(0));
+                while (await reader.ReadAsync(cancellationToken))
+                {
+                    reconciled.Add(reader.GetInt64(0));
+                }
             }
 
             if (reconciled.Count > 0)
@@ -207,11 +235,34 @@ public sealed class ObservationRecorder : IObservationSink, IAsyncDisposable
                     reconciled.Count,
                     string.Join(", ", reconciled));
             }
+
+            var failures = Volatile.Read(ref _orphanReconcileFailures);
+
+            if (failures > 0)
+            {
+                _logger.LogInformation(
+                    "Recording-gap reconciliation succeeded after {Failures} failed attempt(s).", failures);
+            }
+
+            return true;
         }
         catch (Exception ex) when (ex is NpgsqlException or InvalidOperationException or TimeoutException)
         {
-            // Not fatal: recording works without it. Coverage reporting is what degrades.
-            _logger.LogError(ex, "Could not reconcile recording gaps left open by a previous process.");
+            // Not fatal: recording works without it. Coverage reporting is what degrades — until a
+            // retry lands, which is why this reports failure instead of swallowing it.
+            var failures = Interlocked.Increment(ref _orphanReconcileFailures);
+
+            if (failures == 1)
+            {
+                _logger.LogError(ex, "Could not reconcile recording gaps left open by a previous process; retrying.");
+            }
+            else
+            {
+                _logger.LogDebug(
+                    ex, "Recording-gap reconciliation still failing (attempt {Attempt}).", failures);
+            }
+
+            return false;
         }
     }
 

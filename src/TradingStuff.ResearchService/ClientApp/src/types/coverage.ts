@@ -1,4 +1,24 @@
-export interface PerConIdCoverage {
+export interface NodeConIdSegment {
+  conId: number;
+  assignedFrom: string;
+  assignedTo: string | null;
+  measuredFromUtc: string;
+  measuredToUtc: string;
+  minutesWithData: number;
+  totalMinutes: number;
+  coverageRatio: number | null;
+}
+
+export interface NodeCoverage {
+  nodeId: number;
+  role: string;
+  minutesWithData: number;
+  totalMinutes: number;
+  coverageRatio: number | null;
+  conIdSegments: NodeConIdSegment[];
+}
+
+export interface ConIdCoverage {
   conId: number;
   minutesWithData: number;
   totalMinutes: number;
@@ -57,7 +77,8 @@ export interface CoverageReport {
   from: string;
   to: string;
   basis: CoverageBasis;
-  perConId: PerConIdCoverage[];
+  perNode: NodeCoverage[];
+  unassignedConIds: ConIdCoverage[];
   overallCoverageRatio: number | null;
   totalMinutes: number;
   gaps: CoverageGap[];

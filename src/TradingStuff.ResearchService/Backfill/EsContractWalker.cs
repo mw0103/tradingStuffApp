@@ -11,7 +11,29 @@ namespace TradingStuff.ResearchService.Backfill;
 public sealed record EsContractCandidate(int ConId, DateOnly LastTradeDateOrContractMonth);
 
 /// <summary>One scan's outcome, for logging and for tests to assert on.</summary>
-public sealed record EsWalkResult(int ContractCount, int SlicesPlanned, int SlicesInserted)
+/// <param name="ContractCount">How many contracts this scan's family enumeration returned.</param>
+/// <param name="UnplannedContractCount">
+/// How many of those the scan could NOT plan — a head timestamp that would not resolve this pass,
+/// or a per-contract failure. The number that has to exist for this walker to be able to tell
+/// "finished" from "barely started": a skipped contract writes no request rows, so it lowers no
+/// count in <c>research.backfill_requests</c> and is invisible to every completion query.
+/// </param>
+/// <param name="ForgottenContractCount">
+/// How many contracts have request rows from an earlier scan but were absent from THIS scan's
+/// enumeration. Non-zero means the family listing came back incomplete, which is the one way this
+/// walker's expected-contract set can shrink without anything being wrong with the contracts.
+/// </param>
+/// <param name="PlanningComplete">
+/// True only when every contract this walker knows about — enumerated now, or planned before — was
+/// planned in this scan. The gate on declaring the job finished.
+/// </param>
+public sealed record EsWalkResult(
+    int ContractCount,
+    int SlicesPlanned,
+    int SlicesInserted,
+    int UnplannedContractCount = 0,
+    int ForgottenContractCount = 0,
+    bool PlanningComplete = false)
 {
     public static readonly EsWalkResult Empty = new(0, 0, 0);
 }
@@ -215,6 +237,7 @@ public sealed class EsContractWalker(
 
         var planned = 0;
         var inserted = 0;
+        var unplanned = new List<int>();
 
         foreach (var contract in contracts)
         {
@@ -226,17 +249,17 @@ public sealed class EsContractWalker(
                 {
                     // Not resolvable this pass — pacing, a disconnect, or (most often for ES) a
                     // quarter CME lists years ahead of its own expiry that has not traded yet.
-                    // Skip it; the next scan tries again.
+                    // Skip it; the next scan tries again. Recorded, not merely skipped: this is the
+                    // ONLY record that the contract exists at all, since it writes no request rows.
+                    unplanned.Add(contract.ConId);
                     continue;
                 }
 
                 var slices = PlanContractWindow(job, contract.ConId, contract.LastTradeDateOrContractMonth, head, cadence);
 
-                if (slices.Count == 0)
-                {
-                    continue;
-                }
-
+                // Zero slices with a RESOLVED head is a conclusion, not a skip: the contract's own
+                // window falls entirely outside the job's declared range. It is planned as far as
+                // this walker is ever going to plan it, so it must not hold the job open forever.
                 planned += slices.Count;
                 inserted += await store.InsertSlicesAsync(slices, cancellationToken);
             }
@@ -244,28 +267,49 @@ public sealed class EsContractWalker(
             {
                 // One contract's failure must not stop the others — the same isolation
                 // BackfillCoordinator.PlanAsync applies per catalog job, applied here per contract.
+                unplanned.Add(contract.ConId);
                 logger.LogError(
                     ex, "Planning {Job} contract {ConId} failed; other contracts are unaffected.", job.Name, contract.ConId);
             }
         }
 
-        if (inserted > 0)
+        // The durable half of the expectation. A contract this walker planned on an earlier scan and
+        // that today's family enumeration did not return means the LISTING came back short, not that
+        // the contract stopped existing — and without this query the walker's idea of "every
+        // contract" is only ever the list it was handed a moment ago.
+        var enumerated = contracts.Select(c => c.ConId).ToHashSet();
+        var forgotten = (await store.GetPlannedConIdsAsync(job.JobId, cancellationToken))
+            .Where(conId => !enumerated.Contains(conId))
+            .ToArray();
+
+        var planningComplete = unplanned.Count == 0 && forgotten.Length == 0;
+
+        // planningComplete is the whole point of this call. IsJobSettledAsync counts rows in
+        // research.backfill_requests, and a contract that was skipped produces NO rows — so it
+        // cannot lower any count, and "total > 0" proves that ONE contract was planned, never that
+        // all of them were. The previous version inferred completion from exactly that: with 29 ES
+        // quarterlies and this job holding the lowest priority in the system, four contracts
+        // planning while head probes for the other 25 were paced away was enough to report the job
+        // complete at 100% with ~85% of the intended history never requested.
+        await store.RefreshJobStatusAsync(job.JobId, _options.MaxAttempts, planningComplete, cancellationToken);
+
+        if (planningComplete)
         {
-            await store.SetJobStatusAsync(job.JobId, "running", cancellationToken);
+            logger.LogInformation(
+                "ES contract walk for {Job}: all {ContractCount} contract(s) planned, {Planned} slice(s), {Inserted} new.",
+                job.Name, contracts.Count, planned, inserted);
+        }
+        else
+        {
+            logger.LogWarning(
+                "ES contract walk for {Job}: {Planned} slice(s) planned ({Inserted} new), but {Unplanned} of " +
+                "{ContractCount} enumerated contract(s) could not be planned this scan and {Forgotten} previously " +
+                "planned contract(s) were missing from the family listing. The job stays open; it will be retried " +
+                "in {Interval}.",
+                job.Name, planned, inserted, unplanned.Count, contracts.Count, forgotten.Length, RescanInterval);
         }
 
-        // Mirrors BackfillCoordinator.UpdateHistoricalJobStatusAsync: only meaningful once at least
-        // one contract has actually been planned, which IsJobSettledAsync's own total>0 guard covers.
-        if (await store.IsJobSettledAsync(job.JobId, _options.MaxAttempts, cancellationToken))
-        {
-            await store.SetJobStatusAsync(job.JobId, "complete", cancellationToken);
-        }
-
-        logger.LogInformation(
-            "ES contract walk for {Job}: {ContractCount} contract(s) scanned, {Planned} slice(s) planned, {Inserted} new.",
-            job.Name, contracts.Count, planned, inserted);
-
-        return new EsWalkResult(contracts.Count, planned, inserted);
+        return new EsWalkResult(contracts.Count, planned, inserted, unplanned.Count, forgotten.Length, planningComplete);
     }
 
     /// <summary>

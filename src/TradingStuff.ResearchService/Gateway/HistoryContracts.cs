@@ -80,7 +80,12 @@ public enum GatewayOutcome
     /// <summary>The pacing governor refused the request. Back off by <c>Retry-After</c> and re-issue the same slice.</summary>
     Paced,
 
-    /// <summary>Worth retrying: a transient gateway/TWS failure, or a timeout.</summary>
+    /// <summary>
+    /// Worth retrying, and the request MAY have reached TWS: a 502/504, a client-side timeout, a
+    /// response that ended part-way through. Distinct from <see cref="Unreachable"/> precisely
+    /// because the caller cannot tell whether a paced request slot was consumed, so it must assume
+    /// one was.
+    /// </summary>
     Transient,
 
     /// <summary>Retrying this exact request cannot help (bad contract, rejected parameters, CONTFUT error 10339).</summary>
@@ -88,6 +93,21 @@ public enum GatewayOutcome
 
     /// <summary>The gateway is not connected to TWS. Like <see cref="Paced"/>, the slice never left the building.</summary>
     NotConnected,
+
+    /// <summary>
+    /// The request never left THIS process: the gateway host could not be connected to or resolved,
+    /// or the resilience pipeline's circuit breaker short-circuited it before the transport ran.
+    /// </summary>
+    /// <remarks>
+    /// Split out of <see cref="Transient"/> because the coordinator's two failure branches differ in
+    /// exactly one respect — whether the slice's attempt is refunded — and that decision turns on
+    /// "did this reach TWS", not on "is this retryable". Both are retryable; only this one is
+    /// PROVABLY free, in the same way <see cref="Paced"/> and <see cref="NotConnected"/> are.
+    /// Lumping a connection-refused into <see cref="Transient"/> is what let a routine gateway
+    /// redeploy walk down a job burning one attempt per slice at HTTP-failure speed, permanently
+    /// retiring ~100 of the newest slices in the drain (there is no attempt-reset path).
+    /// </remarks>
+    Unreachable,
 }
 
 /// <summary>The outcome of one <c>POST /ibkr/history/bars</c>, classified for the coordinator.</summary>

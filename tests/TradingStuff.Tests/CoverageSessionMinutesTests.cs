@@ -275,6 +275,63 @@ public sealed class CoverageSessionMinutesTests
         Assert.Equal(10, session.ExpectedMinutes);
     }
 
+    // ------------------------------------------ a node's own tenure, not the whole window (rotation)
+
+    [Fact]
+    public void Intersect_minutes_measures_a_sub_interval_of_the_window_not_the_whole_session()
+    {
+        // A node's assignment tenure is a sub-interval of the report window, potentially narrower
+        // than any one session. 2026-07-31 Cboe RTH is 13:30-20:15 UTC (405 published minutes); a
+        // conId assigned only 14:00-14:10 should be measured against ten minutes, not 405 and not the
+        // window.
+        var day = UtcDay(Date(2026, 7, 31), CboeRth);
+
+        Assert.Equal(10, SessionMinutes.IntersectMinutes(day, Utc(2026, 7, 31, 14, 0), Utc(2026, 7, 31, 14, 10)));
+    }
+
+    [Fact]
+    public void Intersect_minutes_is_zero_when_the_sub_interval_falls_outside_every_session()
+    {
+        // Between the 08:15 CT GTH close and the 08:30 CT RTH open the Cboe index book is shut. A
+        // node "assigned" only across that gap contributed nothing that ought to have been recorded,
+        // so its denominator is zero — not a sliver of the (non-existent) session.
+        var day = UtcDay(Date(2026, 7, 31), CboeRth, CboeGth);
+
+        Assert.Equal(0, SessionMinutes.IntersectMinutes(day, Utc(2026, 7, 31, 13, 16), Utc(2026, 7, 31, 13, 29)));
+    }
+
+    [Fact]
+    public void Intersect_minutes_splits_a_session_at_a_sub_minute_boundary_without_double_counting_or_dropping_it()
+    {
+        // This additivity is exactly what CoverageMonitor leans on to reassemble a rotated node from
+        // its conId segments: splitting one conId's tenure into "old" and "new" at the instant of
+        // rotation must reproduce the whole session's minutes exactly, with the boundary minute
+        // attributed to exactly one side.
+        var day = UtcDay(Date(2026, 7, 31), CboeRth);
+        var rotatedAt = Utc(2026, 7, 31, 16, 47).AddSeconds(33); // deliberately not minute-aligned
+
+        var before = SessionMinutes.IntersectMinutes(day, Utc(2026, 7, 31, 13, 30), rotatedAt);
+        var after = SessionMinutes.IntersectMinutes(day, rotatedAt, Utc(2026, 7, 31, 20, 15));
+
+        Assert.Equal(197, before); // 13:30 to the 16:47 floor: 3h17m
+        Assert.Equal(208, after);  // the 16:47 floor to 20:15: 3h28m — the boundary minute lands HERE
+        Assert.Equal(405, before + after); // the full published RTH length, split but not lost or doubled
+    }
+
+    [Fact]
+    public void Intersect_minutes_counts_a_nested_session_once_even_across_the_whole_span()
+    {
+        // CME_ES nests its RTH row inside the Globex GTH row for the same trading date. A sub-interval
+        // spanning the entire day must still see the union (1,380 minutes), not the naive sum (1,785),
+        // the same guarantee DistinctMinutes gives the window as a whole.
+        var day = SessionMinutes.Clip(
+            _clock.SessionsBetween(CmeEs, Date(2025, 6, 17), Date(2025, 6, 17)),
+            Utc(2025, 6, 14),
+            Utc(2025, 6, 20));
+
+        Assert.Equal(1380, SessionMinutes.IntersectMinutes(day, Utc(2025, 6, 16), Utc(2025, 6, 18)));
+    }
+
     // ------------------------------------------------- the table must agree with the generator
 
     [Fact]

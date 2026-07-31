@@ -20,7 +20,10 @@ export interface BackfillJobStatus {
   exhaustedCount: number;
   permanentCount: number;
   nowAnchoredCount: number;
+  /** Rows actually persisted to research.bars. The honest figure — render this one. */
   barsLanded: number;
+  /** Bars TWS returned, summed before research.bars' primary key deduplicated them. */
+  barsReturned: number;
   percentComplete: number;
   lowWaterMarkUtc: string | null;
   highWaterMarkUtc: string | null;
