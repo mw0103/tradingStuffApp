@@ -174,6 +174,7 @@ public sealed class IbkrOrderClient(
         var settled = await tracker.WaitForSettlementAsync(
             ibkrOrderId,
             TimeSpan.FromSeconds(_options.OrderSettleTimeoutSeconds),
+            TimeSpan.FromSeconds(_options.FillSettleGraceSeconds),
             cancellationToken);
 
         var state = settled ?? tracker.Get(ibkrOrderId)

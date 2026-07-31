@@ -166,6 +166,40 @@ app.MapGet("/ibkr/underlyings/{symbol}/resolve", async (
     })
     .RequireAuthorization();
 
+// Enumerates a futures family's contracts, expired and current alike — the discovery step a deep
+// ES intraday backfill needs before it can walk individual quarterly contracts (a CONTFUT rejects a
+// past endDateTime with error 10339; see docs/research/ibkr-data-capability-matrix.md constraint 3
+// and ResearchService's EsContractWalker, the only caller today).
+app.MapGet("/ibkr/futures/{symbol}/contracts", async (
+        string symbol,
+        [FromQuery] string? exchange,
+        [FromQuery] string? currency,
+        IbkrMarketDataClient client,
+        CancellationToken cancellationToken) =>
+    {
+        try
+        {
+            return Results.Ok(await client.GetFuturesFamilyAsync(
+                symbol, exchange ?? "CME", currency ?? "USD", cancellationToken));
+        }
+        catch (IbkrRequestException ex)
+        {
+            return Results.Problem(
+                title: "IBKR could not enumerate the futures family.",
+                detail: ex.Message,
+                statusCode: ex.IsPermanent ? StatusCodes.Status400BadRequest : StatusCodes.Status502BadGateway,
+                extensions: new Dictionary<string, object?> { ["ibkrErrorCode"] = ex.ErrorCode });
+        }
+        catch (IbkrConnectionException ex)
+        {
+            return Results.Problem(
+                title: "Not connected to TWS.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+    })
+    .RequireAuthorization();
+
 app.MapGet("/ibkr/options/chains/{underlying}", async (
         string underlying,
         [FromQuery] string? expiration,

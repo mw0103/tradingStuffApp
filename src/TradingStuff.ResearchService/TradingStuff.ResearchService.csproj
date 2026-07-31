@@ -19,6 +19,10 @@
   <ItemGroup>
     <!-- Migrations ship inside the binary and are applied in name order by MigrationRunner. -->
     <EmbeddedResource Include="Persistence\Migrations\*.sql" />
+    <!-- Holiday/closure data ships with the generator that reads it, for the same reason: the
+         sessions every downstream consumer is validated against must not be able to drift from the
+         binary that produced them. -->
+    <EmbeddedResource Include="Sessions\exchange-calendars.json" />
   </ItemGroup>
 
   <ItemGroup>

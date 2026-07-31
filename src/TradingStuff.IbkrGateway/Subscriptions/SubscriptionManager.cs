@@ -129,6 +129,10 @@ public sealed class SubscriptionManager : BackgroundService
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
+        // Before anything is subscribed: any gap still open in the table belongs to a process that
+        // is gone, and left alone it would count against every future coverage window.
+        await _recorder.ReconcileOrphanedGapsAsync(stoppingToken);
+
         while (!stoppingToken.IsCancellationRequested)
         {
             try

@@ -1,5 +1,6 @@
 using Npgsql;
 using TradingStuff.ResearchContracts;
+using TradingStuff.ResearchService.Backfill;
 using TradingStuff.ResearchService.Gateway;
 using TradingStuff.ResearchService.Persistence;
 using TradingStuff.ResearchService.Recording;
@@ -18,18 +19,35 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<PartitionMaintaine
 // Talks to the gateway over HTTP, never a project reference — the gateway is a separate process
 // and the sole TWS socket owner. Retries disabled: a retried lease grant would double-lease a
 // conId's market-data line rather than merely repeating a safe read.
+// The attempt timeout must exceed the gateway's own IBKR:HistoricalRequestTimeoutSeconds (60s by
+// default): a multi-month bar request legitimately takes tens of seconds, and abandoning it from
+// this side would burn the paced request slot, misreport a live request as a client timeout, and
+// leave TWS still delivering into a socket nobody is waiting on. Kept under HttpClient's own 100s
+// default so the resilience pipeline, not the raw client, is what expires first.
 builder.Services.AddHttpClient<IbkrGatewayClient>((sp, http) =>
     {
         var configuration = sp.GetRequiredService<IConfiguration>();
         ServiceClientConfiguration.ConfigureInternalClient(
             http, configuration, "IbkrGateway:BaseUrl", "http://localhost:5100");
     })
-    .DisableAutomaticRetries(TimeSpan.FromSeconds(30));
+    .DisableAutomaticRetries(TimeSpan.FromSeconds(80));
 
 builder.Services.AddSingleton<NodeSelector>();
 builder.Services.AddSingleton<CoverageMonitor>();
 builder.Services.AddSingleton<RecorderOrchestrator>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<RecorderOrchestrator>());
+
+builder.Services.Configure<BackfillOptions>(builder.Configuration.GetSection("Backfill"));
+builder.Services.AddSingleton<BackfillStore>();
+builder.Services.AddSingleton<BackfillCoordinator>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<BackfillCoordinator>());
+
+// Seeds the ES job's per-contract request rows (BackfillJobCatalog deliberately excludes ES — a
+// CONTFUT cannot page a past endDateTime, so it must be walked contract-by-contract); the
+// coordinator above drains whatever this seeds with no change of its own, since a request row's
+// contract is rebuilt from research.instruments plus the row's own con_id.
+builder.Services.AddSingleton<EsContractWalker>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<EsContractWalker>());
 
 var app = builder.Build();
 
@@ -143,6 +161,48 @@ app.MapGet("/research/coverage", async (
 
 app.MapGet("/research/nodes", async (NodeSelector nodeSelector, CancellationToken cancellationToken) =>
     Results.Ok(await nodeSelector.GetCurrentAssignmentsAsync(cancellationToken)));
+
+// Backfill progress, derived from research.backfill_requests rather than from any in-memory
+// tracker — the same "a restart re-derives state from the checkpoint table" principle the table
+// exists for, which also means this endpoint answers correctly while the coordinator is disabled,
+// stopped, or running in another process.
+//
+// EVERY job row is reported, including one with no request rows at all: that job renders as 0
+// slices and 0% rather than being omitted. A query that cannot emit a row for the absent case makes
+// absence read as health, which was the shared root cause of three of the Phase 1 review's eight
+// confirmed defects. `enabled` is reported for the same reason — a coordinator that is switched off
+// must not look like a coordinator with nothing left to do.
+app.MapGet("/research/backfill", async (
+        BackfillStore store,
+        BackfillCoordinator coordinator,
+        Microsoft.Extensions.Options.IOptions<BackfillOptions> backfillOptions,
+        CancellationToken cancellationToken) =>
+    {
+        var settings = backfillOptions.Value;
+
+        if (string.IsNullOrWhiteSpace(store.ConnectionString))
+        {
+            return Results.Problem(
+                title: "Research persistence is not configured.",
+                detail: "No 'trading' connection string.",
+                statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+
+        try
+        {
+            var jobs = await store.GetStatusAsync(settings.MaxAttempts, cancellationToken);
+
+            return Results.Ok(new BackfillStatusReport(
+                settings.Enabled, coordinator.OwnerId, settings.MaxAttempts, jobs));
+        }
+        catch (NpgsqlException ex)
+        {
+            return Results.Problem(
+                title: "Could not read backfill progress.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+    });
 
 app.MapDefaultEndpoints();
 

@@ -99,6 +99,17 @@ public sealed class IbkrOptions
     public int OrderSettleTimeoutSeconds { get; set; } = 20;
 
     /// <summary>
+    /// Extra time to wait, AFTER a terminal order status, for the per-leg executions to arrive.
+    /// </summary>
+    /// <remarks>
+    /// TWS sends <c>orderStatus="Filled"</c> before the <c>execDetails</c> carrying the fills.
+    /// Returning on the status alone yields a filled order with an empty fill list, which
+    /// ExecutionService then persists — losing the fills. Observed live: fills appeared roughly
+    /// four seconds after the status on a paper SPY vertical.
+    /// </remarks>
+    public int FillSettleGraceSeconds { get; set; } = 10;
+
+    /// <summary>
     /// Lets SMART fill combo legs independently. Fills more readily, but accepts leg risk: the order
     /// can end up partially legged into a position that is not the intended spread. Off by default.
     /// </summary>

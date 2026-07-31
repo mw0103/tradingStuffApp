@@ -365,6 +365,90 @@ and one theorized stale-`LineLease` disposal path that, on closer trace, does no
 occur the way first described (the *related*, real stale-reference issue above was found and
 fixed independently while re-verifying this claim by hand).
 
+### Research platform Phase 2 (milestone 2, 2026-07-31) — sessions, history, backfill
+
+Roadmap Phase 2 (`docs/plans/ibkr-edge-research-roadmap.md`): the historical plane. Shipped:
+
+- **Migrations 004–006.** 004: `sessions`, `backfill_jobs`, `backfill_requests`, `bars`. 005: claim
+  ownership (`claimed_by`, `lease_expires_at`) with a CHECK making every inflight row reclaimable,
+  plus `kind` (historical vs top-up) and per-job `slice_duration`. 006: gap-close provenance (below).
+- **`IbkrHistoricalClient`** — `reqHeadTimeStamp` and `reqHistoricalData` with `formatDate=2`
+  (epoch) so exchange-local timezone strings never enter parsing. `reqRealTimeBars` stays cut.
+- **`SessionCalendarService` + `SessionClock`** — the only type permitted to call
+  `TimeZoneInfo.ConvertTime`; half-days and DST transitions covered by tests.
+- **`BackfillPlanner` / `BackfillCoordinator` / `BackfillStore`** — resumable and idempotent by
+  construction; the request row IS the checkpoint. Claiming is one `UPDATE ... RETURNING` over a
+  `FOR UPDATE ... SKIP LOCKED` candidate subquery, because `SKIP LOCKED` has no
+  "unblock-and-silently-re-evaluate" window (the same Read Committed hazard that produced the Phase 1
+  `node_assignments` defect).
+- **`EsContractWalker`** — enumerates expired ES quarterlies and walks each within-contract, because
+  CONTFUT cannot page into the past (runtime-verified error 10339).
+- **`/research/backfill` + `/ui/backfill`** — per-job slice states, water marks, bars landed.
+
+**Model arbitration for this phase** (per the CLAUDE.md phase-start protocol): Opus attacker vs
+Opus justifier, Fable arbiter. The table's Sonnet/medium row was overridden to **Sonnet/high** for
+the coordinator package on the attacker's argument that a claim/lease/reclaim state machine is a
+split-path lifetime — the class that produced 4 of Phase 1's 8 confirmed defects. Conceded
+counterpoint, recorded because it was not dismissed: the planner's slice arithmetic on its own is
+ordinary date math and does not justify the tier; it rode along on package cohesion, not merit.
+
+### Phase 2 live verification against the paper account (2026-07-31)
+
+Per CLAUDE.md's standing rule that anything touching TWS is exercised against the paper account
+before it is claimed to work. Everything below is an observation from a real socket, not a fixture.
+Two defects were found this way that no amount of mocked testing could have surfaced.
+
+**Defect: settlement returned before the fills existed.** A 1-lot SPY vertical returned
+`filled=1, avgFillPrice=1.28, fills=[], commission=0`; four seconds later the same order read two
+fills (1.67 and 0.39, differencing to exactly 1.28) and commission 1.598693. `WaitForSettlementAsync`
+awaited only terminal `orderStatus`, but TWS sends that BEFORE `execDetails` and those before
+`commissionAndFeesReport` — so ExecutionService would have persisted a filled order with no fills as
+its permanent record. Fixed with a post-settlement grace (`IbkrOptions.FillSettleGraceSeconds`,
+default 10 s) that waits for every leg to report an execution AND every execution to report its
+commission; expiry is logged loudly, never thrown, because a filled order reported with partial
+fills still beats failing a completed order. Re-verified by placing another live paper vertical:
+fills and commission both present at return.
+
+**Defect: a dead recorder's gap stayed open forever.** Only the process that opens a
+`recorder_gaps` row ever closes it, so an ungraceful exit leaves `ended_at` NULL permanently — and
+`CoverageMonitor` counts an unended gap as overlapping EVERY later window. One crash would have
+made coverage permanently red, and coverage is the gate that admits a recorded day into a study.
+Found by killing the gateway three times during this session and noticing two immortal gaps. Fixed:
+migration 006 adds `closed_by` (`observed` | `inferred`) with a CHECK tying it to `ended_at`, and the
+gateway bounds orphaned gaps at startup — marked `inferred`, because the interval really was
+unrecorded but nobody watched it end, so `ended_at` is an upper bound rather than a measurement.
+
+**Verified working live** (paper account `DU…`, TWS 127.0.0.1:7497, serverVersion 223):
+
+- Head timestamps match the plan's recorded floors exactly: SPX 2004-03-04, SPY 1993-01-29,
+  VIX 2005-10-03, SPY BID_ASK 2004-01-23.
+- Expired-futures history is deeper than assumed: ESZ4 (conId 495512557) reports a head of
+  **2021-06-06**, ~3.5 years before its expiry, against the roadmap's 2-year guaranteed floor.
+  60 one-minute bars pulled from it. 29 ES contracts enumerated.
+- Daily bars carry `tradingDate` with a null `timestamp`; intraday bars the reverse — the intended
+  split, confirmed on the wire rather than assumed.
+- **Pacing governor under real load**: 20 concurrent historical requests all returned 200 with
+  latencies staggered 0.1 s → 24 s. No 162, no pacing violation, and the socket never reconnected.
+- **Reconnect and lease replay**, the path that had never once executed: forced a genuine socket
+  drop via a local TCP proxy (no root needed to kill the connection). A `disconnect` gap opened at
+  19:34:49.48 and closed at 19:34:51.18; recorded ticks stop at :49 and resume at :51, exactly the
+  one missing second. The lease survived and replayed.
+- **Backfill backpressure**: the coordinator claimed a slice, the governor returned 429 with
+  `Retry-After`, and it backed off 253 s and released the slice with its attempt refunded — no
+  stranded inflight row, no attempt burned on a rejection that never reached TWS.
+- Order cancel: a resting limit order (0.05 on a spread worth ~1.7) reached `Cancelled`.
+- Portfolio with position Greeks and daily P&L, against positions the test orders had just opened.
+- `gateway.ibkr_order_map` persists internal id ↔ broker id ↔ permId ↔ terminal status across
+  restarts. With a deliberately wrong connection string the gateway logged Critical and still
+  traded, which is `RequireOrderPersistence=false` behaving as documented.
+
+**Live observation worth keeping:** portfolio positions come back with `exchange: "AMEX"` while
+chains and quotes use `SMART`. `PortfolioRiskEvaluator` joins quotes to order legs by whole-record
+equality, so this would silently zero every Greeks and max-loss check if the two ever met — they do
+not, because `QuoteRequest` echoes the contract it was ASKED for rather than TWS's normalized one
+(verified live: requested SMART, returned SMART). Worth remembering before anyone "simplifies" that
+echo into using the resolved contract.
+
 ## Left
 
 Milestone 2 (research platform — sequenced in `docs/plans/ibkr-edge-research-roadmap.md`):

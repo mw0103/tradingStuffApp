@@ -1,4 +1,5 @@
 using System.Net.Http.Json;
+using System.Text.Json;
 using TradingStuff.Contracts;
 using TradingStuff.ResearchContracts;
 
@@ -6,6 +7,13 @@ namespace TradingStuff.ResearchService.Gateway;
 
 /// <summary>An underlying's IBKR identity — mirrors the gateway's internal <c>UnderlyingDefinition</c>.</summary>
 public sealed record UnderlyingResolution(int ConId, string SecType, string Exchange);
+
+/// <summary>
+/// One futures-family contract, matched by property name against the gateway's own
+/// <c>FuturesContractDefinition</c>. See <see cref="IbkrGatewayClient.GetFuturesFamilyAsync"/>.
+/// </summary>
+public sealed record FuturesContractResolution(
+    int ConId, DateOnly LastTradeDateOrContractMonth, string? TradingClass, string Exchange, string Currency);
 
 /// <summary>
 /// Thin HTTP client for the parts of the IBKR gateway that recorder orchestration needs: underlying
@@ -84,6 +92,49 @@ public sealed class IbkrGatewayClient(HttpClient httpClient, ILogger<IbkrGateway
         return resolved;
     }
 
+    /// <summary>
+    /// Enumerates every contract IBKR lists for a futures family — expired and current alike. The
+    /// discovery step <c>EsContractWalker</c> needs before it can walk individual ES quarterlies: a
+    /// <c>CONTFUT</c> rejects a past <c>endDateTime</c> (error 10339), so deep intraday history is
+    /// only reachable one specific contract at a time.
+    /// </summary>
+    /// <remarks>
+    /// Swallows failure into an empty list rather than throwing, matching
+    /// <see cref="ResolveUnderlyingAsync"/> and <see cref="GetChainAsync"/>: the only caller is a
+    /// periodic scan for which "nothing back this pass" means "try again next scan", not a fatal
+    /// error worth tearing down the walker over.
+    /// </remarks>
+    public async Task<IReadOnlyList<FuturesContractResolution>> GetFuturesFamilyAsync(
+        string symbol, string exchange, string currency, CancellationToken cancellationToken)
+    {
+        var path = $"/ibkr/futures/{Uri.EscapeDataString(symbol)}/contracts" +
+                    $"?exchange={Uri.EscapeDataString(exchange)}&currency={Uri.EscapeDataString(currency)}";
+
+        HttpResponseMessage response;
+
+        try
+        {
+            response = await httpClient.GetAsync(path, cancellationToken);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException && !cancellationToken.IsCancellationRequested)
+        {
+            logger.LogWarning("Could not enumerate the {Symbol} futures family: {Message}", symbol, ex.Message);
+            return [];
+        }
+
+        using (response)
+        {
+            if (!response.IsSuccessStatusCode)
+            {
+                logger.LogWarning(
+                    "Could not enumerate the {Symbol} futures family: {Status}.", symbol, response.StatusCode);
+                return [];
+            }
+
+            return await response.Content.ReadFromJsonAsync<IReadOnlyList<FuturesContractResolution>>(cancellationToken) ?? [];
+        }
+    }
+
     public async Task<SubscriptionLease?> GrantSubscriptionAsync(
         SubscriptionLeaseRequest request, CancellationToken cancellationToken)
     {
@@ -109,6 +160,150 @@ public sealed class IbkrGatewayClient(HttpClient httpClient, ILogger<IbkrGateway
     {
         var response = await httpClient.DeleteAsync($"/ibkr/subscriptions/{leaseId}", cancellationToken);
         return response.IsSuccessStatusCode;
+    }
+
+    // ---- historical data ------------------------------------------------------------------------
+    // The backfill coordinator's only route to TWS history. Every failure mode is classified here
+    // rather than at the call site, so the coordinator's state machine reads as a switch over
+    // outcomes instead of a pile of status-code checks — and so the one mapping that is easy to get
+    // backwards (200 + HasData:false is a confirmed-empty SLICE, not a failed request) lives in
+    // exactly one place.
+
+    public async Task<HistoricalBarsResult> GetHistoricalBarsAsync(
+        HistoricalBarsRequestDto request, CancellationToken cancellationToken)
+    {
+        HttpResponseMessage response;
+
+        try
+        {
+            response = await httpClient.PostAsJsonAsync("/ibkr/history/bars", request, cancellationToken);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException && !cancellationToken.IsCancellationRequested)
+        {
+            // Unreachable gateway or a client-side timeout. Indistinguishable from a slow TWS from
+            // here, and retryable either way.
+            return new HistoricalBarsResult(GatewayOutcome.Transient, [], null, null, ex.Message);
+        }
+
+        using (response)
+        {
+            if (response.IsSuccessStatusCode)
+            {
+                var body = await response.Content.ReadFromJsonAsync<HistoricalBarsResponseDto>(cancellationToken);
+
+                if (body is null)
+                {
+                    return new HistoricalBarsResult(GatewayOutcome.Transient, [], null, null, "The gateway returned an empty body.");
+                }
+
+                return body.HasData
+                    ? new HistoricalBarsResult(GatewayOutcome.Ok, body.Bars, null, null, null)
+                    : new HistoricalBarsResult(GatewayOutcome.Empty, [], null, null, "TWS reported no data for this slice.");
+            }
+
+            var (outcome, retryAfter, errorCode, detail) = await ClassifyFailureAsync(response, cancellationToken);
+            return new HistoricalBarsResult(outcome, [], retryAfter, errorCode, detail);
+        }
+    }
+
+    public async Task<HeadTimestampResult> GetHeadTimestampAsync(
+        HistoricalContractSpecDto contract, string whatToShow, bool useRth, CancellationToken cancellationToken)
+    {
+        HttpResponseMessage response;
+
+        try
+        {
+            response = await httpClient.PostAsJsonAsync(
+                "/ibkr/history/head-timestamp", new { Contract = contract, WhatToShow = whatToShow, UseRth = useRth },
+                cancellationToken);
+        }
+        catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException && !cancellationToken.IsCancellationRequested)
+        {
+            return new HeadTimestampResult(GatewayOutcome.Transient, null, null, null, ex.Message);
+        }
+
+        using (response)
+        {
+            if (response.IsSuccessStatusCode)
+            {
+                var body = await response.Content.ReadFromJsonAsync<HeadTimestampResponseDto>(cancellationToken);
+
+                return body is null
+                    ? new HeadTimestampResult(GatewayOutcome.Transient, null, null, null, "The gateway returned an empty body.")
+                    : new HeadTimestampResult(GatewayOutcome.Ok, body.HeadTimestamp.ToUniversalTime(), null, null, null);
+            }
+
+            var (outcome, retryAfter, errorCode, detail) = await ClassifyFailureAsync(response, cancellationToken);
+            return new HeadTimestampResult(outcome, null, retryAfter, errorCode, detail);
+        }
+    }
+
+    /// <summary>Maps the gateway's documented history error surface onto <see cref="GatewayOutcome"/>.</summary>
+    private static async Task<(GatewayOutcome Outcome, TimeSpan? RetryAfter, int? ErrorCode, string? Detail)> ClassifyFailureAsync(
+        HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        var (errorCode, detail) = await ReadProblemAsync(response, cancellationToken);
+
+        return (int)response.StatusCode switch
+        {
+            // The pacing governor's backpressure signal. Retry-After is authoritative; the fallback
+            // only covers a governor that somehow answered 429 without the header, and erring long
+            // is correct because erring short re-triggers the same rejection immediately.
+            429 => (GatewayOutcome.Paced, ReadRetryAfter(response) ?? TimeSpan.FromSeconds(60), errorCode, detail),
+            400 => (GatewayOutcome.Permanent, null, errorCode, detail),
+            503 => (GatewayOutcome.NotConnected, null, errorCode, detail),
+            _ => (GatewayOutcome.Transient, null, errorCode, detail), // 502 bad gateway, 504 TWS timeout, anything unforeseen
+        };
+    }
+
+    private static TimeSpan? ReadRetryAfter(HttpResponseMessage response)
+    {
+        if (response.Headers.RetryAfter?.Delta is { } delta)
+        {
+            return delta;
+        }
+
+        if (response.Headers.RetryAfter?.Date is { } date)
+        {
+            var wait = date - DateTimeOffset.UtcNow;
+            return wait > TimeSpan.Zero ? wait : TimeSpan.Zero;
+        }
+
+        return null;
+    }
+
+    /// <summary>Pulls the gateway's <c>ibkrErrorCode</c> ProblemDetails extension and detail text, if present.</summary>
+    private static async Task<(int? ErrorCode, string? Detail)> ReadProblemAsync(
+        HttpResponseMessage response, CancellationToken cancellationToken)
+    {
+        try
+        {
+            var payload = await response.Content.ReadAsStringAsync(cancellationToken);
+
+            if (string.IsNullOrWhiteSpace(payload))
+            {
+                return (null, response.ReasonPhrase);
+            }
+
+            using var document = JsonDocument.Parse(payload);
+
+            int? errorCode = document.RootElement.TryGetProperty("ibkrErrorCode", out var code) &&
+                             code.ValueKind == JsonValueKind.Number
+                ? code.GetInt32()
+                : null;
+
+            var detail = document.RootElement.TryGetProperty("detail", out var detailElement)
+                ? detailElement.GetString()
+                : payload;
+
+            return (errorCode, detail);
+        }
+        catch (JsonException)
+        {
+            // A non-ProblemDetails body (a proxy's HTML error page, say) still classifies fine on
+            // status code alone; losing the detail text is not worth failing the request over.
+            return (null, response.ReasonPhrase);
+        }
     }
 
     private sealed record ResolveContractsRequestDto(IReadOnlyList<OptionContract> Contracts);

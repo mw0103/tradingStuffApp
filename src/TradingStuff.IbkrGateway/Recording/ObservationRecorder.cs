@@ -157,6 +157,65 @@ public sealed class ObservationRecorder : IObservationSink, IAsyncDisposable
     // ---- gap bookkeeping -----------------------------------------------------------------------
 
     /// <summary>
+    /// Bounds every gap left open by a previous process, which by definition cannot still be
+    /// ongoing: this process holds no subscriptions yet, so nothing it does could close them.
+    /// </summary>
+    /// <remarks>
+    /// Only the recorder that opened a gap ever closes it, so a process that dies mid-gap — crash,
+    /// OOM, redeploy, Ctrl-C — leaves <c>ended_at</c> NULL forever. CoverageMonitor counts a gap as
+    /// overlapping a window when it has no end, so ONE ungraceful shutdown makes every future
+    /// coverage report carry a permanent unexplained gap, and coverage is the gate that admits a
+    /// recorded day into a study. Closing at startup keeps that gate meaningful.
+    /// <para>
+    /// The close is marked <c>inferred</c>, never <c>observed</c>: the interval really was
+    /// unrecorded, but nobody watched recording resume, so <c>ended_at</c> is an upper bound on the
+    /// outage rather than a measurement of it. Study-time filters need that distinction.
+    /// </para>
+    /// <para>
+    /// Safe to run with other gateways live only because gap scope is per-LEASE and lease ids are
+    /// fresh per process: no row this reconciliation can see belongs to a subscription anyone still
+    /// holds. If gap scope ever becomes per-conId, this becomes wrong and needs an owner column.
+    /// </para>
+    /// </remarks>
+    public async Task ReconcileOrphanedGapsAsync(CancellationToken cancellationToken)
+    {
+        if (_dataSource is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await using var command = _dataSource.CreateCommand(
+                "UPDATE gateway.recorder_gaps SET ended_at = now(), closed_by = 'inferred' " +
+                "WHERE ended_at IS NULL RETURNING gap_id");
+
+            var reconciled = new List<long>();
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+
+            while (await reader.ReadAsync(cancellationToken))
+            {
+                reconciled.Add(reader.GetInt64(0));
+            }
+
+            if (reconciled.Count > 0)
+            {
+                _logger.LogWarning(
+                    "Bounded {Count} recording gap(s) left open by a previous process: {GapIds}. " +
+                    "Their end times are inferred from this startup, not observed — the data really " +
+                    "is missing, but the outage may have ended earlier than the row now says.",
+                    reconciled.Count,
+                    string.Join(", ", reconciled));
+            }
+        }
+        catch (Exception ex) when (ex is NpgsqlException or InvalidOperationException or TimeoutException)
+        {
+            // Not fatal: recording works without it. Coverage reporting is what degrades.
+            _logger.LogError(ex, "Could not reconcile recording gaps left open by a previous process.");
+        }
+    }
+
+    /// <summary>
     /// Opens a gap for <paramref name="scope"/> if one is not already open. Safe to call
     /// repeatedly while a condition persists — only the first call in a run actually inserts a row.
     /// </summary>
@@ -171,6 +230,7 @@ public sealed class ObservationRecorder : IObservationSink, IAsyncDisposable
         {
             await using var command = _dataSource.CreateCommand(
                 "INSERT INTO gateway.recorder_gaps (scope, started_at, reason) VALUES ($1, now(), $2) RETURNING gap_id");
+            // closed_by stays NULL while the gap is open; the schema CHECK ties the two together.
             command.Parameters.AddWithValue(scope);
             command.Parameters.AddWithValue(reason);
 
@@ -180,7 +240,7 @@ public sealed class ObservationRecorder : IObservationSink, IAsyncDisposable
             {
                 // Another caller opened one concurrently; close the redundant row rather than leak it.
                 await using var close = _dataSource.CreateCommand(
-                    "UPDATE gateway.recorder_gaps SET ended_at = now() WHERE gap_id = $1");
+                    "UPDATE gateway.recorder_gaps SET ended_at = now(), closed_by = 'observed' WHERE gap_id = $1");
                 close.Parameters.AddWithValue(gapId);
                 await close.ExecuteNonQueryAsync(cancellationToken);
                 return;
@@ -205,7 +265,7 @@ public sealed class ObservationRecorder : IObservationSink, IAsyncDisposable
         try
         {
             await using var command = _dataSource.CreateCommand(
-                "UPDATE gateway.recorder_gaps SET ended_at = now() WHERE gap_id = $1");
+                "UPDATE gateway.recorder_gaps SET ended_at = now(), closed_by = 'observed' WHERE gap_id = $1");
             command.Parameters.AddWithValue(gapId);
             await command.ExecuteNonQueryAsync();
 

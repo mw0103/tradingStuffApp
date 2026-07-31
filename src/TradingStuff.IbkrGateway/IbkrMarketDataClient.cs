@@ -3,6 +3,7 @@ using System.Globalization;
 using IBApi;
 using Microsoft.Extensions.Options;
 using TradingStuff.Contracts;
+using TradingStuff.IbkrGateway.History;
 using TradingStuff.IbkrGateway.Pacing;
 using IbContract = IBApi.Contract;
 
@@ -144,6 +145,57 @@ public sealed class IbkrMarketDataClient(
             // Expected while probing: a stock lookup for an index symbol finds nothing.
             return null;
         }
+    }
+
+    // ---- futures family enumeration ----------------------------------------------------------
+
+    /// <summary>
+    /// Enumerates every contract IBKR lists for a futures family — expired and currently listed
+    /// alike — via <c>reqContractDetails</c> with <c>IncludeExpired</c>. See
+    /// <see cref="FuturesContractDefinition"/> for why this exists: a deep intraday backfill cannot
+    /// page a <c>CONTFUT</c> into the past, so it must instead walk each individual contract, and
+    /// this is how the walker (ResearchService's <c>EsContractWalker</c>) discovers what they are.
+    /// </summary>
+    /// <remarks>
+    /// Unlike <see cref="ResolveOptionConIdAsync"/>, an empty result is not turned into an
+    /// exception here: the caller (a periodic scan) treats "nothing back this pass" as "try again
+    /// later", not a hard failure, and a family enumeration returning zero rows is not on its own
+    /// evidence of a broken symbol/exchange the way an unresolved single option contract is.
+    /// </remarks>
+    public async Task<IReadOnlyList<FuturesContractDefinition>> GetFuturesFamilyAsync(
+        string symbol, string exchange, string currency, CancellationToken cancellationToken)
+    {
+        var details = await RequestListAsync<ContractDetails>(
+            (requestId, ct) => socket.ReqContractDetailsAsync(requestId, new IbContract
+            {
+                Symbol = symbol.ToUpperInvariant(),
+                SecType = "FUT",
+                Exchange = exchange,
+                Currency = currency,
+                IncludeExpired = true,
+            }, ct),
+            cancellationToken);
+
+        var contracts = new List<FuturesContractDefinition>(details.Count);
+
+        foreach (var detail in details)
+        {
+            if (FuturesContractExpiry.Resolve(detail) is not { } expiry)
+            {
+                // Should not happen given IBKR's documented field shapes, but a contract this
+                // walker cannot date is one it must not silently mis-plan either.
+                logger.LogWarning(
+                    "Skipping a {Symbol} futures contract (conId {ConId}): neither RealExpirationDate " +
+                    "('{Real}') nor LastTradeDateOrContractMonth ('{Raw}') parsed as a date.",
+                    symbol, detail.Contract.ConId, detail.RealExpirationDate, detail.Contract.LastTradeDateOrContractMonth);
+                continue;
+            }
+
+            contracts.Add(new FuturesContractDefinition(
+                detail.Contract.ConId, expiry, detail.Contract.TradingClass, detail.Contract.Exchange, detail.Contract.Currency));
+        }
+
+        return contracts;
     }
 
     // ---- chains -----------------------------------------------------------------------------

@@ -186,8 +186,11 @@ public sealed class ResearchRecordingPostgresTests
                 await insert.ExecuteNonQueryAsync();
             }
 
+            // closed_by is required alongside ended_at: the schema refuses a gap that claims an end
+            // without saying whether that end was observed or merely inferred at a later startup.
             await using var gap = new NpgsqlCommand(
-                "INSERT INTO gateway.recorder_gaps (scope, started_at, ended_at, reason) VALUES ($1, $2, $3, $4)", connection);
+                "INSERT INTO gateway.recorder_gaps (scope, started_at, ended_at, reason, closed_by) " +
+                "VALUES ($1, $2, $3, $4, 'observed')", connection);
             gap.Parameters.AddWithValue("lease:test");
             gap.Parameters.AddWithValue(from.AddMinutes(4));
             gap.Parameters.AddWithValue(from.AddMinutes(5));

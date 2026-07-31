@@ -121,9 +121,15 @@ public sealed class IbkrOrderTracker(ILogger<IbkrOrderTracker> logger)
     public IReadOnlyList<IbkrOrderState> All() => [.. _orders.Values.Select(order => order.Snapshot())];
 
     /// <summary>Completes when the order reaches a terminal status, or the timeout elapses.</summary>
+    /// <param name="fillGrace">
+    /// How long to keep waiting AFTER terminal status for the per-leg executions to arrive. See the
+    /// body — terminal status and complete fills are two different events on two different TWS
+    /// callbacks, and treating them as one loses the fills.
+    /// </param>
     public async Task<IbkrOrderState?> WaitForSettlementAsync(
         int ibkrOrderId,
         TimeSpan timeout,
+        TimeSpan fillGrace,
         CancellationToken cancellationToken)
     {
         if (!_orders.TryGetValue(ibkrOrderId, out var order))
@@ -142,6 +148,35 @@ public sealed class IbkrOrderTracker(ILogger<IbkrOrderTracker> logger)
                 "Order {OrderId} had not settled after {Timeout}s; returning its working state.",
                 ibkrOrderId,
                 timeout.TotalSeconds);
+        }
+
+        // Terminal status is NOT the end of the story. TWS delivers orderStatus="Filled" BEFORE the
+        // execDetails that carry the per-leg fills, and commissionAndFeesReport after those again.
+        // Returning on Settled alone hands the caller a filled order with an EMPTY fill list, and
+        // ExecutionService then persists it that way — the per-leg fills are simply lost from the
+        // system of record while the gateway holds them in memory.
+        //
+        // Observed live on the paper account, not theorised: a 1-lot SPY 745/747 vertical returned
+        // filled=1, avgFillPrice=1.28, fills=[], commission=0; four seconds later the same order
+        // read fills=2 (1.67 and 0.39, differencing to exactly 1.28) and commission=1.598693.
+        if (order.ExpectsFills)
+        {
+            try
+            {
+                await order.FillsSettled.Task.WaitAsync(fillGrace, cancellationToken);
+            }
+            catch (TimeoutException)
+            {
+                // Deliberately not fatal: the order really did fill, and reporting it with partial
+                // fills beats failing a completed order. Loud, because a persisted fill record that
+                // silently disagrees with `filled` is a reconciliation problem later.
+                logger.LogWarning(
+                    "Order {OrderId} reported filled but its per-leg executions and commissions did " +
+                    "not all arrive within {Grace}s. The returned fills/commission are incomplete; " +
+                    "reconcile against the broker before trusting them for cost analysis.",
+                    ibkrOrderId,
+                    fillGrace.TotalSeconds);
+            }
         }
 
         return order.Snapshot();
@@ -239,6 +274,25 @@ public sealed class IbkrOrderTracker(ILogger<IbkrOrderTracker> logger)
 
         public TaskCompletionSource Settled { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
+        /// <summary>
+        /// Completes once every leg has an execution and every execution has its commission — the
+        /// real "this order's cost is known" signal, distinct from <see cref="Settled"/> (which
+        /// only means TWS reported a terminal status).
+        /// </summary>
+        public TaskCompletionSource FillsSettled { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+        /// <summary>True once TWS says the order filled, so per-leg executions are owed.</summary>
+        public bool ExpectsFills
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return _filled > 0m && legIndexByConId.Count > 0;
+                }
+            }
+        }
+
         public void ApplyStatus(
             string status,
             decimal filled,
@@ -284,6 +338,8 @@ public sealed class IbkrOrderTracker(ILogger<IbkrOrderTracker> logger)
 
         public void ApplyExecution(IBApi.Contract contract, Execution execution)
         {
+            bool complete;
+
             lock (_gate)
             {
                 // Dedupe on ExecId: executions replay after a reconnect.
@@ -310,18 +366,55 @@ public sealed class IbkrOrderTracker(ILogger<IbkrOrderTracker> logger)
                     DateTimeOffset.UtcNow);
 
                 _updatedAt = DateTimeOffset.UtcNow;
+
+                complete = IsFillReportingComplete();
+            }
+
+            if (complete)
+            {
+                FillsSettled.TrySetResult();
             }
         }
 
         public void ApplyCommission(CommissionAndFeesReport report)
         {
+            bool complete;
+
             lock (_gate)
             {
                 if (QuoteRequest.TryConvertGreek(report.CommissionAndFees, out var commission))
                 {
                     _commissionByExecId[report.ExecId] = commission;
                 }
+
+                complete = IsFillReportingComplete();
             }
+
+            if (complete)
+            {
+                FillsSettled.TrySetResult();
+            }
+        }
+
+        /// <summary>
+        /// True once every leg has an execution AND every execution has its commission — the point
+        /// at which the order's cost is fully known.
+        /// </summary>
+        /// <remarks>
+        /// Leg coverage counts DISTINCT leg indices rather than executions, which is what makes it
+        /// correct when one leg fills in several pieces while another has not started.
+        /// </remarks>
+        private bool IsFillReportingComplete()
+        {
+            if (legIndexByConId.Count == 0 || _fillsByExecId.Count == 0)
+            {
+                return false;
+            }
+
+            var legsCovered = _fillsByExecId.Values.Select(fill => fill.LegIndex).Distinct().Count();
+
+            return legsCovered >= legIndexByConId.Count
+                   && _commissionByExecId.Count >= _fillsByExecId.Count;
         }
 
         public void ApplyError(int errorCode, string message)

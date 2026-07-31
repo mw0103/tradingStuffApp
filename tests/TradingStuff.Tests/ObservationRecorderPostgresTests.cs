@@ -158,6 +158,57 @@ public sealed class ObservationRecorderPostgresTests
         }
     }
 
+    [Fact]
+    public async Task A_gap_left_open_by_a_dead_process_is_bounded_at_the_next_startup()
+    {
+        // Found by killing the gateway three times during live paper testing. Only the process that
+        // opened a gap ever closes it, so an ungraceful exit leaves ended_at NULL forever — and
+        // CoverageMonitor counts an unended gap as overlapping EVERY later window, so one crash in
+        // July silently fails coverage for the rest of the platform's life.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+
+        // The dead process: opens a gap, then goes away without closing it.
+        await using (var abandoned = CreateRecorder(connectionString))
+        {
+            await abandoned.OpenGapAsync("lease:abandoned", "disconnect", CancellationToken.None);
+        }
+
+        // A gap this process closed itself must keep its 'observed' provenance through the sweep.
+        await using var survivor = CreateRecorder(connectionString);
+        await survivor.OpenGapAsync("lease:recovered", "disconnect", CancellationToken.None);
+        await survivor.CloseGapAsync("lease:recovered");
+
+        await using var restarted = CreateRecorder(connectionString);
+        await restarted.ReconcileOrphanedGapsAsync(CancellationToken.None);
+
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+
+        await using var stillOpen = new NpgsqlCommand(
+            "SELECT count(*) FROM gateway.recorder_gaps WHERE ended_at IS NULL", connection);
+        Assert.Equal(0L, (long)(await stillOpen.ExecuteScalarAsync())!);
+
+        await using var provenance = new NpgsqlCommand(
+            "SELECT scope, closed_by FROM gateway.recorder_gaps ORDER BY gap_id", connection);
+        var closedBy = new Dictionary<string, string>();
+        await using (var reader = await provenance.ExecuteReaderAsync())
+        {
+            while (await reader.ReadAsync())
+            {
+                closedBy[reader.GetString(0)] = reader.GetString(1);
+            }
+        }
+
+        // The distinction the column exists for: one end time was measured, the other only bounded.
+        Assert.Equal("inferred", closedBy["lease:abandoned"]);
+        Assert.Equal("observed", closedBy["lease:recovered"]);
+    }
+
     private static async Task<bool> WaitUntilAsync(Func<Task<bool>> condition, TimeSpan timeout)
     {
         var deadline = DateTime.UtcNow + timeout;

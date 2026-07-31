@@ -48,7 +48,20 @@ public enum BackfillRequestState
 /// <param name="ConId">
 /// NULL for a job that walks multiple contracts over the target range (e.g. ES, which must roll
 /// across expired futures contracts — see docs/research/ibkr-data-capability-matrix.md on CONTFUT
-/// rejecting a past endDateTime).
+/// rejecting a past endDateTime). A job with a NULL conId supplies its own request rows (its walker
+/// knows the per-contract conIds); the coordinator drains them but does not plan them.
+/// </param>
+/// <param name="Kind">
+/// <c>"historical"</c> (walk a fixed <paramref name="TargetFrom"/>..<paramref name="TargetTo"/>
+/// backward, once) or <c>"topup"</c> (re-anchor forward to the current bucket every run, never
+/// finished). See <see cref="BackfillJobKinds"/>.
+/// </param>
+/// <param name="SliceDuration">
+/// Overrides the TWS duration string the planner would otherwise derive from
+/// <paramref name="BarSize"/>. NULL means "derive it". This is a persisted job column rather than
+/// configuration on purpose: slice boundaries must be a pure function of the job row, or an ambient
+/// config change silently re-plans the job into a second, overlapping set of request rows that the
+/// idempotency key cannot collapse.
 /// </param>
 public sealed record BackfillJob(
     long JobId,
@@ -61,7 +74,22 @@ public sealed record BackfillJob(
     DateTimeOffset TargetFrom,
     DateTimeOffset TargetTo,
     int Priority,
-    string Status);
+    string Status,
+    string Kind = BackfillJobKinds.Historical,
+    string? SliceDuration = null);
+
+/// <summary>Known values for <see cref="BackfillJob.Kind"/>; mirrors migration 005's CHECK constraint.</summary>
+public static class BackfillJobKinds
+{
+    /// <summary>Walks a fixed target range backward, exactly once, and then completes.</summary>
+    public const string Historical = "historical";
+
+    /// <summary>
+    /// Re-anchors forward to the current bucket on every run and never completes. Its slices carry a
+    /// concrete bucket-floored <c>end_time_utc</c>, never NULL — see migration 005 for why.
+    /// </summary>
+    public const string TopUp = "topup";
+}
 
 /// <summary>
 /// The concrete parameters of one <c>reqHistoricalData</c> call — everything TWS needs to identify

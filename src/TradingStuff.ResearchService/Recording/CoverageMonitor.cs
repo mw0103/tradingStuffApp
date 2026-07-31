@@ -6,7 +6,18 @@ namespace TradingStuff.ResearchService.Recording;
 public sealed record ConIdCoverage(int ConId, int MinutesWithData, int TotalMinutes, double CoverageRatio);
 
 /// <summary>A recorder gap, open or closed, for the requested window.</summary>
-public sealed record RecorderGapSummary(long GapId, string Scope, DateTimeOffset StartedAt, DateTimeOffset? EndedAt, string Reason);
+/// <param name="ClosedBy">
+/// <c>observed</c> when the recorder watched recording resume, <c>inferred</c> when a later process
+/// bounded a gap its owner died holding — in which case <see cref="EndedAt"/> is an upper bound on
+/// the outage, not a measurement. NULL while the gap is still open.
+/// </param>
+public sealed record RecorderGapSummary(
+    long GapId,
+    string Scope,
+    DateTimeOffset StartedAt,
+    DateTimeOffset? EndedAt,
+    string Reason,
+    string? ClosedBy);
 
 /// <summary>
 /// Coverage as required by the Phase 1 acceptance criterion: a full RTH+GTH session at &gt;=95%
@@ -132,7 +143,7 @@ public sealed class CoverageMonitor(IConfiguration configuration, ILogger<Covera
         // A gap "overlaps the window" if it started before the window ends and either never ended
         // or ended after the window began.
         await using var command = new NpgsqlCommand(
-            "SELECT gap_id, scope, started_at, ended_at, reason FROM gateway.recorder_gaps " +
+            "SELECT gap_id, scope, started_at, ended_at, reason, closed_by FROM gateway.recorder_gaps " +
             "WHERE started_at < $2 AND (ended_at IS NULL OR ended_at > $1) " +
             "ORDER BY started_at DESC",
             connection);
@@ -146,7 +157,8 @@ public sealed class CoverageMonitor(IConfiguration configuration, ILogger<Covera
         {
             gaps.Add(new RecorderGapSummary(
                 reader.GetInt64(0), reader.GetString(1), reader.GetFieldValue<DateTimeOffset>(2),
-                reader.IsDBNull(3) ? null : reader.GetFieldValue<DateTimeOffset>(3), reader.GetString(4)));
+                reader.IsDBNull(3) ? null : reader.GetFieldValue<DateTimeOffset>(3), reader.GetString(4),
+                reader.IsDBNull(5) ? null : reader.GetString(5)));
         }
 
         return gaps;
