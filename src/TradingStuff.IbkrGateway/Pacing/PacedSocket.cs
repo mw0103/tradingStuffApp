@@ -8,21 +8,40 @@ namespace TradingStuff.IbkrGateway.Pacing;
 /// relevant pacing budget from <see cref="IbkrPacingGovernor"/> before touching the wire.
 /// </summary>
 /// <remarks>
+/// <para>
 /// Direct <c>connection.RequireClient().reqXxx(...)</c> calls elsewhere bypass pacing and are how
 /// the ~50 msg/s and 100-line limits get violated. Connection lifecycle calls
 /// (<c>eConnect</c>/<c>eDisconnect</c>/<c>reqMarketDataType</c>) remain in
 /// <see cref="IbkrConnection"/>: they happen once per connection, before any budget contention.
+/// </para>
+/// <para>
+/// <b>Every method resolves the socket AFTER its budgets, never before.</b> A budget wait can span
+/// minutes (the historical window) and a reconnect replaces the <c>EClientSocket</c> outright, so a
+/// reference captured before the wait belongs to a dead socket by the time the wait returns.
+/// Writing to it throws or silently no-ops depending on where the old socket died — and for
+/// <see cref="PlaceOrderAsync"/> a silent no-op is the worst outcome in the system: the order map
+/// row and the tracker claim already exist, so the gateway reports a working order TWS never
+/// received. Resolving last shrinks the window to the handful of instructions between
+/// <see cref="IbkrConnection.RequireClient"/> and the write, and a connection that is already down
+/// at that point fails the call so the caller's compensation runs.
+/// </para>
+/// <para>
+/// Not sealed, and two methods are virtual, <b>for tests only</b>: the order client's
+/// never-transmitted compensation is the most consequential branch in the gateway and is otherwise
+/// unreachable without a live socket, since order placement depends on conId resolution which also
+/// needs one. Production has exactly one implementation, and it must stay that way — a second one
+/// would be a second <c>placeOrder</c> call site.
+/// </para>
 /// </remarks>
-public sealed class PacedSocket(
+public class PacedSocket(
     IbkrConnection connection,
     IbkrPacingGovernor governor,
     ILogger<PacedSocket> logger)
 {
-    public async Task ReqContractDetailsAsync(int requestId, IbContract contract, CancellationToken cancellationToken)
+    public virtual async Task ReqContractDetailsAsync(int requestId, IbContract contract, CancellationToken cancellationToken)
     {
-        var client = connection.RequireClient();
         await governor.AcquireMessagesAsync(1, SocketMessageClass.Normal, cancellationToken);
-        client.reqContractDetails(requestId, contract);
+        connection.RequireClient().reqContractDetails(requestId, contract);
     }
 
     public async Task ReqSecDefOptParamsAsync(
@@ -33,9 +52,9 @@ public sealed class PacedSocket(
         int underlyingConId,
         CancellationToken cancellationToken)
     {
-        var client = connection.RequireClient();
         await governor.AcquireMessagesAsync(1, SocketMessageClass.Normal, cancellationToken);
-        client.reqSecDefOptParams(requestId, underlyingSymbol, futFopExchange, underlyingSecType, underlyingConId);
+        connection.RequireClient()
+            .reqSecDefOptParams(requestId, underlyingSymbol, futFopExchange, underlyingSecType, underlyingConId);
     }
 
     /// <summary>
@@ -52,17 +71,21 @@ public sealed class PacedSocket(
         LineClass lineClass,
         CancellationToken cancellationToken)
     {
-        var client = connection.RequireClient();
         var lease = await governor.AcquireLineAsync(lineClass, cancellationToken);
 
         try
         {
             await governor.AcquireMessagesAsync(1, SocketMessageClass.Normal, cancellationToken);
+
+            var client = connection.RequireClient();
             client.reqMktData(tickerId, contract, genericTickList, snapshot, regulatorySnapshot, mktDataOptions);
+
             return lease;
         }
         catch
         {
+            // Covers the socket being gone as well as the message budget expiring: either way no
+            // subscription exists at TWS, so the line must go straight back to the ledger.
             lease.Dispose();
             throw;
         }
@@ -85,9 +108,8 @@ public sealed class PacedSocket(
 
         try
         {
-            var client = connection.RequireClient();
             await governor.AcquireMessagesAsync(1, SocketMessageClass.Normal, CancellationToken.None);
-            client.cancelMktData(tickerId);
+            connection.RequireClient().cancelMktData(tickerId);
         }
         catch (Exception ex)
         {
@@ -120,10 +142,10 @@ public sealed class PacedSocket(
         bool countsDouble,
         CancellationToken cancellationToken)
     {
-        var client = connection.RequireClient();
         await governor.AcquireHistoricalAsync(pacingRequestKey, pacingContractKey, countsDouble, cancellationToken);
         await governor.AcquireMessagesAsync(1, SocketMessageClass.Normal, cancellationToken);
-        client.reqHistoricalData(
+
+        connection.RequireClient().reqHistoricalData(
             requestId, contract, endDateTime, durationString, barSizeSetting, whatToShow, useRth, formatDate,
             keepUpToDate, chartOptions);
     }
@@ -146,10 +168,10 @@ public sealed class PacedSocket(
         bool countsDouble,
         CancellationToken cancellationToken)
     {
-        var client = connection.RequireClient();
         await governor.AcquireHistoricalAsync(pacingRequestKey, pacingContractKey, countsDouble, cancellationToken);
         await governor.AcquireMessagesAsync(1, SocketMessageClass.Normal, cancellationToken);
-        client.reqHeadTimestamp(requestId, contract, whatToShow, useRth, formatDate);
+
+        connection.RequireClient().reqHeadTimestamp(requestId, contract, whatToShow, useRth, formatDate);
     }
 
     /// <summary>
@@ -160,9 +182,8 @@ public sealed class PacedSocket(
     {
         try
         {
-            var client = connection.RequireClient();
             await governor.AcquireMessagesAsync(1, SocketMessageClass.Normal, CancellationToken.None);
-            client.cancelHeadTimestamp(requestId);
+            connection.RequireClient().cancelHeadTimestamp(requestId);
         }
         catch (Exception ex)
         {
@@ -170,49 +191,108 @@ public sealed class PacedSocket(
         }
     }
 
-    public async Task PlaceOrderAsync(int orderId, IbContract contract, Order order, CancellationToken cancellationToken)
+    /// <summary>
+    /// Transmits an order. The one call site in the system that reaches <c>placeOrder</c>.
+    /// </summary>
+    /// <param name="onAboutToTransmit">
+    /// Invoked immediately before the socket write, with nothing awaitable between the two. It is
+    /// the caller's only reliable answer to "did this order reach TWS?": everything that can throw
+    /// before it — the message budget, the trading-gate re-check, resolving the live socket — is
+    /// provably never-transmitted, and everything from the write onward is not. Order compensation
+    /// (undoing the order-map row and the tracker claim) depends on that distinction, and getting
+    /// it wrong in the permissive direction risks a second live order for one internal id, so a
+    /// failure raised from inside <c>placeOrder</c> itself deliberately counts as transmitted even
+    /// though it may not be.
+    /// </param>
+    public virtual async Task PlaceOrderAsync(
+        int orderId,
+        IbContract contract,
+        Order order,
+        Action onAboutToTransmit,
+        CancellationToken cancellationToken)
     {
-        var client = connection.RequireClient();
         await governor.AcquireMessagesAsync(1, SocketMessageClass.Order, cancellationToken);
 
-        // Re-checked at the wire: the waits above can span a reconnect, and a reconnect can land on
-        // an account the trading gate refuses. The check at the top of PlaceAsync is not enough.
+        // Both re-checked at the wire: the wait above can span a reconnect, which can land on an
+        // account the trading gate refuses and always replaces the socket. The checks at the top of
+        // PlaceAsync, and any client reference resolved before the wait, are not enough.
         connection.EnsureTradingPermitted();
+        var client = connection.RequireClient();
+
+        onAboutToTransmit();
         client.placeOrder(orderId, contract, order);
     }
 
     public async Task CancelOrderAsync(int orderId, OrderCancel orderCancel, CancellationToken cancellationToken)
     {
-        var client = connection.RequireClient();
         await governor.AcquireMessagesAsync(1, SocketMessageClass.Order, cancellationToken);
-        client.cancelOrder(orderId, orderCancel);
+        connection.RequireClient().cancelOrder(orderId, orderCancel);
     }
 
     public async Task ReqAllOpenOrdersAsync(CancellationToken cancellationToken)
     {
-        var client = connection.RequireClient();
         await governor.AcquireMessagesAsync(1, SocketMessageClass.Normal, cancellationToken);
-        client.reqAllOpenOrders();
+        connection.RequireClient().reqAllOpenOrders();
     }
 
     public async Task ReqAccountSummaryAsync(int requestId, string group, string tags, CancellationToken cancellationToken)
     {
-        var client = connection.RequireClient();
         await governor.AcquireMessagesAsync(1, SocketMessageClass.Normal, cancellationToken);
-        client.reqAccountSummary(requestId, group, tags);
+        connection.RequireClient().reqAccountSummary(requestId, group, tags);
     }
 
     public async Task ReqPositionsMultiAsync(int requestId, string account, string modelCode, CancellationToken cancellationToken)
     {
-        var client = connection.RequireClient();
         await governor.AcquireMessagesAsync(1, SocketMessageClass.Normal, cancellationToken);
-        client.reqPositionsMulti(requestId, account, modelCode);
+        connection.RequireClient().reqPositionsMulti(requestId, account, modelCode);
     }
 
     public async Task ReqPnLAsync(int requestId, string account, string modelCode, CancellationToken cancellationToken)
     {
-        var client = connection.RequireClient();
         await governor.AcquireMessagesAsync(1, SocketMessageClass.Normal, cancellationToken);
-        client.reqPnL(requestId, account, modelCode);
+        connection.RequireClient().reqPnL(requestId, account, modelCode);
+    }
+
+    /// <summary>
+    /// Desubscribes an account stream. Never throws — a rebuild must proceed whether or not the
+    /// cancel lands, and a socket that has already gone has dropped the subscription anyway.
+    /// </summary>
+    /// <remarks>
+    /// Measured against TWS 223 on the paper account: <c>cancelAccountSummary</c> does NOT free the
+    /// slot the "maximum number of account summary requests exceeded" error (322) counts, so the
+    /// cancel alone does not make a rebuild safe — see
+    /// <see cref="IbkrAccountClient"/> for the request-id reuse that does. It is still issued
+    /// because leaving the stream live means TWS keeps pushing into a sink nothing reads.
+    /// </remarks>
+    public async Task CancelAccountStreamsAsync(int? summaryId, int? positionsId, int? pnlId)
+    {
+        if (summaryId is { } summary)
+        {
+            await TryCancelAsync(summary, static (client, id) => client.cancelAccountSummary(id), "account summary");
+        }
+
+        if (positionsId is { } positions)
+        {
+            await TryCancelAsync(positions, static (client, id) => client.cancelPositionsMulti(id), "positions");
+        }
+
+        if (pnlId is { } pnl)
+        {
+            await TryCancelAsync(pnl, static (client, id) => client.cancelPnL(id), "P&L");
+        }
+    }
+
+    private async Task TryCancelAsync(int requestId, Action<EClientSocket, int> cancel, string description)
+    {
+        try
+        {
+            await governor.AcquireMessagesAsync(1, SocketMessageClass.Normal, CancellationToken.None);
+            cancel(connection.RequireClient(), requestId);
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(
+                ex, "Ignoring failure to cancel the {Description} stream {RequestId}.", description, requestId);
+        }
     }
 }

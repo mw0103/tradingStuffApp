@@ -115,14 +115,11 @@ public sealed class OrderIdStore : IDisposable
         }
         catch (PostgresException ex) when (ex.SqlState == PostgresErrorCodes.UniqueViolation)
         {
-            _logger.LogCritical(
-                ex,
-                "Broker order id {IbkrOrderId} is already mapped to a different internal order. " +
-                "This should be impossible while ids come from TWS's nextValidId sequence.",
-                ibkrOrderId);
+            var diagnosis = await DescribeBrokerIdCollisionAsync(ibkrOrderId, cancellationToken);
 
-            return new OrderMappingResult.IntegrityViolation(
-                $"Broker order id {ibkrOrderId} is already mapped to a different internal order.");
+            _logger.LogCritical(ex, "Refusing to place an order: {Diagnosis}", diagnosis);
+
+            return new OrderMappingResult.IntegrityViolation(diagnosis);
         }
         catch (Exception ex) when (ex is NpgsqlException or InvalidOperationException or TimeoutException)
         {
@@ -134,6 +131,66 @@ public sealed class OrderIdStore : IDisposable
                 ibkrOrderId);
 
             return new OrderMappingResult.Unavailable(ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Explains a broker-order-id collision in terms an operator can act on.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// This is not "impossible". TWS's <b>Global Configuration → API → Settings → Reset API order ID
+    /// sequence</b> sends the client a low <c>nextValidId</c>, and while
+    /// <see cref="IbkrRequestRegistry.SeedFrom"/> only ever raises the in-process sequence, a gateway
+    /// restart after such a reset starts from that low id — straight back into the range the
+    /// <c>ibkr_order_map</c> rows of earlier sessions already occupy. Every placement then fails
+    /// here, with no self-healing path, until the shared request/order sequence has climbed past the
+    /// highest id on record.
+    /// </para>
+    /// <para>
+    /// The remedy is deliberately NOT to delete the colliding rows. They are the audit trail that
+    /// links an internal order to a real broker order, and silently removing one to unblock a
+    /// placement would destroy exactly the record that exists to prove what was transmitted. The
+    /// honest output is a message naming the cause and the number the sequence has to clear.
+    /// </para>
+    /// </remarks>
+    private async Task<string> DescribeBrokerIdCollisionAsync(int ibkrOrderId, CancellationToken cancellationToken)
+    {
+        var baseline =
+            $"Broker order id {ibkrOrderId} is already mapped to a different internal order in " +
+            "gateway.ibkr_order_map.";
+
+        try
+        {
+            await using var command = _dataSource!.CreateCommand(
+                "SELECT m.internal_order_id, m.last_status, m.placed_at, " +
+                "       (SELECT max(ibkr_order_id) FROM gateway.ibkr_order_map) " +
+                "FROM gateway.ibkr_order_map m WHERE m.ibkr_order_id = $1");
+            command.Parameters.AddWithValue(ibkrOrderId);
+
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+
+            if (!await reader.ReadAsync(cancellationToken))
+            {
+                return baseline;
+            }
+
+            var highest = reader.IsDBNull(3) ? ibkrOrderId : reader.GetInt32(3);
+
+            return baseline +
+                   $" It belongs to internal order {reader.GetGuid(0)} ({reader.GetString(1)}), recorded " +
+                   $"{reader.GetFieldValue<DateTimeOffset>(2):u}. The usual cause is TWS's " +
+                   "'Reset API order ID sequence' followed by a gateway restart, which reseeds this " +
+                   $"process below ids already used. Placement stays blocked until the id sequence is " +
+                   $"above {highest}: restart the gateway with TWS's order id sequence advanced past " +
+                   "that value (Global Configuration -> API -> Settings), or reconcile and retire the " +
+                   "old mappings deliberately. Do NOT delete order-map rows to clear this — they are " +
+                   "the audit trail.";
+        }
+        catch (Exception ex) when (ex is NpgsqlException or InvalidOperationException or TimeoutException)
+        {
+            _logger.LogWarning(ex, "Could not read the colliding order-map row for broker order {IbkrOrderId}.", ibkrOrderId);
+            return baseline;
         }
     }
 

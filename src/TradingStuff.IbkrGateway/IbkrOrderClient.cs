@@ -148,22 +148,53 @@ public sealed class IbkrOrderClient(
             return existing;
         }
 
+        if (request.LimitPrice is { } requested &&
+            plan.NetPricePerSpread is { } perSpread &&
+            perSpread * plan.SpreadCount != requested)
+        {
+            // The whole-order net does not divide into a tradeable per-spread increment, so the
+            // transmitted price is the next one DOWN — never more aggressive than asked, but not
+            // what was asked either. Said out loud rather than left for someone to derive from the
+            // fill price.
+            logger.LogWarning(
+                "Whole-order net {Requested} over {Spreads} spread(s) is not on a tradeable increment; " +
+                "transmitting {PerSpread} per spread ({Effective} across the order).",
+                requested,
+                plan.SpreadCount,
+                perSpread,
+                perSpread * plan.SpreadCount);
+        }
+
         logger.LogInformation(
             "Placing order {OrderId} for internal order {InternalOrderId}: {Plan}",
             ibkrOrderId,
             internalOrderId,
             IbkrOrderBuilder.Describe(plan));
 
+        // Set by PacedSocket in the same synchronous step as the wire write. Compensation keys off
+        // this rather than off the exception type: the pre-wire section can fail in more ways than
+        // any catch filter reliably enumerates — the trading-gate re-check throws
+        // InvalidOperationException, the pacing budget throws TimeoutException, resolving the socket
+        // throws IbkrConnectionException, cancellation throws OperationCanceledException — and a
+        // type this list misses skips compensation and permanently poisons the internal order id
+        // with a mapping to an order TWS never received.
+        var transmitted = false;
+
         try
         {
-            await socket.PlaceOrderAsync(ibkrOrderId, plan.Contract, plan.Order, cancellationToken);
+            await socket.PlaceOrderAsync(
+                ibkrOrderId, plan.Contract, plan.Order, () => transmitted = true, cancellationToken);
         }
-        catch (Exception ex) when (ex is IbkrConnectionException or TimeoutException or OperationCanceledException)
+        catch (Exception) when (!transmitted)
         {
-            // These can only originate BEFORE the socket write (RequireClient, the pacing wait, or
-            // the trading gate re-check) — nothing reached TWS. Without compensation, the mapping
-            // row and tracker claim would make every retry of this internal order return a phantom
-            // "working" order that does not exist at the broker.
+            // Nothing reached TWS. Without compensation, the mapping row and tracker claim would
+            // make every retry of this internal order return a phantom "working" order that does
+            // not exist at the broker.
+            //
+            // The converse is deliberately conservative: once the write has been entered the order
+            // may be live, so a failure from there on is NOT compensated even though it might also
+            // have transmitted nothing. Refusing a legitimate retry is recoverable by
+            // reconciliation; placing a second live order for one internal id is not.
             tracker.Untrack(ibkrOrderId, internalOrderId);
 
             if (recordedByThisCall)

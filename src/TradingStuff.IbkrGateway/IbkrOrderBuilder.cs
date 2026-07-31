@@ -23,12 +23,17 @@ internal sealed record ComboOrderPlan(
 /// </remarks>
 internal static class IbkrOrderBuilder
 {
+    /// <param name="minimumTick">
+    /// The price increment the combo's net must land on. See <see cref="DefaultMinimumTick"/> — the
+    /// default is right for equity and ETF options and too fine for nickel-quoted index series.
+    /// </param>
     public static ComboOrderPlan Build(
         SubmitOrderRequest request,
         IReadOnlyDictionary<OptionContractKey, int> conIds,
         string? account,
         bool nonGuaranteed,
-        bool outsideRegularTradingHours = false)
+        bool outsideRegularTradingHours = false,
+        decimal minimumTick = DefaultMinimumTick)
     {
         if (request.Legs.Count == 0)
         {
@@ -75,8 +80,8 @@ internal static class IbkrOrderBuilder
             ComboLegs = comboLegs,
         };
 
-        var netPerSpread = PerSpreadPrice(request.LimitPrice, spreadCount);
-        var stopPerSpread = PerSpreadPrice(request.StopPrice, spreadCount);
+        var netPerSpread = PerSpreadPrice(request.LimitPrice, spreadCount, minimumTick);
+        var stopPerSpread = PerSpreadPrice(request.StopPrice, spreadCount, minimumTick);
 
         var order = new IbOrder
         {
@@ -145,20 +150,66 @@ internal static class IbkrOrderBuilder
         [.. legs.Select(leg => Math.Abs(leg.Quantity) / spreadCount)];
 
     /// <summary>
-    /// Converts a whole-order net price into the per-combo price TWS expects.
+    /// The price increment a per-spread combo price is snapped to.
     /// </summary>
     /// <remarks>
+    /// Measured against TWS 223 on the paper account: a combo's minimum price variation is the
+    /// <c>ContractDetails.MinTick</c> of its legs, and TWS rejects a non-conforming BAG limit
+    /// outright with error 110 ("The price does not conform to the minimum price variation for this
+    /// contract"). Confirmed on both sides: a SPY vertical (leg minTick 0.01) was rejected at 0.3333
+    /// and accepted at 0.33; an SPXW vertical (leg minTick 0.05) was rejected at both 0.3333 and
+    /// 0.33 and accepted at 0.35.
+    /// <para>
+    /// 0.01 is therefore correct for equity and ETF options and NOT sufficient for index series
+    /// quoted in nickels. Fixing that properly needs the real per-leg <c>MinTick</c> threaded from
+    /// contract resolution, which is why this is a parameter rather than a constant in the
+    /// arithmetic — until a caller supplies one, an SPXW multi-lot whose net does not divide into
+    /// nickels still draws a 110, exactly as before, and no order is silently mispriced.
+    /// </para>
+    /// </remarks>
+    public const decimal DefaultMinimumTick = 0.01m;
+
+    /// <summary>
+    /// Converts a whole-order net price into the per-combo price TWS expects, snapped to a
+    /// tradeable increment.
+    /// </summary>
+    /// <remarks>
+    /// <para>
     /// <c>SubmitOrderRequest.LimitPrice</c> is the net across the whole order — that is how
     /// <c>PaperExecutionEngine.CalculateNetDebit</c> defines it, summing signed prices multiplied by
     /// each leg's absolute quantity. TWS instead wants the net for a single combo unit. The two
     /// coincide only at one spread, which is why the distinction is easy to miss.
-    /// <para>Sign is preserved: positive is a net debit, negative a net credit — the same convention
-    /// both sides already use.</para>
+    /// </para>
+    /// <para>
+    /// Sign is preserved: positive is a net debit, negative a net credit — the same convention both
+    /// sides already use. The division rarely lands on a tick (a whole-order net of 1.00 over three
+    /// spreads is 0.3333…), and rounding to four decimal places, as this used to, produces a price
+    /// TWS refuses — see <see cref="DefaultMinimumTick"/> for the measurements.
+    /// </para>
+    /// <para>
+    /// The snap is always <b>downward</b>, never nearest. The BAG order is always submitted as a BUY
+    /// with a signed net, so a lower limit is uniformly the less aggressive one: a debit pays no
+    /// more than asked, and a credit demands no less than asked. Nearest-rounding would make roughly
+    /// half of all multi-lot orders marginally more aggressive than the caller specified, which is
+    /// not a change an adapter gets to make silently.
+    /// </para>
     /// </remarks>
-    public static decimal? PerSpreadPrice(decimal? wholeOrderPrice, int spreadCount) =>
-        wholeOrderPrice is { } price && spreadCount > 0
-            ? decimal.Round(price / spreadCount, 4, MidpointRounding.ToEven)
-            : wholeOrderPrice;
+    public static decimal? PerSpreadPrice(
+        decimal? wholeOrderPrice,
+        int spreadCount,
+        decimal minimumTick = DefaultMinimumTick)
+    {
+        if (wholeOrderPrice is not { } price || spreadCount <= 0)
+        {
+            return wholeOrderPrice;
+        }
+
+        var perSpread = price / spreadCount;
+
+        return minimumTick > 0m
+            ? decimal.Floor(perSpread / minimumTick) * minimumTick
+            : perSpread;
+    }
 
     public static string ToIbOrderType(OrderType orderType) => orderType switch
     {

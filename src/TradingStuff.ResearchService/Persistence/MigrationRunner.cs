@@ -1,4 +1,6 @@
 using System.Reflection;
+using System.Security.Cryptography;
+using System.Text;
 using Npgsql;
 
 namespace TradingStuff.ResearchService.Persistence;
@@ -10,20 +12,51 @@ public sealed record MigrationState(
     string? Error);
 
 /// <summary>
+/// A migration's DDL failed because the object it creates already exists — the signature of a
+/// migration applied by hand outside this runner (or a ledger row inserted/edited directly). Retrying
+/// cannot fix this: the identical statement fails identically every time until a human reconciles the
+/// database or the ledger, so this gets a short, bounded retry and a named, actionable error instead
+/// of the indefinite backoff <see cref="MigrationRunner"/> uses for ordinary startup races (Postgres
+/// not accepting connections yet, the database not created yet, and so on).
+/// </summary>
+internal sealed class MigrationConflictException(string migrationName, Exception inner)
+    : Exception(
+        $"Migration '{migrationName}' failed because an object it creates already exists in the " +
+        "database. This is the signature of a migration applied by hand outside this runner (or a " +
+        "hand-edited research.schema_migrations row) — retrying will not resolve it. Reconcile the " +
+        "database (drop or adjust the conflicting object) or the ledger (insert the migration's name " +
+        $"and checksum so the runner considers it already applied) before restarting. Original error: " +
+        $"{inner.Message}",
+        inner)
+{
+    public string MigrationName { get; } = migrationName;
+}
+
+/// <summary>
 /// Applies the embedded SQL migrations, in name order, exactly once each.
 /// </summary>
 /// <remarks>
 /// ResearchService owns ALL schema — including the <c>gateway.*</c> tables the IbkrGateway writes —
 /// so there is exactly one migration authority. The runner takes a Postgres advisory lock so two
-/// service instances cannot race, records applied migrations in <c>research.schema_migrations</c>,
-/// and retries in the background rather than failing the host: the gateway and this service both
-/// tolerate a database that is still coming up.
+/// service instances cannot race, records applied migrations (with a checksum of their content, so a
+/// file edited after the fact is detected rather than silently trusted) in
+/// <c>research.schema_migrations</c>, and retries transient failures in the background rather than
+/// failing the host: the gateway and this service both tolerate a database that is still coming up.
+/// A migration that fails because its target already exists is a different class of problem —
+/// retrying it forever cannot help — and gets a short, bounded retry instead.
 /// </remarks>
 public sealed class MigrationRunner(IConfiguration configuration, ILogger<MigrationRunner> logger)
     : BackgroundService
 {
     // Arbitrary but fixed: the advisory lock key that serialises migration runs across processes.
     private const long AdvisoryLockKey = 0x54_52_41_44_49_4E_47;
+
+    // "Already exists" failures never resolve themselves — the same DDL fails identically forever —
+    // so this bounds the retry rather than trusting the same backoff used for ordinary startup races.
+    // Not 1: a single retry absorbs the vanishingly rare case where the conflict was itself transient
+    // (e.g. a concurrent out-of-band script mid-run), without disguising the common case, which is a
+    // hand-applied migration that needs a human.
+    private const int MaxConflictAttempts = 3;
 
     private volatile MigrationState _state = new("pending", [], null);
 
@@ -41,6 +74,7 @@ public sealed class MigrationRunner(IConfiguration configuration, ILogger<Migrat
         }
 
         var attempt = 0;
+        var conflictAttempts = 0;
 
         while (!stoppingToken.IsCancellationRequested)
         {
@@ -51,6 +85,32 @@ public sealed class MigrationRunner(IConfiguration configuration, ILogger<Migrat
 
                 logger.LogInformation("Schema is current: {Count} migration(s) applied.", applied.Count);
                 return;
+            }
+            catch (MigrationConflictException ex)
+            {
+                conflictAttempts++;
+                _state = new MigrationState("failed", _state.Applied, ex.Message);
+
+                if (conflictAttempts >= MaxConflictAttempts)
+                {
+                    logger.LogCritical(
+                        ex,
+                        "Migration {Name} still conflicts with an existing object after {Attempts} " +
+                        "attempts; giving up rather than retrying forever.",
+                        ex.MigrationName,
+                        conflictAttempts);
+                    return;
+                }
+
+                logger.LogError(
+                    ex,
+                    "Migration {Name} attempt {Attempt} conflicted with an existing object; " +
+                    "retrying {Remaining} more time(s) before giving up.",
+                    ex.MigrationName,
+                    conflictAttempts,
+                    MaxConflictAttempts - conflictAttempts);
+
+                await Task.Delay(TimeSpan.FromSeconds(5), stoppingToken);
             }
             catch (Exception ex) when (ex is not OperationCanceledException)
             {
@@ -73,12 +133,25 @@ public sealed class MigrationRunner(IConfiguration configuration, ILogger<Migrat
     }
 
     /// <summary>One full pass — ensure the database exists, then apply pending migrations.</summary>
+    internal Task<IReadOnlyList<string>> ApplyOnceAsync(
+        string connectionString,
+        CancellationToken cancellationToken) =>
+        ApplyOnceAsync(connectionString, LoadEmbeddedMigrations(), cancellationToken);
+
+    /// <summary>
+    /// As <see cref="ApplyOnceAsync(string, CancellationToken)"/>, but against an explicit migration
+    /// set rather than what the assembly currently embeds. Exists so a test can simulate a migration
+    /// file changing after it was applied — something that cannot happen through the embedded-resource
+    /// path within a single test run — by applying one set and then a second set that reuses a name
+    /// with different SQL.
+    /// </summary>
     internal async Task<IReadOnlyList<string>> ApplyOnceAsync(
         string connectionString,
+        IReadOnlyList<(string Name, string Sql, string Checksum)> migrations,
         CancellationToken cancellationToken)
     {
         await EnsureDatabaseAsync(connectionString, cancellationToken);
-        return await ApplyAsync(connectionString, cancellationToken);
+        return await ApplyAsync(connectionString, migrations, cancellationToken);
     }
 
     /// <summary>Creates the target database when the server is up but the database is not there.</summary>
@@ -116,7 +189,10 @@ public sealed class MigrationRunner(IConfiguration configuration, ILogger<Migrat
         }
     }
 
-    private async Task<IReadOnlyList<string>> ApplyAsync(string connectionString, CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<string>> ApplyAsync(
+        string connectionString,
+        IReadOnlyList<(string Name, string Sql, string Checksum)> migrations,
+        CancellationToken cancellationToken)
     {
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
@@ -132,28 +208,85 @@ public sealed class MigrationRunner(IConfiguration configuration, ILogger<Migrat
             await using (var bootstrap = new NpgsqlCommand(
                 "CREATE SCHEMA IF NOT EXISTS research; " +
                 "CREATE TABLE IF NOT EXISTS research.schema_migrations (" +
-                "  name text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now())",
+                "  name text PRIMARY KEY, applied_at timestamptz NOT NULL DEFAULT now(), checksum text); " +
+                // A brand-new table already has the column from the CREATE TABLE above; this line is
+                // what brings an EXISTING ledger (created before checksums existed) up to date, every
+                // startup, before anything below assumes the column is there. Idempotent and cheap —
+                // Postgres no-ops an ADD COLUMN IF NOT EXISTS against a column that already exists.
+                "ALTER TABLE research.schema_migrations ADD COLUMN IF NOT EXISTS checksum text",
                 connection))
             {
                 await bootstrap.ExecuteNonQueryAsync(cancellationToken);
             }
 
-            var alreadyApplied = new HashSet<string>(StringComparer.Ordinal);
+            var embeddedChecksums = migrations.ToDictionary(m => m.Name, m => m.Checksum, StringComparer.Ordinal);
+            var appliedChecksums = new Dictionary<string, string?>(StringComparer.Ordinal);
 
-            await using (var existing = new NpgsqlCommand("SELECT name FROM research.schema_migrations", connection))
+            await using (var existing = new NpgsqlCommand(
+                "SELECT name, checksum FROM research.schema_migrations", connection))
             await using (var reader = await existing.ExecuteReaderAsync(cancellationToken))
             {
                 while (await reader.ReadAsync(cancellationToken))
                 {
-                    alreadyApplied.Add(reader.GetString(0));
+                    appliedChecksums[reader.GetString(0)] = reader.IsDBNull(1) ? null : reader.GetString(1);
                 }
             }
 
-            var applied = new List<string>(alreadyApplied);
-
-            foreach (var (name, sql) in LoadEmbeddedMigrations())
+            // Backfill: a row recorded before the checksum column existed has nothing to compare
+            // against yet. The only checksum available for a migration nobody has re-run since is
+            // whatever is CURRENTLY embedded under that name, so that becomes the baseline. A name
+            // with no current match (an old migration file since deleted or renamed) is left alone —
+            // there is nothing to compute a baseline from, and that is a different problem than this
+            // migration exists to catch.
+            foreach (var (name, checksum) in appliedChecksums.ToArray())
             {
-                if (alreadyApplied.Contains(name))
+                if (checksum is not null || !embeddedChecksums.TryGetValue(name, out var baseline))
+                {
+                    continue;
+                }
+
+                await using (var backfill = new NpgsqlCommand(
+                    "UPDATE research.schema_migrations SET checksum = $1 WHERE name = $2 AND checksum IS NULL",
+                    connection))
+                {
+                    backfill.Parameters.AddWithValue(baseline);
+                    backfill.Parameters.AddWithValue(name);
+                    await backfill.ExecuteNonQueryAsync(cancellationToken);
+                }
+
+                appliedChecksums[name] = baseline;
+
+                logger.LogInformation(
+                    "Backfilled a content checksum for previously applied migration {Name}; this " +
+                    "becomes the baseline future runs are checked against.",
+                    name);
+            }
+
+            // Only once every applied row has a real baseline does a mismatch mean something: the
+            // file's content today does not match what was recorded as having run. Continuing past
+            // that would silently apply new migrations on top of a foundation nobody can vouch for, so
+            // it is fatal — named, and before anything else touches the schema — rather than logged
+            // and ignored.
+            foreach (var (name, _, checksum) in migrations)
+            {
+                if (appliedChecksums.TryGetValue(name, out var recorded)
+                    && recorded is not null
+                    && !string.Equals(recorded, checksum, StringComparison.Ordinal))
+                {
+                    throw new InvalidOperationException(
+                        $"Migration '{name}' has changed since it was applied (recorded checksum " +
+                        $"{recorded}, current file checksum {checksum}). The database and the " +
+                        "migration file have diverged. Reconcile by hand — revert the file to what " +
+                        "actually ran, or confirm the divergence is intentional and update " +
+                        "research.schema_migrations yourself — before this runner will proceed.");
+                }
+            }
+
+            var applied = new List<string>(appliedChecksums.Keys);
+
+            foreach (var (name, sql, checksum) in migrations)
+            {
+                if (appliedChecksums.ContainsKey(name))
                 {
                     continue;
                 }
@@ -162,15 +295,27 @@ public sealed class MigrationRunner(IConfiguration configuration, ILogger<Migrat
 
                 await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
 
-                await using (var migration = new NpgsqlCommand(sql, connection, transaction))
+                try
                 {
-                    await migration.ExecuteNonQueryAsync(cancellationToken);
+                    await using (var migration = new NpgsqlCommand(sql, connection, transaction))
+                    {
+                        await migration.ExecuteNonQueryAsync(cancellationToken);
+                    }
+                }
+                catch (PostgresException ex) when (IsAlreadyExistsConflict(ex))
+                {
+                    // The transaction is rolled back implicitly when the `await using` above disposes
+                    // it without a commit — same as any other exception from this block.
+                    throw new MigrationConflictException(name, ex);
                 }
 
                 await using (var record = new NpgsqlCommand(
-                    "INSERT INTO research.schema_migrations (name) VALUES ($1)", connection, transaction))
+                    "INSERT INTO research.schema_migrations (name, checksum) VALUES ($1, $2)",
+                    connection,
+                    transaction))
                 {
                     record.Parameters.AddWithValue(name);
+                    record.Parameters.AddWithValue(checksum);
                     await record.ExecuteNonQueryAsync(cancellationToken);
                 }
 
@@ -189,8 +334,26 @@ public sealed class MigrationRunner(IConfiguration configuration, ILogger<Migrat
         }
     }
 
+    /// <summary>
+    /// Postgres' "this object already exists" family (DDL run twice, or by hand outside this runner).
+    /// Matched by SqlState first since that is exact; the message-text fallback catches variants the
+    /// fixed code list misses without needing to be exhaustive — false positives here only mean an
+    /// unrelated failure gets the bounded-retry path instead of the indefinite one, which is a longer
+    /// wait, not a wrong answer.
+    /// </summary>
+    private static bool IsAlreadyExistsConflict(PostgresException ex) =>
+        ex.SqlState is
+            PostgresErrorCodes.DuplicateDatabase or
+            PostgresErrorCodes.DuplicateSchema or
+            PostgresErrorCodes.DuplicateTable or
+            PostgresErrorCodes.DuplicateColumn or
+            PostgresErrorCodes.DuplicateObject or
+            PostgresErrorCodes.DuplicateFunction or
+            PostgresErrorCodes.DuplicatePreparedStatement
+        || ex.MessageText.Contains("already exists", StringComparison.OrdinalIgnoreCase);
+
     /// <summary>Embedded migrations in apply order. Names must sort in the intended order.</summary>
-    internal static IReadOnlyList<(string Name, string Sql)> LoadEmbeddedMigrations()
+    internal static IReadOnlyList<(string Name, string Sql, string Checksum)> LoadEmbeddedMigrations()
     {
         var assembly = typeof(MigrationRunner).Assembly;
 
@@ -201,14 +364,26 @@ public sealed class MigrationRunner(IConfiguration configuration, ILogger<Migrat
                 using var stream = assembly.GetManifestResourceStream(name)
                                    ?? throw new InvalidOperationException($"Missing embedded resource {name}.");
                 using var reader = new StreamReader(stream);
+                var sql = reader.ReadToEnd();
 
                 // Recorded under the bare file name, not the full manifest resource name — the
                 // applied-migration history must survive assembly, namespace, and folder renames.
-                return (Name: NormalizeName(name), Sql: reader.ReadToEnd());
+                return (Name: NormalizeName(name), Sql: sql, Checksum: ComputeChecksum(sql));
             })
             .OrderBy(migration => migration.Name, StringComparer.Ordinal)
             .ToArray();
     }
+
+    /// <summary>
+    /// A content fingerprint for a migration's SQL text, used to detect a file that changed after it
+    /// was recorded as applied. SHA-256 over the raw bytes exactly as embedded: no normalisation
+    /// (line-ending, whitespace, or otherwise), because normalising would let a change that alters
+    /// behaviour but happens to survive normalisation slip through undetected — the property this
+    /// exists to guarantee is "the bytes that ran are the bytes on disk", not "the bytes are
+    /// equivalent under some notion of insignificant difference".
+    /// </summary>
+    internal static string ComputeChecksum(string sql) =>
+        Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(sql)));
 
     private static string NormalizeName(string manifestResourceName)
     {

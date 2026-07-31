@@ -83,6 +83,61 @@ public sealed class IbkrOrderBuilderTests
         Assert.Equal(-0.75m, IbkrOrderBuilder.PerSpreadPrice(-1.50m, 2));
     }
 
+    // ---- the per-spread price has to be tradeable ----------------------------------------------
+    //
+    // Verified against TWS 223 on the paper account: a BAG limit that is not a multiple of the legs'
+    // ContractDetails.MinTick is rejected with error 110, "The price does not conform to the minimum
+    // price variation for this contract". A SPY vertical (minTick 0.01) was refused at 0.3333 and
+    // accepted at 0.33. This used to round to four decimal places, which is a price no US option
+    // combo can trade at, so any multi-lot order whose net did not divide evenly was dead on arrival.
+
+    [Fact]
+    public void A_price_that_does_not_divide_evenly_is_snapped_to_a_tradeable_increment()
+    {
+        Assert.Equal(0.33m, IbkrOrderBuilder.PerSpreadPrice(1.00m, 3));
+        Assert.Equal(0.14m, IbkrOrderBuilder.PerSpreadPrice(1.00m, 7));
+    }
+
+    [Fact]
+    public void Snapping_is_never_more_aggressive_than_the_price_asked_for()
+    {
+        // The BAG is always submitted as a BUY with a signed net, so a lower limit is uniformly the
+        // less aggressive one: a debit pays no more than asked, and a credit demands no less.
+        // Nearest-rounding would push about half of all multi-lot orders the other way.
+        Assert.Equal(0.33m, IbkrOrderBuilder.PerSpreadPrice(0.999m, 3));
+        Assert.Equal(-0.34m, IbkrOrderBuilder.PerSpreadPrice(-1.00m, 3));
+        Assert.Equal(-0.34m, IbkrOrderBuilder.PerSpreadPrice(-0.999m, 3));
+    }
+
+    [Fact]
+    public void A_price_already_on_the_increment_is_untouched()
+    {
+        Assert.Equal(1.20m, IbkrOrderBuilder.PerSpreadPrice(2.40m, 2));
+        Assert.Equal(0.05m, IbkrOrderBuilder.PerSpreadPrice(0.15m, 3));
+        Assert.Equal(-0.75m, IbkrOrderBuilder.PerSpreadPrice(-1.50m, 2));
+    }
+
+    [Fact]
+    public void A_coarser_increment_is_honoured_when_supplied()
+    {
+        // SPXW legs report minTick 0.05, and TWS refused an SPXW combo at 0.33 while accepting 0.35 —
+        // so the default is right for equity options and too fine for nickel-quoted index series.
+        Assert.Equal(0.30m, IbkrOrderBuilder.PerSpreadPrice(1.00m, 3, minimumTick: 0.05m));
+        Assert.Equal(-0.35m, IbkrOrderBuilder.PerSpreadPrice(-1.00m, 3, minimumTick: 0.05m));
+    }
+
+    [Fact]
+    public void The_built_order_carries_the_snapped_price()
+    {
+        var order = Order([Leg(100m, OrderSide.Buy, 3), Leg(105m, OrderSide.Sell, 3)], limitPrice: 1.00m);
+
+        var plan = IbkrOrderBuilder.Build(order, ConIds(order), account: null, nonGuaranteed: false);
+
+        Assert.Equal(3, plan.SpreadCount);
+        Assert.Equal(0.33m, plan.NetPricePerSpread);
+        Assert.Equal(0.33d, plan.Order.LmtPrice);
+    }
+
     // ---- full plan ----------------------------------------------------------------------------
 
     [Fact]

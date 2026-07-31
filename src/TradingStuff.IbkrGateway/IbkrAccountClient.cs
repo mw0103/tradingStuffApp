@@ -119,7 +119,8 @@ public sealed class IbkrAccountClient(
 
         var summary = feed.Summary.Values;
         var positionRows = feed.Positions.Rows;
-        var pnl = feed.Pnl?.Latest;
+
+        var pnl = ReadableDailyPnL(feed.Pnl);
 
         var buyingPower = ReadDecimal(summary, account, BuyingPowerTags);
 
@@ -224,8 +225,12 @@ public sealed class IbkrAccountClient(
 
                 foreach (var quote in quotes.Quotes)
                 {
-                    // A quote that settled on a timeout carries zeroed Greeks rather than none at all.
-                    if (quote.Greeks is { Delta: 0m, Gamma: 0m, Theta: 0m, Vega: 0m })
+                    // A quote that settled on a timeout carries zeroed Greeks rather than none at
+                    // all, and the source string is what says which happened. The all-zero check
+                    // stays as a belt-and-braces second reading for any quote source that does not
+                    // carry the marker.
+                    if (QuoteRequest.IsPartial(quote) ||
+                        quote.Greeks is { Delta: 0m, Gamma: 0m, Theta: 0m, Vega: 0m })
                     {
                         continue;
                     }
@@ -261,18 +266,53 @@ public sealed class IbkrAccountClient(
         return (positions, greeksComplete);
     }
 
+    /// <summary>
+    /// The account P&amp;L to report, or null when there is no live stream to report it from.
+    /// </summary>
+    /// <remarks>
+    /// A faulted <see cref="PnLSubscription"/> keeps returning whatever it last received — the
+    /// registry drops the entry on the TWS error that killed it, so nothing overwrites the value
+    /// again. Serving that is worse than serving nothing: <c>MAX_DAILY_LOSS</c> would evaluate a
+    /// figure frozen at the moment TWS stopped talking, while <c>DailyPnLAvailable</c> claimed it
+    /// was current. Absence at least fails the check honestly and shows up in the flag.
+    /// </remarks>
+    internal static AccountPnL? ReadableDailyPnL(PnLSubscription? pnl) =>
+        pnl is { Failure: null } ? pnl.Latest : null;
+
     // ---- the connection-scoped feed -------------------------------------------------------------
 
-    /// <summary>The three open streams, and the connection they belong to.</summary>
+    /// <summary>The three open streams, the request ids they were issued under, and their connection.</summary>
     private sealed record AccountFeed(
         DateTimeOffset ConnectedAt,
         string Account,
+        int SummaryRequestId,
+        int PositionsRequestId,
         AccountSummarySubscription Summary,
         PositionsSubscription Positions,
+        int? PnlRequestId,
         PnLSubscription? Pnl);
+
+    /// <summary>
+    /// How long to leave a P&amp;L stream alone after a failed open before trying again.
+    /// </summary>
+    /// <remarks>
+    /// Retrying on every portfolio refresh would put a <c>PnLTimeoutSeconds</c> wait on the order
+    /// path for as long as TWS refuses to serve P&amp;L, which is the wrong trade for a figure that
+    /// is already reported as unavailable. Long enough not to matter, short enough that a transient
+    /// fault does not disable <c>MAX_DAILY_LOSS</c> for the rest of the connection.
+    /// </remarks>
+    private static readonly TimeSpan PnLRecoveryBackoff = TimeSpan.FromMinutes(5);
 
     private readonly SemaphoreSlim _feedGate = new(1, 1);
     private AccountFeed? _feed;
+    private DateTimeOffset _pnlRetryNotBefore = DateTimeOffset.MinValue;
+
+    // The request ids the three account streams are ALWAYS issued under, allocated once and reused
+    // for the life of the process. See RebuildFeedAsync for why they must not be fresh per rebuild.
+    private bool _streamIdsAllocated;
+    private int _summaryRequestId;
+    private int _positionsRequestId;
+    private int _pnlRequestId;
 
     /// <summary>
     /// Returns the open streams for this account, opening them if this connection has none.
@@ -288,7 +328,7 @@ public sealed class IbkrAccountClient(
         var connectedAt = connection.GetStatus().ConnectedAt
                           ?? throw new IbkrConnectionException("Not connected to TWS.");
 
-        if (IsUsable(_feed, account, connectedAt) is { } live)
+        if (IsUsable(_feed, account, connectedAt) is { } live && !ShouldRetryPnL(live))
         {
             return live;
         }
@@ -297,12 +337,22 @@ public sealed class IbkrAccountClient(
 
         try
         {
+            // Re-checked under the gate: concurrent readers would otherwise each rebuild after
+            // queueing behind the first, and a rebuild is the expensive, TWS-limited path.
             if (IsUsable(_feed, account, connectedAt) is { } settled)
             {
-                return settled;
+                if (!ShouldRetryPnL(settled))
+                {
+                    return settled;
+                }
+
+                var recovered = await ReopenPnLAsync(settled, cancellationToken);
+                _feed = recovered;
+
+                return recovered;
             }
 
-            var feed = await OpenFeedAsync(account, connectedAt, cancellationToken);
+            var feed = await RebuildFeedAsync(account, connectedAt, cancellationToken);
             _feed = feed;
 
             return feed;
@@ -313,7 +363,17 @@ public sealed class IbkrAccountClient(
         }
     }
 
-    /// <summary>The feed, if it belongs to this connection and account and none of its streams died.</summary>
+    /// <summary>
+    /// The feed, if it belongs to this connection and account and neither structural stream died.
+    /// </summary>
+    /// <remarks>
+    /// A dead P&amp;L stream deliberately does NOT invalidate the feed. It is optional by design
+    /// (<see cref="TryOpenPnLAsync"/> degrades to unavailable), and tearing down a healthy summary
+    /// and positions feed to recover it would spend one of TWS's two account-summary request slots
+    /// per attempt. It is handled by re-opening that one stream instead — and until it is,
+    /// <see cref="ReadPortfolioAsync"/> reports P&amp;L as unavailable rather than serving the last
+    /// value it received before the fault.
+    /// </remarks>
     private static AccountFeed? IsUsable(AccountFeed? feed, string account, DateTimeOffset connectedAt) =>
         feed is not null
         && feed.ConnectedAt == connectedAt
@@ -322,6 +382,104 @@ public sealed class IbkrAccountClient(
         && feed.Positions.Failure is null
             ? feed
             : null;
+
+    /// <summary>True when this feed has no live P&amp;L and enough time has passed to try again.</summary>
+    private bool ShouldRetryPnL(AccountFeed feed) =>
+        feed.Pnl is null or { Failure: not null } && DateTimeOffset.UtcNow >= _pnlRetryNotBefore;
+
+    /// <summary>
+    /// Replaces the feed: the previous streams are desubscribed and deregistered first, then
+    /// re-issued under the SAME request ids.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Both halves matter, and the second is the surprising one. Measured against TWS 223 on the
+    /// paper account: TWS permits exactly <b>two</b> account-summary requests per API client and
+    /// counts <em>distinct request ids</em>, not live subscriptions. Issuing a third id — the second
+    /// rebuild of a session — fails with error 322 ("Maximum number of account summary requests
+    /// exceeded; desubscribe to previous request first") and every later id fails the same way, so
+    /// portfolio reads stay broken for the rest of the connection and the risk engine loses its
+    /// inputs. <c>cancelAccountSummary</c> does <em>not</em> free the slot: five cycles of
+    /// cancel-then-subscribe-with-a-fresh-id reproduced 322 on the third exactly as the leaking
+    /// version did. Re-issuing on an id TWS has already seen does work, indefinitely — five
+    /// rebuild cycles of all three streams, no errors.
+    /// </para>
+    /// <para>
+    /// The cancel is still sent, because it is what stops TWS pushing into a subscription nothing
+    /// reads, and it is sent BEFORE the new registration so a late error for the old stream cannot
+    /// fault the replacement registered under the same id. It is skipped when the previous feed
+    /// belongs to a connection that no longer exists — that socket took its subscriptions with it,
+    /// and cancelling a request the current session never made only draws an error back.
+    /// </para>
+    /// </remarks>
+    private async Task<AccountFeed> RebuildFeedAsync(
+        string account,
+        DateTimeOffset connectedAt,
+        CancellationToken cancellationToken)
+    {
+        var registry = connection.Registry;
+        EnsureStreamRequestIds();
+
+        // Cleared before the teardown, so a failure part-way through can never leave a reference to
+        // a feed whose streams have already been cancelled.
+        var previous = _feed;
+        _feed = null;
+
+        if (previous is not null)
+        {
+            registry.Remove(previous.SummaryRequestId);
+            registry.Remove(previous.PositionsRequestId);
+
+            if (previous.PnlRequestId is { } previousPnlId)
+            {
+                registry.Remove(previousPnlId);
+            }
+
+            if (previous.ConnectedAt == connectedAt)
+            {
+                logger.LogInformation(
+                    "Rebuilding the account feed on the live connection; desubscribing the previous streams.");
+
+                await socket.CancelAccountStreamsAsync(
+                    previous.SummaryRequestId, previous.PositionsRequestId, previous.PnlRequestId);
+            }
+        }
+
+        return await OpenFeedAsync(account, connectedAt, cancellationToken);
+    }
+
+    /// <summary>
+    /// The request ids the three account streams are issued under, allocated on first use and never
+    /// reallocated. Call under <see cref="_feedGate"/>.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Allocation is deliberately lazy rather than done in the constructor: ids come from the
+    /// sequence shared with order ids, and one allocated before TWS's <c>nextValidId</c> has raised
+    /// that sequence would sit inside the range TWS's own order ids already occupy, making error
+    /// routing ambiguous.
+    /// </para>
+    /// <para>
+    /// Internal rather than private so a test can assert the ids do not move between rebuilds. That
+    /// is the property TWS's two-request account-summary cap depends on (see
+    /// <see cref="RebuildFeedAsync"/>), and it is otherwise unobservable from outside the gateway
+    /// without a live socket — which is exactly how the leak it replaces went unnoticed.
+    /// </para>
+    /// </remarks>
+    internal (int Summary, int Positions, int Pnl) EnsureStreamRequestIds()
+    {
+        if (!_streamIdsAllocated)
+        {
+            var registry = connection.Registry;
+
+            _summaryRequestId = registry.NextRequestId();
+            _positionsRequestId = registry.NextRequestId();
+            _pnlRequestId = registry.NextRequestId();
+            _streamIdsAllocated = true;
+        }
+
+        return (_summaryRequestId, _positionsRequestId, _pnlRequestId);
+    }
 
     private async Task<AccountFeed> OpenFeedAsync(
         string account,
@@ -332,20 +490,34 @@ public sealed class IbkrAccountClient(
         var timeout = TimeSpan.FromSeconds(_options.RequestTimeoutSeconds);
 
         var summary = new AccountSummarySubscription();
-        var summaryId = registry.NextRequestId();
-        registry.Register(summaryId, summary);
-
-        // "All" rather than the account id: TWS rejects a group naming a single account unless it has
-        // been defined as an account group in TWS itself. Rows are filtered by account on the way out.
-        await socket.ReqAccountSummaryAsync(summaryId, "All", SummaryTags, cancellationToken);
-
         var positions = new PositionsSubscription();
-        var positionsId = registry.NextRequestId();
-        registry.Register(positionsId, positions);
-        await socket.ReqPositionsMultiAsync(positionsId, account, string.Empty, cancellationToken);
 
-        await summary.InitialDelivery.WaitAsync(timeout, cancellationToken);
-        await positions.InitialDelivery.WaitAsync(timeout, cancellationToken);
+        registry.Register(_summaryRequestId, summary);
+        registry.Register(_positionsRequestId, positions);
+
+        try
+        {
+            // "All" rather than the account id: TWS rejects a group naming a single account unless it
+            // has been defined as an account group in TWS itself. Rows are filtered by account on the
+            // way out.
+            await socket.ReqAccountSummaryAsync(_summaryRequestId, "All", SummaryTags, cancellationToken);
+            await socket.ReqPositionsMultiAsync(_positionsRequestId, account, string.Empty, cancellationToken);
+
+            await summary.InitialDelivery.WaitAsync(timeout, cancellationToken);
+            await positions.InitialDelivery.WaitAsync(timeout, cancellationToken);
+        }
+        catch
+        {
+            // A half-open feed must not be left behind. The registry entries would swallow every
+            // later push, and the TWS-side subscriptions would keep running against a client that
+            // has forgotten them.
+            registry.Remove(_summaryRequestId);
+            registry.Remove(_positionsRequestId);
+
+            await socket.CancelAccountStreamsAsync(_summaryRequestId, _positionsRequestId, pnlId: null);
+
+            throw;
+        }
 
         var pnl = await TryOpenPnLAsync(registry, account, cancellationToken);
 
@@ -353,11 +525,49 @@ public sealed class IbkrAccountClient(
             "Opened account streams for the connection established at {ConnectedAt} " +
             "(summary {SummaryId}, positions {PositionsId}, P&L {PnLState}).",
             connectedAt,
-            summaryId,
-            positionsId,
+            _summaryRequestId,
+            _positionsRequestId,
             pnl is null ? "unavailable" : "open");
 
-        return new AccountFeed(connectedAt, account, summary, positions, pnl);
+        return new AccountFeed(
+            connectedAt,
+            account,
+            _summaryRequestId,
+            _positionsRequestId,
+            summary,
+            positions,
+            pnl is null ? null : _pnlRequestId,
+            pnl);
+    }
+
+    /// <summary>
+    /// Replaces a missing or faulted P&amp;L stream on an otherwise healthy feed.
+    /// </summary>
+    /// <remarks>
+    /// Without this, one TWS error against the P&amp;L request id disables <c>MAX_DAILY_LOSS</c> for
+    /// the rest of the connection — the subscription faults, the registry drops it, and nothing ever
+    /// re-opens it. Rate-limited by <see cref="PnLRecoveryBackoff"/> so a permanently unavailable
+    /// P&amp;L does not add its timeout to every portfolio read.
+    /// </remarks>
+    private async Task<AccountFeed> ReopenPnLAsync(AccountFeed feed, CancellationToken cancellationToken)
+    {
+        var registry = connection.Registry;
+
+        // Only the P&L stream is touched — the summary and positions streams are healthy, and a
+        // rebuild of those is the expensive path this method exists to avoid. The cancel goes out
+        // even when the last open failed by timeout: TWS may hold a subscription that never
+        // delivered, and re-issuing on top of it is what the request-id reuse depends on.
+        registry.Remove(_pnlRequestId);
+        await socket.CancelAccountStreamsAsync(summaryId: null, positionsId: null, pnlId: _pnlRequestId);
+
+        var pnl = await TryOpenPnLAsync(registry, feed.Account, cancellationToken);
+
+        if (pnl is not null)
+        {
+            logger.LogInformation("Re-opened the account P&L stream; MAX_DAILY_LOSS has a live figure again.");
+        }
+
+        return feed with { PnlRequestId = pnl is null ? null : _pnlRequestId, Pnl = pnl };
     }
 
     private async Task<PnLSubscription?> TryOpenPnLAsync(
@@ -366,12 +576,11 @@ public sealed class IbkrAccountClient(
         CancellationToken cancellationToken)
     {
         var pnl = new PnLSubscription();
-        var pnlId = registry.NextRequestId();
-        registry.Register(pnlId, pnl);
+        registry.Register(_pnlRequestId, pnl);
 
         try
         {
-            await socket.ReqPnLAsync(pnlId, account, string.Empty, cancellationToken);
+            await socket.ReqPnLAsync(_pnlRequestId, account, string.Empty, cancellationToken);
 
             await pnl.InitialDelivery
                 .WaitAsync(TimeSpan.FromSeconds(_options.PnLTimeoutSeconds), cancellationToken);
@@ -386,7 +595,9 @@ public sealed class IbkrAccountClient(
                 ex,
                 "Daily P&L is unavailable; the MAX_DAILY_LOSS risk check cannot fire on this snapshot.");
 
-            registry.Remove(pnlId);
+            registry.Remove(_pnlRequestId);
+            _pnlRetryNotBefore = DateTimeOffset.UtcNow + PnLRecoveryBackoff;
+
             return null;
         }
     }

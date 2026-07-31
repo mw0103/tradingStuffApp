@@ -596,6 +596,100 @@ ground truth every downstream artifact is validated against (CLAUDE.md class (b)
 observation is not a published schedule. The evidence is recorded in `InstrumentCalendars` for
 whoever writes it. The RTH expectation currently under-flags, which is the safe direction.
 
+### Phase 0-and-earlier adversarial review — 16 confirmed + 1 critic-found, 0 refuted (2026-07-31)
+
+A full adversarial pass over everything on main up to and including Phase 0, **run on Fable by
+explicit instruction** (an in-prompt model directive, per the policy's exception 2): the milestone-1
+execution stack (never before reviewed), the PR #1 gateway core, and the Phase 0 additions. Six
+lenses, a three-lens refutation panel per finding, a completeness critic. 44 raw findings, 16
+verified — and, uniquely across the three reviews so far, **the panel killed nothing**: 16/16
+survived, 7 critical. The never-reviewed money-computing code was exactly where the worst defects
+in the repository were hiding, behind a fully green test suite that exercised the happy path of
+formulas wrong by construction.
+
+**The risk engine approved what it could not price.** The gateway deliberately completes timed-out
+quotes as bid=0/ask=0/Greeks=0 (observed live pre-market), and the evaluator priced those as zero
+risk: a 10-lot credit vertical approved with EstimatedMaxLoss $0 against a $2,500 limit, reproduced
+against built assemblies. The account client and paper engine both already treated zero-filled data
+as untrustworthy; the money check was the one component that did not. Fixed fail-closed — and
+stricter than specified, on the fix agent's own argument: a zero bid on a *sold* leg is not
+conservative (it flips the net across zero and hands a credit spread the debit formula), so the
+rule is per-side: no price on the side the leg trades at → `UNPRICEABLE_LEG`, no figures, rejection.
+
+**Every max-loss formula was quantity-blind, and the shape checks beneath them leaked.** A 1×10
+"vertical" (nine naked short calls, unbounded) was approved at ~$150; the cover check thought one
+long covered ten shorts; and an out-of-range `StrategyKind` bypassed shape validation entirely,
+falling to the evaluator's `_ => Math.Max(0m, netDebit)` arm — a naked strangle at $0. Replaced
+with one quantity-aware defined-risk formula that **does not branch on the sign of the price**
+(exposure is a property of the strikes; the sign branch was reachable by one bad quote), a
+contract-allocating cover check, validator+evaluator both rejecting unknown strategies and unequal
+quantities independently (separate services; neither trusts its caller). The fix agent also found a
+17th defect the review missed: `Multiplier: 0` priced an entire order at $0 and TWS never sees the
+field. Breach codes 12 → 18, centralised in `RiskBreachCodes`, enumerable at `GET /risk/breach-codes`,
+every code now tested at exactly-equal and one-cent-past boundaries.
+
+**Cancel was a fiction for broker-routed orders.** `IOrderRouter` had no cancel operation;
+`POST /orders/{id}/cancel` flipped the local record while the order kept working at TWS — able to
+fill after the operator was told it was dead. The router seam now carries cancel; the IBKR router
+asks the gateway and the record shows **what the broker said** (ordinarily `PendingCancel`, which
+can still fill), with "could not ask" a distinct 502 rather than a 200 with an unchanged order.
+Replace is refused (409) for broker-routed orders — the gateway exposes no replace, and a TWS
+replace is a new `placeOrder` call site nobody should invent without a paper round trip behind it.
+
+**A broker order could exist with zero record.** Nothing persisted before routing. Orders now
+persist `Submitted` before `RouteAsync`, with the crash windows analysed in both orderings —
+record-no-broker-order (visible, reconcilable) is now the failure shape, never the reverse. The
+retry story was rebuilt on a confirmed hole: ExecutionService generated a fresh Guid per submit, so
+the gateway's duplicate-transmission guard had nothing stable to recognise; the internal id is now
+derived from `{AccountId}:{ClientOrderId}`, and a resubmit replays the settled outcome or re-routes
+under the same id. The risk client also still had default HTTP retries — a lost evaluate response
+would retry into `DUPLICATE_ORDER` and permanently burn the id. Both fixed; the duplicate guard is
+now an atomic claim released on rejection, burned only on approval.
+
+**The gateway core, live-verified.** `PacedSocket` resolved the socket BEFORE awaiting budgets, so
+a call parked across a reconnect issued against the dead client — for `placeOrder`, a silent no-op
+behind an already-persisted order map row. All 14 methods now resolve after acquisition, with both
+trading gates inside the protected region. The never-transmitted compensation missed
+`InvalidOperationException`; replaced with a provable discriminator (an about-to-transmit callback)
+so everything before the write compensates by construction. `QuoteSnapshot.Source` gains a
+`-partial` suffix when a field was never received (nullness, not zero-ness, is the discriminator) —
+verified live on after-hours quotes.
+
+**The prescribed account-feed fix was refuted by the broker and replaced.** The review said: cancel
+the previous account-summary subscription before re-issuing. Live TWS proved that wrong — TWS caps
+**distinct request ids** (two per client), and cancelling does not return the slot: cancel-then-
+reissue hit error 322 on the third cycle exactly like never cancelling. Re-issuing on the SAME id
+works indefinitely. Stream ids are now allocated once per process; four feed rebuilds in one live
+session, zero 322s. Two `RequiresTws` tests pin the cap behaviour so nobody "fixes" it back.
+Broker behaviour is not knowledge until a live connection has demonstrated it — this is the
+clearest instance yet.
+
+Also live-measured: SPXW combo limits refuse penny prices (leg `minTick` 0.05 — TWS error 110 at
+0.33, accepted at 0.35), so combo net limits now snap to tick, always downward. The per-leg
+`MinTick` is not yet threaded from `IbkrMarketDataClient` into the builder; an SPXW multi-lot whose
+net does not divide into nickels still draws an honest 110.
+
+**Verification discipline, now with a track record.** Every fix agent ran negative controls
+(reintroduce the defect, watch the test fail, restore), and across the four agents this caught
+**three tests that passed against the defect they claimed to guard**: a race test green 3-runs-in-5
+against check-then-act, a one-attempt HTTP test whose harness never installed the resilience
+handler it opted out of, and one spurious result from siblings rebuilding shared bin/obj. A test
+that has never failed against its defect is decoration; this is now the project standard.
+
+**Operator-visible behaviour changes:** orders against illiquid/pre-market books are rejected
+(`UNPRICEABLE_LEG`) where they were previously approved at $0; replace returns 409 for broker-routed
+orders; cancel reports broker truth (`PendingCancel` can still fill); startup fails fast on
+`Execution:Router=ibkr` with a non-ibkr portfolio source, and on any present-but-unparseable risk
+limit (previously: silent fallback to the loosest defaults in the system). Migration files are now
+checksummed — one edited after application fails startup naming the file.
+
+**Deliberately not fixed:** the account feed does not react to TWS 1101 (values freeze at the blip;
+the rebuild is now safe to trigger, but the wiring adds a pump-thread path the agent could not
+exercise live — flagged, not shipped); per-leg `MinTick` threading (above); live verification of
+the new ExecutionService cancel path end-to-end (markets closed — queued for the Sunday session
+with the multi-lot BAG semantics pin); crossed quotes are still priced (locked/crossed markets are
+legitimately common); Market orders carry no slippage model.
+
 ## Left
 
 Milestone 2 (research platform — sequenced in `docs/plans/ibkr-edge-research-roadmap.md`):

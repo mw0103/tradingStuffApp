@@ -109,7 +109,8 @@ public sealed class TradingWorkflowTests
             new FakePortfolioProvider(SampleOrders.Portfolio(order.AccountId)),
             new PaperOrderRouter(new PaperExecutionEngine()),
             repository,
-            publisher);
+            publisher,
+            ExecutionTestDoubles.Logger<ExecutionWorkflow>());
 
         var response = await workflow.SubmitAsync(order, CancellationToken.None);
         var persisted = await repository.GetAsync(response.OrderId, CancellationToken.None);
@@ -133,7 +134,7 @@ public sealed class TradingWorkflowTests
             "test-quotes");
 
         var repository = new InMemoryOrderRepository();
-        var router = new RecordingOrderRouter();
+        var router = new RecordingOrderRouter(new RoutedOrderResult(OrderLifecycleStatus.Filled, []));
 
         var workflow = new ExecutionWorkflow(
             new OrderRequestValidator(),
@@ -143,59 +144,20 @@ public sealed class TradingWorkflowTests
             router,
             repository,
             new InMemoryExecutionEventPublisher(
-                LoggerFactory.Create(_ => { }).CreateLogger<InMemoryExecutionEventPublisher>()));
+                LoggerFactory.Create(_ => { }).CreateLogger<InMemoryExecutionEventPublisher>()),
+            ExecutionTestDoubles.Logger<ExecutionWorkflow>());
 
         await Assert.ThrowsAsync<PortfolioUnavailableException>(
             () => workflow.SubmitAsync(order, CancellationToken.None));
 
-        Assert.False(router.WasCalled);
+        Assert.Equal(0, router.RouteCount);
         Assert.Empty(await repository.ListAsync(CancellationToken.None));
-    }
-
-    private sealed class FakeMarketDataClient(MarketDataQuoteResponse response) : IMarketDataClient
-    {
-        public Task<MarketDataQuoteResponse> GetQuotesAsync(
-            MarketDataQuoteRequest request,
-            CancellationToken cancellationToken) =>
-            Task.FromResult(response);
-    }
-
-    private sealed class FakeRiskClient(PortfolioRiskEvaluator evaluator) : IRiskClient
-    {
-        public Task<RiskEvaluationResult> EvaluateAsync(
-            RiskEvaluationRequest request,
-            CancellationToken cancellationToken) =>
-            Task.FromResult(evaluator.Evaluate(request));
-    }
-
-    private sealed class FakePortfolioProvider(PortfolioSnapshot portfolio) : IPortfolioProvider
-    {
-        public Task<PortfolioSnapshot> GetPortfolioAsync(string accountId, CancellationToken cancellationToken) =>
-            Task.FromResult(portfolio);
     }
 
     private sealed class UnavailablePortfolioProvider : IPortfolioProvider
     {
         public Task<PortfolioSnapshot> GetPortfolioAsync(string accountId, CancellationToken cancellationToken) =>
             throw new PortfolioUnavailableException("The IBKR gateway is unreachable.");
-    }
-
-    private sealed class RecordingOrderRouter : IOrderRouter
-    {
-        public string Name => "recording";
-
-        public bool WasCalled { get; private set; }
-
-        public Task<RoutedOrderResult> RouteAsync(
-            Guid orderId,
-            SubmitOrderRequest request,
-            IReadOnlyList<QuoteSnapshot> quotes,
-            CancellationToken cancellationToken)
-        {
-            WasCalled = true;
-
-            return Task.FromResult(new RoutedOrderResult(OrderLifecycleStatus.Filled, []));
-        }
     }
 }
 
@@ -243,9 +205,11 @@ internal static class SampleOrders
     public static PortfolioSnapshot Portfolio(string accountId) =>
         new(accountId, 50_000m, 0m, GreeksVector.Zero, []);
 
-    public static IReadOnlyList<QuoteSnapshot> Quotes(SubmitOrderRequest order)
+    public static IReadOnlyList<QuoteSnapshot> Quotes(SubmitOrderRequest order) => QuotesForLegs(order.Legs);
+
+    public static IReadOnlyList<QuoteSnapshot> QuotesForLegs(IReadOnlyList<OrderLegRequest> legs)
     {
-        return order.Legs.Select((leg, index) =>
+        return legs.Select((leg, index) =>
         {
             var isBuy = leg.Side == OrderSide.Buy;
             var absoluteDelta = index == 0 ? 0.80m : 0.20m;

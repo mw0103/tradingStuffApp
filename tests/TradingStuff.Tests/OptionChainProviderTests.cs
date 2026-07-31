@@ -1,5 +1,6 @@
 using System.Net;
 using Microsoft.Extensions.Logging.Abstractions;
+using TradingStuff.Contracts;
 using TradingStuff.MarketDataService;
 
 namespace TradingStuff.Tests;
@@ -68,8 +69,7 @@ public sealed class OptionChainProviderTests
     [Fact]
     public async Task The_deterministic_provider_accepts_and_ignores_the_selectors()
     {
-        var configuration = new Microsoft.Extensions.Configuration.ConfigurationBuilder().Build();
-        var provider = new DeterministicOptionMarketDataProvider(configuration);
+        var provider = new DeterministicOptionMarketDataProvider();
 
         var withSelectors = await provider.GetOptionChainAsync(
             "XYZ", new DateOnly(2026, 9, 18), 3, "XYZW", CancellationToken.None);
@@ -78,5 +78,30 @@ public sealed class OptionChainProviderTests
 
         Assert.Equal(22, withSelectors.Count);
         Assert.Equal(without, withSelectors);
+    }
+
+    // Negative control for the vega sign fix: a prior version gave puts negative vega, so a
+    // straddle's two legs nearly cancelled instead of adding — the exact structure MAX_VEGA exists
+    // to catch. If the sign regresses, this fails; it does not merely pin a numeric snapshot.
+    [Fact]
+    public void A_straddles_net_vega_is_materially_positive()
+    {
+        var provider = new DeterministicOptionMarketDataProvider();
+        var expiration = DateOnly.FromDateTime(DateTime.UtcNow.Date.AddDays(30));
+        var call = new OptionContract("XYZC", "XYZ", expiration, 100m, OptionRight.Call);
+        var put = new OptionContract("XYZP", "XYZ", expiration, 100m, OptionRight.Put);
+
+        var response = provider.GetQuotes(new MarketDataQuoteRequest(
+        [
+            new OrderLegRequest(call, OrderSide.Buy, 1, PositionEffect.Open),
+            new OrderLegRequest(put, OrderSide.Buy, 1, PositionEffect.Open),
+        ]));
+
+        Assert.All(response.Quotes, quote => Assert.True(
+            quote.Greeks.Vega > 0m,
+            $"{quote.Contract.Right} vega must be positive, got {quote.Greeks.Vega}"));
+
+        var netVega = response.Quotes.Sum(quote => quote.Greeks.Vega);
+        Assert.True(netVega > 0.1m, $"expected a straddle's net vega to be materially positive, got {netVega}");
     }
 }
