@@ -1,0 +1,5 @@
+{
+  "appHost": {
+    "path": "src/TradingStuff.AppHost/TradingStuff.AppHost.csproj"
+  }
+}

@@ -1,0 +1,14 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/TradingStuff.AppHost/TradingStuff.AppHost.csproj" />
+    <Project Path="src/TradingStuff.AuditDashboard/TradingStuff.AuditDashboard.csproj" />
+    <Project Path="src/TradingStuff.Contracts/TradingStuff.Contracts.csproj" />
+    <Project Path="src/TradingStuff.ExecutionService/TradingStuff.ExecutionService.csproj" />
+    <Project Path="src/TradingStuff.MarketDataService/TradingStuff.MarketDataService.csproj" />
+    <Project Path="src/TradingStuff.RiskService/TradingStuff.RiskService.csproj" />
+    <Project Path="src/TradingStuff.ServiceDefaults/TradingStuff.ServiceDefaults.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/TradingStuff.Tests/TradingStuff.Tests.csproj" />
+  </Folder>
+</Solution>
