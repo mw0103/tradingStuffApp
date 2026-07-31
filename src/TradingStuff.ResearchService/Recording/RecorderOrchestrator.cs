@@ -99,9 +99,14 @@ public sealed class RecorderOrchestrator(
                 continue;
             }
 
+            // resolution.Exchange, NOT "SMART": SPX and VIX are indices, and an index conId on
+            // SMART is rejected by TWS with error 200 and streams zero ticks (verified live). The
+            // resolver already returns the instrument's real exchange — passing it on is the whole
+            // fix, and discarding it is what previously made SPX/VIX record nothing in silence.
             var request = new SubscriptionLeaseRequest(
                 resolution.ConId, LeasePriority.CoreRecording, RecordToDatabase: true, IsOption: false,
-                GenericTickList: string.Empty, HeartbeatIntervalSeconds: (int)LeaseHeartbeatInterval.TotalSeconds);
+                GenericTickList: string.Empty, HeartbeatIntervalSeconds: (int)LeaseHeartbeatInterval.TotalSeconds,
+                Exchange: resolution.Exchange);
 
             var lease = await gateway.GrantSubscriptionAsync(request, cancellationToken);
 
@@ -148,7 +153,11 @@ public sealed class RecorderOrchestrator(
             var request = new SubscriptionLeaseRequest(
                 assignment.ConId, LeasePriority.CoreRecording, RecordToDatabase: true, IsOption: true,
                 // 100 = per-contract volume, 101 = per-contract open interest, 106 = option IV.
-                GenericTickList: "100,101,106", HeartbeatIntervalSeconds: (int)LeaseHeartbeatInterval.TotalSeconds);
+                GenericTickList: "100,101,106", HeartbeatIntervalSeconds: (int)LeaseHeartbeatInterval.TotalSeconds,
+                // Explicit rather than relying on the default: SMART is genuinely correct for SPX
+                // options (verified live — an SPXW conId on SMART streamed 109 ticks with Greeks),
+                // but it is correct here by fact, not by being the fallback.
+                Exchange: "SMART");
 
             var lease = await gateway.GrantSubscriptionAsync(request, cancellationToken);
 

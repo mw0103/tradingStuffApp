@@ -63,10 +63,23 @@ public sealed class SubscriptionManager : BackgroundService
         var genericTicks = request.GenericTickList ?? string.Empty;
         var now = DateTimeOffset.UtcNow;
 
+        if (string.IsNullOrWhiteSpace(request.Exchange))
+        {
+            // TWS rejects a conId with no exchange outright (error 321, "Please enter exchange"),
+            // so refuse here with a message that names the cause rather than letting it surface as
+            // an opaque broker error on a subscription that then silently records nothing.
+            throw new ArgumentException(
+                $"An exchange is required to subscribe to conId {request.ConId}; TWS rejects a " +
+                "conId-only request. Supply the instrument's real exchange (index conIds are NOT " +
+                "reachable via SMART).",
+                nameof(request));
+        }
+
         var active = new ActiveLease
         {
             LeaseId = leaseId,
             ConId = request.ConId,
+            Exchange = request.Exchange,
             Priority = request.Priority,
             RecordToDatabase = request.RecordToDatabase,
             IsOption = request.IsOption,
@@ -281,7 +294,10 @@ public sealed class SubscriptionManager : BackgroundService
             _connection.Registry.Register(ticker, sink);
         }
 
-        var contract = new IbContract { ConId = active.ConId, Exchange = "SMART" };
+        // Exchange comes from the lease, never a hardcoded "SMART": verified against live paper TWS
+        // that an index conId on SMART is rejected with error 200 and streams zero ticks, while the
+        // same conId on its native exchange (CBOE) streams normally. See SubscriptionLeaseRequest.
+        var contract = new IbContract { ConId = active.ConId, Exchange = active.Exchange };
 
         LineLease lineLease;
 
@@ -346,6 +362,7 @@ public sealed class SubscriptionManager : BackgroundService
 
         public required Guid LeaseId { get; init; }
         public required int ConId { get; init; }
+        public required string Exchange { get; init; }
         public required LeasePriority Priority { get; init; }
         public required bool RecordToDatabase { get; init; }
         public required bool IsOption { get; init; }

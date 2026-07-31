@@ -218,10 +218,23 @@ Key runtime-verified facts (read-only wire probes against paper TWS, 2026-07-31)
   order-map restart survival + never-transmitted compensation + broker-id integrity) run via
   `TRADING_TEST_POSTGRES="Host=...;Username=postgres;Password=..." dotnet test --filter Category=RequiresPostgres`.
 
-### Research platform Phase 1 (milestone 2, 2026-07-31) — DONE
+### Research platform Phase 1 (milestone 2, 2026-07-31) — CODE-COMPLETE, ACCEPTANCE NOT MET
 
-The calendar-critical slice: standing subscriptions, the raw recorder, node selection, and
-coverage measurement are live. The Track B clock has started.
+**Status corrected 2026-07-31.** This section previously said "DONE". That was an overclaim and is
+retracted. Phase 1's own acceptance criterion, written in
+`docs/plans/ibkr-edge-research-roadmap.md`, is *"a full RTH+GTH session at ≥95% coverage, all gaps
+explained, visible in the UI"*. No such session was ever recorded. The phase was marked done on
+unit and Postgres tests alone — **not one line of the recorder had ever run against TWS.**
+
+That was not a bookkeeping slip. It let a fatal defect ship undetected: the recorder subscribed
+with a bare conId and a hardcoded `Exchange = "SMART"`, which TWS **rejects for index conIds with
+error 200**, so SPX and VIX — two of the three core underlyings, including the price series the
+entire research programme depends on — recorded **nothing at all**, silently. Every unit test
+passed the whole time, because they all stub the socket. Found only when a live probe was finally
+run (see the Phase 2 entry). **The Track B recording clock had not actually started.**
+
+The code below is written and unit/Postgres-tested. Treat it as unverified against the broker
+until a live session has been recorded end to end.
 
 - **Migration 003**: `research.option_nodes` (54-row registered grid, 6 DTE buckets × 9 delta
   nodes, seeded in SQL), `research.node_assignments` (role → conId over time, `assigned_from`/
