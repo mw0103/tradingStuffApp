@@ -16,11 +16,18 @@ var ibkrClientId = builder.AddParameter("ibkr-client-id", "11", publishValueAsDe
 // Set to 1 for live data once the account has market data subscriptions.
 var ibkrMarketDataType = builder.AddParameter("ibkr-market-data-type", "3", publishValueAsDefault: true);
 
-var postgres = builder.AddContainer("postgres", "postgres", "17")
-    .WithEnvironment("POSTGRES_USER", "trading")
-    .WithEnvironment("POSTGRES_PASSWORD", "trading")
-    .WithEnvironment("POSTGRES_DB", "trading")
-    .WithEndpoint(port: 5432, targetPort: 5432, name: "tcp");
+// A real Aspire Postgres resource, not a bare container: it produces the connection string that the
+// gateway (order-id map, raw recording) and ResearchService (everything derived) actually consume.
+var postgresUser = builder.AddParameter("postgres-user", "trading", publishValueAsDefault: true);
+var postgresPassword = builder.AddParameter("postgres-password", "trading", publishValueAsDefault: true);
+
+var postgres = builder.AddPostgres("postgres", postgresUser, postgresPassword)
+    .WithImageTag("17")
+    .WithHostPort(5432);
+
+// POSTGRES_USER=trading makes initdb create a database named "trading"; MigrationRunner also
+// creates it defensively if a different server is pointed at.
+var tradingDb = postgres.AddDatabase("trading");
 
 var rabbitmq = builder.AddContainer("rabbitmq", "rabbitmq", "4-management")
     .WithEnvironment("RABBITMQ_DEFAULT_USER", "trading")
@@ -44,7 +51,10 @@ var ibkrGateway = builder.AddProject(
     .WithEnvironment("IBKR__Host", ibkrHost)
     .WithEnvironment("IBKR__Port", ibkrPort)
     .WithEnvironment("IBKR__ClientId", ibkrClientId)
-    .WithEnvironment("IBKR__MarketDataType", ibkrMarketDataType);
+    .WithEnvironment("IBKR__MarketDataType", ibkrMarketDataType)
+    // The order-id map. No WaitFor(postgres): the gateway starts and serves market data without a
+    // database; only order-mapping persistence degrades (loudly) when Postgres is down.
+    .WithReference(tradingDb);
     // IBKR__AllowLiveTrading is deliberately not set here. It defaults to false, so a non-DU
     // account cannot trade; enabling live trading must be a conscious, per-environment decision.
 
@@ -90,6 +100,16 @@ var execution = builder.AddProject(
     .WaitFor(rabbitmq)
     .WaitFor(postgres)
     .WaitFor(keycloak);
+
+// Research plane: schema migrations, capability registry, and (from Phase 1) recorder
+// orchestration, features, labels, and studies. Owns ALL schema, including gateway.* tables.
+builder.AddProject(
+        "researchservice",
+        "../TradingStuff.ResearchService/TradingStuff.ResearchService.csproj")
+    .WithExternalHttpEndpoints()
+    .WithEnvironment("Authentication__DevelopmentToken", devInternalToken)
+    .WithReference(tradingDb)
+    .WaitFor(postgres);
 
 builder.AddProject(
         "auditdashboard",

@@ -2,8 +2,8 @@
 
   <ItemGroup>
     <ProjectReference Include="..\TradingStuff.Contracts\TradingStuff.Contracts.csproj" />
+    <ProjectReference Include="..\TradingStuff.ResearchContracts\TradingStuff.ResearchContracts.csproj" />
     <ProjectReference Include="..\TradingStuff.ServiceDefaults\TradingStuff.ServiceDefaults.csproj" />
-    <ProjectReference Include="..\..\third_party\IBApi\IBApi.csproj" />
   </ItemGroup>
 
   <ItemGroup>
@@ -17,8 +17,11 @@
   </PropertyGroup>
 
   <ItemGroup>
-    <!-- Tick accumulation and request correlation are internal but are exactly the logic most worth
-         unit-testing, since they are hard to exercise without a live TWS. -->
+    <!-- Migrations ship inside the binary and are applied in name order by MigrationRunner. -->
+    <EmbeddedResource Include="Persistence\Migrations\*.sql" />
+  </ItemGroup>
+
+  <ItemGroup>
     <InternalsVisibleTo Include="TradingStuff.Tests" />
   </ItemGroup>
 

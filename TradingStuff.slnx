@@ -6,6 +6,8 @@
     <Project Path="src/TradingStuff.ExecutionService/TradingStuff.ExecutionService.csproj" />
     <Project Path="src/TradingStuff.IbkrGateway/TradingStuff.IbkrGateway.csproj" />
     <Project Path="src/TradingStuff.MarketDataService/TradingStuff.MarketDataService.csproj" />
+    <Project Path="src/TradingStuff.ResearchContracts/TradingStuff.ResearchContracts.csproj" />
+    <Project Path="src/TradingStuff.ResearchService/TradingStuff.ResearchService.csproj" />
     <Project Path="src/TradingStuff.RiskService/TradingStuff.RiskService.csproj" />
     <Project Path="src/TradingStuff.ServiceDefaults/TradingStuff.ServiceDefaults.csproj" />
   </Folder>

@@ -11,7 +11,7 @@ Greenfield .NET Aspire trading microservice workspace focused on paper options e
 - C# audit dashboard with local operator links.
 - Shared contracts for options, multileg orders, quotes, fills, risk decisions, and lifecycle events.
 - Aspire AppHost wiring for Postgres, RabbitMQ, Keycloak, TWS connection parameters, and all services.
-- xUnit coverage (125 tests) for strategy validation, risk rejection, fills, workflow orchestration, and the IBKR adapter logic.
+- xUnit coverage (149 tests) for strategy validation, risk rejection, fills, workflow orchestration, and the IBKR adapter logic.
 
 ## Run
 

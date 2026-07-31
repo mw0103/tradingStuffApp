@@ -1,6 +1,8 @@
 using Microsoft.AspNetCore.Mvc;
 using TradingStuff.Contracts;
 using TradingStuff.IbkrGateway;
+using TradingStuff.IbkrGateway.Pacing;
+using TradingStuff.IbkrGateway.Persistence;
 using TradingStuff.ServiceDefaults;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -9,10 +11,18 @@ builder.AddServiceDefaults();
 
 builder.Services.Configure<IbkrOptions>(builder.Configuration.GetSection(IbkrOptions.SectionName));
 
+builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<IbkrRequestRegistry>();
 builder.Services.AddSingleton<IbkrClientWrapper>();
 builder.Services.AddSingleton<IbkrConnection>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<IbkrConnection>());
+
+// Every outbound socket call flows through the governor via PacedSocket — TWS enforces its pacing
+// limits by disconnecting, so nothing is allowed to talk to the wire directly.
+builder.Services.AddSingleton<IbkrPacingGovernor>();
+builder.Services.AddSingleton<PacedSocket>();
+builder.Services.AddSingleton<OrderIdStore>();
+
 builder.Services.AddSingleton<IbkrMarketDataClient>();
 builder.Services.AddSingleton<IbkrOrderTracker>();
 builder.Services.AddSingleton<IbkrOrderClient>();
@@ -28,6 +38,9 @@ app.UseAuthentication();
 app.UseAuthorization();
 
 app.MapGet("/ibkr/status", (IbkrConnection connection) => Results.Ok(connection.GetStatus()))
+    .RequireAuthorization();
+
+app.MapGet("/ibkr/pacing", (IbkrPacingGovernor governor) => Results.Ok(governor.GetLineBudget()))
     .RequireAuthorization();
 
 app.MapPost("/ibkr/contracts/resolve", async (
@@ -234,20 +247,28 @@ app.MapGet("/ibkr/orders/{ibkrOrderId:int}", (int ibkrOrderId, IbkrOrderClient o
         orders.Get(ibkrOrderId) is { } state ? Results.Ok(state) : Results.NotFound())
     .RequireAuthorization();
 
-app.MapPost("/ibkr/orders/{ibkrOrderId:int}/cancel", (
+app.MapPost("/ibkr/orders/{ibkrOrderId:int}/cancel", async (
         int ibkrOrderId,
         CancelOrderRequest request,
-        IbkrOrderClient orders) =>
+        IbkrOrderClient orders,
+        CancellationToken cancellationToken) =>
     {
         try
         {
-            return orders.Cancel(ibkrOrderId, request.Reason) is { } state
+            return await orders.CancelAsync(ibkrOrderId, request.Reason, cancellationToken) is { } state
                 ? Results.Ok(state)
                 : Results.NotFound();
         }
         catch (InvalidOperationException ex)
         {
             return Results.Problem(title: "Cancel refused.", detail: ex.Message, statusCode: StatusCodes.Status409Conflict);
+        }
+        catch (IbkrConnectionException ex)
+        {
+            return Results.Problem(
+                title: "Not connected to TWS.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status503ServiceUnavailable);
         }
     })
     .RequireAuthorization();

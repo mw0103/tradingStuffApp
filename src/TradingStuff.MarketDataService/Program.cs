@@ -52,12 +52,15 @@ app.MapPost("/market-data/options/quotes", async (
 app.MapGet("/market-data/options/chains/{underlying}", async (
         string underlying,
         string? expiration,
+        int? window,
+        string? tradingClass,
         IOptionMarketDataProvider provider,
         CancellationToken cancellationToken) =>
     {
         DateOnly? target = DateOnly.TryParse(expiration, out var parsed) ? parsed : null;
 
-        return Results.Ok(await provider.GetOptionChainAsync(underlying, target, cancellationToken));
+        return Results.Ok(await provider.GetOptionChainAsync(
+            underlying, target, window, tradingClass, cancellationToken));
     })
     .RequireAuthorization();
 

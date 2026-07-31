@@ -7,7 +7,7 @@ Updated: 2026-07-31
 - Aspire/.NET solution scaffolded.
 - Execution, risk, market-data, audit dashboard, contracts, service defaults, and AppHost projects created.
 - Paper options workflow implemented with strategy validation, Greeks-aware risk, deterministic quotes, fills, lifecycle events, and local auth.
-- Tests pass: 125/125. Full solution builds.
+- Tests pass: 149/149 (plus 5 Postgres-gated integration tests). Full solution builds.
 
 ### IBKR integration (stages 1-4 and 6 of `.claude/skills/ibkr/references/migration-plan.md`)
 
@@ -186,14 +186,43 @@ Key runtime-verified facts (read-only wire probes against paper TWS, 2026-07-31)
 - Historical bar timestamps arrive exchange-local with `formatDate=1`; research ingestion will use
   `formatDate=2` (epoch) exclusively.
 
+### Research platform Phase 0 (milestone 2, 2026-07-31) — DONE
+
+- **Pacing governor** (`IbkrGateway/Pacing/`): every outbound socket call now flows through
+  `PacedSocket` → `IbkrPacingGovernor`. Budgets ~10% inside TWS's documented limits: 45 msg/s
+  token bucket (order placement/cancel jumps the queue but still consumes tokens), historical
+  window 54/10 min with BID_ASK counting double + 15 s identical-request cooldown + 5-per-2s
+  same-contract limit (throws `IbkrPacingRejectedException` with `RetryAfter` when the wait would
+  exceed the acquire timeout — the future backfill coordinator's 429), and a market-data **line
+  ledger** capped at 90 of the account's 100 with 10 lines reserved for execution-class transient
+  quotes. The previously unbounded quote fan-out now queues at the ledger instead of blowing the
+  account cap. Metrics on Meter `TradingStuff.IbkrGateway`; `GET /ibkr/pacing` reports the ledger.
+- **Broker order-id persistence** (`gateway.ibkr_order_map` + `Persistence/OrderIdStore.cs`): the
+  internal-order → broker-order mapping is written BEFORE `placeOrder` and consulted on every
+  placement, so a caller retry after a gateway restart is refused instead of transmitting a second
+  live order (verified by an integration test that restarts the store). Postgres-down degrades
+  loudly (LogCritical) unless `IBKR:RequireOrderPersistence=true`, which refuses orders instead.
+  Cancel no longer requires the trading gate — cancelling reduces risk and must work exactly when
+  the gate slams shut.
+- **Postgres wired for real**: AppHost `AddPostgres`/`AddDatabase("trading")` (was a decorative
+  `AddContainer`), connection string referenced by the gateway and the new
+  **TradingStuff.ResearchService**, whose advisory-locked `MigrationRunner` owns ALL schema
+  (including `gateway.*`) via embedded ordered migrations. Migration 001: schemas, seeded
+  `research.instruments`, `research.capability_probes`, `gateway.ibkr_order_map`. Migration 002:
+  the 2026-07-31 probe session persisted as ~26 capability rows (`GET /research/capabilities`).
+  New `TradingStuff.ResearchContracts` project for research-domain records.
+- **`IbkrOptionMarketDataProvider` param fix**: `window` and `tradingClass` now survive the
+  MarketDataService hop, so SPXW is reachable without calling the gateway directly.
+- Tests: 125 → **149** (pacing budgets under `FakeTimeProvider`, provider forwarding, migration
+  set), plus 5 `Category=RequiresPostgres` integration tests (migration idempotency + probe seed +
+  order-map restart survival + never-transmitted compensation + broker-id integrity) run via
+  `TRADING_TEST_POSTGRES="Host=...;Username=postgres;Password=..." dotnet test --filter Category=RequiresPostgres`.
+
 ## Left
 
 Milestone 2 (research platform — sequenced in `docs/plans/ibkr-edge-research-roadmap.md`):
 
-- Phase 0: Postgres wiring (`AddPostgres` + Npgsql + migrations), gateway pacing governor (also a
-  milestone-1 debt: the quote fan-out is unpaced), order-id persistence (`ibkr_order_map`),
-  `IbkrOptionMarketDataProvider` window/tradingClass param fix, capability-probe persistence.
-- Phase 1: standing subscription leases + line ledger, SPX surface recorder + node selection +
+- Phase 1: standing subscription leases + SPX surface recorder + node selection +
   coverage monitoring (calendar-critical — option data is perishable).
 - Phase 2: session calendar, historical client, resumable backfill (SPX/SPY/VIX/ES), gap detection.
 - Phases 3–8: snapshots → features/labels/baselines/study runner → residual models →

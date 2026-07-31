@@ -1,9 +1,14 @@
+using TradingStuff.IbkrGateway.Pacing;
+
 namespace TradingStuff.IbkrGateway;
 
 /// <summary>Connection and behaviour settings for the single TWS/IB Gateway socket.</summary>
 public sealed class IbkrOptions
 {
     public const string SectionName = "IBKR";
+
+    /// <summary>Pacing budgets enforced by <see cref="IbkrPacingGovernor"/>.</summary>
+    public IbkrPacingOptions Pacing { get; set; } = new();
 
     /// <summary>Host running TWS or IB Gateway. It must list this machine under Trusted IPs.</summary>
     public string Host { get; set; } = "127.0.0.1";
@@ -25,6 +30,13 @@ public sealed class IbkrOptions
     /// in AppHost, appsettings, or test fixtures. Data paths ignore it; order placement requires it.
     /// </summary>
     public bool AllowLiveTrading { get; set; }
+
+    /// <summary>
+    /// When true, an order is refused unless its internal-order → broker-order mapping was durably
+    /// persisted first. Off by default so a paper gateway still trades with Postgres down; turn it
+    /// on for any account where an orphaned live order is unacceptable.
+    /// </summary>
+    public bool RequireOrderPersistence { get; set; }
 
     /// <summary>1 live, 2 frozen, 3 delayed, 4 delayed-frozen. Delayed needs no OPRA subscription.</summary>
     public int MarketDataType { get; set; } = 3;

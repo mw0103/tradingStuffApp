@@ -87,6 +87,19 @@ public sealed class IbkrOrderTracker(ILogger<IbkrOrderTracker> logger)
     public IbkrOrderState? FindByInternalOrderId(Guid internalOrderId) =>
         _orderIdByInternalId.TryGetValue(internalOrderId, out var ibkrOrderId) ? Get(ibkrOrderId) : null;
 
+    /// <summary>
+    /// Releases a claim taken by <see cref="TryTrack"/> when the order provably never reached the
+    /// wire, so a retry of the same internal order may place. Only removes the exact pairing it is
+    /// given — a transmitted order's claim can never be released by a stray compensation.
+    /// </summary>
+    internal void Untrack(int ibkrOrderId, Guid internalOrderId)
+    {
+        if (_orderIdByInternalId.TryRemove(KeyValuePair.Create(internalOrderId, ibkrOrderId)))
+        {
+            _orders.TryRemove(ibkrOrderId, out _);
+        }
+    }
+
     // ---- open order reconciliation ----------------------------------------------------------
     // reqAllOpenOrders carries no request id, and neither do openOrder/openOrderEnd, so this cannot
     // go through the id-keyed registry — it needs a single dedicated slot.
