@@ -5,6 +5,14 @@ using TradingStuff.ResearchService.Gateway;
 
 namespace TradingStuff.ResearchService.Backfill;
 
+/// <summary>
+/// One <c>research.backfill_requests</c> row reduced to what <c>GapDetector</c> needs: enough to
+/// derive its nominal [start, end) window and to explain a shortfall found under it. Deliberately not
+/// <see cref="ClaimedSlice"/> — that record carries claim/lease fields no read-only report should
+/// touch, and this one omits <c>request_id</c> because gap analysis never writes back to a row.
+/// </summary>
+public sealed record BackfillRequestWindowRow(DateTimeOffset EndTimeUtc, string Duration, string State, int Attempts);
+
 /// <summary>A slice this coordinator instance currently owns the lease on.</summary>
 public sealed record ClaimedSlice(
     long RequestId,
@@ -788,6 +796,146 @@ public sealed class BackfillStore(IConfiguration configuration, ILogger<Backfill
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
 
         return await reader.ReadAsync(cancellationToken) && reader.GetInt64(0) > 0 && reader.GetInt64(1) == 0;
+    }
+
+    // ---- gap detection --------------------------------------------------------------------------
+
+    /// <summary>
+    /// Every <c>research.backfill_requests</c> row for a job, reduced to what <c>GapArithmetic</c>
+    /// needs to derive its nominal window and outcome.
+    /// </summary>
+    /// <remarks>
+    /// NULL-anchored rows (<c>end_time_utc IS NULL</c>) are excluded: only a hand-inserted row is ever
+    /// NULL-anchored (the coordinator refuses to write one — see migration 005), and there is no
+    /// window to derive from "whenever this runs". Excluding it is the conservative direction — such a
+    /// row contributes nothing toward "this range is covered", so at worst a range shows up as
+    /// <see cref="GapBasis.NotRequested"/> rather than being wrongly cleared by a request that cannot
+    /// actually be replayed. <c>GET /research/backfill</c>'s <c>NowAnchoredCount</c> already surfaces
+    /// such a row so it is never simply invisible.
+    /// </remarks>
+    public async Task<IReadOnlyList<BackfillRequestWindowRow>> GetRequestWindowsAsync(
+        long jobId, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+
+        await using var command = new NpgsqlCommand(
+            "SELECT end_time_utc, duration, state, attempts FROM research.backfill_requests " +
+            "WHERE job_id = $1 AND end_time_utc IS NOT NULL",
+            connection);
+        command.Parameters.AddWithValue(jobId);
+
+        var rows = new List<BackfillRequestWindowRow>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            rows.Add(new BackfillRequestWindowRow(
+                reader.GetFieldValue<DateTimeOffset>(0), reader.GetString(1), reader.GetString(2), reader.GetInt32(3)));
+        }
+
+        return rows;
+    }
+
+    /// <summary>
+    /// Trading dates in [<paramref name="fromUtc"/>, <paramref name="toUtc"/>) that have at least one
+    /// landed daily bar for this exact (con_id, what_to_show, bar_size, use_rth) key.
+    /// </summary>
+    /// <remarks>
+    /// Filters on <c>ts_utc</c>, not <c>trading_date</c>, even though the caller wants dates: a daily
+    /// bar's <c>ts_utc</c> is exactly its trading date's UTC midnight (see migration 004 and
+    /// <see cref="LandBarsAsync"/>), so the two filters select an identical row set, but <c>ts_utc</c>
+    /// is the trailing column of <c>research.bars</c>'s primary key and <c>trading_date</c> is not —
+    /// this is what lets the equality prefix (con_id, what_to_show, bar_size, use_rth) plus a genuine
+    /// index range scan answer the query, rather than a full filter pass over every row for the key.
+    /// This alone does not decide which dates are MISSING — the caller compares the returned set
+    /// against the full expected trading-date list, which is where the absent-row check actually
+    /// happens (a date this query never mentions is exactly a date with nothing landed).
+    /// </remarks>
+    public async Task<HashSet<DateOnly>> GetLandedTradingDatesAsync(
+        int conId, string whatToShow, string barSize, bool useRth,
+        DateTimeOffset fromUtc, DateTimeOffset toUtc, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+
+        await using var command = new NpgsqlCommand(
+            "SELECT DISTINCT trading_date FROM research.bars " +
+            "WHERE con_id = $1 AND what_to_show = $2 AND bar_size = $3 AND use_rth = $4 " +
+            "  AND trading_date IS NOT NULL AND ts_utc >= $5 AND ts_utc < $6",
+            connection);
+        command.Parameters.AddWithValue(conId);
+        command.Parameters.AddWithValue(whatToShow);
+        command.Parameters.AddWithValue(barSize);
+        command.Parameters.AddWithValue(useRth);
+        command.Parameters.AddWithValue(fromUtc);
+        command.Parameters.AddWithValue(toUtc);
+
+        var dates = new HashSet<DateOnly>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            dates.Add(reader.GetFieldValue<DateOnly>(0));
+        }
+
+        return dates;
+    }
+
+    /// <summary>
+    /// Landed bar counts for this exact (con_id, what_to_show, bar_size, use_rth) key, one count per
+    /// caller-supplied [from, to) window, in the SAME order the windows were given.
+    /// </summary>
+    /// <remarks>
+    /// <b>This is where the negative claim for intraday bar sizes is measured, and this is the
+    /// absent-row check.</b> <c>LEFT JOIN</c>, not a <c>GROUP BY</c> starting from
+    /// <c>research.bars</c>: the expected set — every session window the calendar says should have
+    /// bars — is materialised FIRST via <c>unnest(...) WITH ORDINALITY</c>, and reality is joined onto
+    /// it. A window with zero landed bars still produces a row (<c>count = 0</c> via <c>count(b.ts_utc)</c>,
+    /// which ignores the LEFT JOIN's NULL-extended columns) at its own ordinal position; a
+    /// <c>GROUP BY</c> starting from the bars table cannot emit a row for a window that landed nothing,
+    /// which is precisely the worst case a gap report exists to catch. The caller never needs to
+    /// special-case "missing from the result" because there is no such case: the returned array always
+    /// has exactly <c>windowFrom.Count</c> entries.
+    /// </remarks>
+    public async Task<int[]> GetLandedBarCountsAsync(
+        int conId, string whatToShow, string barSize, bool useRth,
+        IReadOnlyList<DateTimeOffset> windowFrom, IReadOnlyList<DateTimeOffset> windowTo,
+        CancellationToken cancellationToken)
+    {
+        if (windowFrom.Count == 0)
+        {
+            return [];
+        }
+
+        await using var connection = await OpenAsync(cancellationToken);
+
+        await using var command = new NpgsqlCommand(
+            """
+            SELECT s.idx, count(b.ts_utc)
+            FROM unnest($1::timestamptz[], $2::timestamptz[]) WITH ORDINALITY AS s(from_utc, to_utc, idx)
+            LEFT JOIN research.bars b
+                   ON b.con_id = $3 AND b.what_to_show = $4 AND b.bar_size = $5 AND b.use_rth = $6
+                  AND b.ts_utc >= s.from_utc AND b.ts_utc < s.to_utc
+            GROUP BY s.idx
+            """,
+            connection);
+
+        AddArray(command, windowFrom.ToArray(), NpgsqlDbType.TimestampTz);
+        AddArray(command, windowTo.ToArray(), NpgsqlDbType.TimestampTz);
+        command.Parameters.AddWithValue(conId);
+        command.Parameters.AddWithValue(whatToShow);
+        command.Parameters.AddWithValue(barSize);
+        command.Parameters.AddWithValue(useRth);
+
+        var counts = new int[windowFrom.Count];
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            // WITH ORDINALITY is 1-based.
+            counts[(int)reader.GetInt64(0) - 1] = (int)reader.GetInt64(1);
+        }
+
+        return counts;
     }
 
     // ---- helpers ------------------------------------------------------------------------------

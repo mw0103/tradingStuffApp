@@ -132,23 +132,84 @@ public sealed record BackfillCheckpoint(
     DateTimeOffset? LowWaterMarkUtc);
 
 /// <summary>
-/// A range with no landed bars, and why it is believed to be a gap rather than simply unattempted.
+/// A span of a backfill job's OWN declared range where the bars the session calendar says should
+/// exist do not fully match what has landed in <c>research.bars</c>. Produced by the gap detector
+/// (package 2f) by comparing expected sessions × expected bars against landed ones; this record
+/// itself has no opinion about severity, only about WHY the shortfall exists — see
+/// <see cref="GapBasis"/>.
 /// </summary>
 /// <param name="Basis">
-/// Explains WHY this range counts as a gap — see <see cref="GapBasis"/> for the known values.
-/// Distinguishing "no_bars" (TWS returned nothing here) from "session_expected" (a session row from
-/// <c>research.sessions</c> says trading should have happened here) matters because the latter is a
-/// stronger signal something is actually missing, while the former can be a legitimate closed
-/// market or a request that has simply not been attempted yet.
+/// Explains WHY this range is reported — see <see cref="GapBasis"/> for the known values. Ranges from
+/// entirely benign (<see cref="GapBasis.Pending"/>: the coordinator has not gotten here yet) to the
+/// one basis that names an actual defect (<see cref="GapBasis.SucceededButAbsent"/>: the checkpoint
+/// says this range succeeded, and <c>research.bars</c> disagrees). A caller that wants "is this
+/// backfill actually complete" rather than "what does every range's checkpoint say" should treat
+/// anything other than <see cref="GapBasis.Empty"/> and <see cref="GapBasis.Permanent"/> as unresolved.
 /// </param>
 public sealed record GapRange(DateTimeOffset From, DateTimeOffset To, string Basis);
 
-/// <summary>Known values for <see cref="GapRange.Basis"/>. Stored as free text; not exhaustive.</summary>
+/// <summary>
+/// Known values for <see cref="GapRange.Basis"/>. Stored as free text rather than an enum — the same
+/// reasoning <see cref="BackfillRequestState"/>'s doc comment gives: an ad-hoc query against a gap
+/// report reads directly, and the set is explicitly "known values", not exhaustive.
+/// </summary>
+/// <remarks>
+/// Every basis but <see cref="NotRequested"/> names the state of the <c>research.backfill_requests</c>
+/// row(s) that nominally cover the range; <see cref="NotRequested"/> is for when no row covers it at
+/// all, and <see cref="SucceededButAbsent"/> is not a request state but a comparison BETWEEN a
+/// <see cref="BackfillRequestState.Succeeded"/> row and the bars that should have landed under it. When
+/// more than one covering row applies to the same range — rare; only a historical job's newest slice
+/// is allowed to overlap its neighbour — the most alarming basis wins rather than an arbitrary one.
+/// </remarks>
 public static class GapBasis
 {
-    /// <summary>A backfill request covering this range came back with zero bars.</summary>
-    public const string NoBars = "no_bars";
+    /// <summary>
+    /// No <c>research.backfill_requests</c> row's nominal window covers this range at all — the
+    /// coordinator has not reached it yet, or the job's planner never ran. Per the absent-row
+    /// discipline this whole report exists to apply, a job with ZERO request rows must still produce
+    /// this basis across its entire window rather than an empty, falsely-clean gap list.
+    /// </summary>
+    public const string NotRequested = "not_requested";
 
-    /// <summary>A <c>research.sessions</c> row says a session covered this range, but no bars land in it.</summary>
-    public const string SessionExpected = "session_expected";
+    /// <summary>Covered by a request row still <see cref="BackfillRequestState.Pending"/>.</summary>
+    public const string Pending = "pending";
+
+    /// <summary>Covered by a request row currently <see cref="BackfillRequestState.Inflight"/>.</summary>
+    public const string Inflight = "inflight";
+
+    /// <summary>
+    /// Covered by a request row that is <see cref="BackfillRequestState.Failed"/> but has not yet
+    /// exhausted its retry budget — distinct from <see cref="Exhausted"/>, which has.
+    /// </summary>
+    public const string Retrying = "retrying";
+
+    /// <summary>
+    /// Covered only by request row(s) that failed and hit the attempt cap. Unlike <see cref="Empty"/>
+    /// and <see cref="Permanent"/> this is NOT explained: the coordinator gave up without a confirmed
+    /// reason the data does not exist, and the range needs a human decision (raise the attempt cap,
+    /// investigate the recorded error, or accept the loss).
+    /// </summary>
+    public const string Exhausted = "exhausted";
+
+    /// <summary>
+    /// Covered by a request row TWS confirmed has no data (<see cref="BackfillRequestState.Empty"/>).
+    /// Explained, not missing — a genuine market-closed stretch or a range before the instrument's
+    /// real data floor.
+    /// </summary>
+    public const string Empty = "empty";
+
+    /// <summary>
+    /// Covered by a request row TWS rejected in a way retrying cannot fix
+    /// (<see cref="BackfillRequestState.Permanent"/>). Explained, not missing.
+    /// </summary>
+    public const string Permanent = "permanent";
+
+    /// <summary>
+    /// The alarming case: a request row says <see cref="BackfillRequestState.Succeeded"/> for this
+    /// range, and <c>research.bars</c> has no (or an incomplete count of) matching rows anyway. Every
+    /// other basis describes an EXPECTED shortfall; this one means the checkpoint and the data
+    /// disagree — the write path that is supposed to make "succeeded" and "bars landed" atomic did
+    /// not, for a request this detector can name.
+    /// </summary>
+    public const string SucceededButAbsent = "succeeded_but_absent";
 }

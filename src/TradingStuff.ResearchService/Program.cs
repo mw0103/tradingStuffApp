@@ -67,6 +67,12 @@ builder.Services.AddSingleton<BackfillStore>();
 builder.Services.AddSingleton<BackfillCoordinator>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<BackfillCoordinator>());
 
+// Gap detection reads research.backfill_requests/research.bars through BackfillStore and sessions
+// through ISessionClock; it has no state of its own and no hosted loop — it is a report computed
+// on demand, the same shape as CoverageMonitor.
+builder.Services.Configure<GapOptions>(builder.Configuration.GetSection("Gaps"));
+builder.Services.AddSingleton<GapDetector>();
+
 // Seeds the ES job's per-contract request rows (BackfillJobCatalog deliberately excludes ES — a
 // CONTFUT cannot page a past endDateTime, so it must be walked contract-by-contract); the
 // coordinator above drains whatever this seeds with no change of its own, since a request row's
@@ -305,6 +311,53 @@ app.MapGet("/research/backfill", async (
         {
             return Results.Problem(
                 title: "Could not read backfill progress.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+    });
+
+// Compares each backfill job's OWN declared range — expected sessions × expected bars, from the
+// session calendar — against what actually landed, and reports the mismatch as labelled GapRange
+// entries. "Empty or explained" is the roadmap's own acceptance criterion for this (Phase 2 item g).
+//
+// Every job in research.backfill_jobs is reported, including one this detector cannot check (no
+// resolved conId, an unmapped instrument, an unsupported bar size) — it appears with a CheckStatus
+// other than "checked" and an explanation, never silently omitted. See GapDetector's remarks for
+// exactly where the negative claim ("nothing is silently missing") is measured.
+app.MapGet("/research/backfill/gaps", async (
+        long? jobId,
+        DateTimeOffset? from,
+        DateTimeOffset? to,
+        GapDetector detector,
+        BackfillStore store,
+        CancellationToken cancellationToken) =>
+    {
+        if (string.IsNullOrWhiteSpace(store.ConnectionString))
+        {
+            return Results.Problem(
+                title: "Research persistence is not configured.",
+                detail: "No 'trading' connection string.",
+                statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+
+        try
+        {
+            var report = await detector.GetReportAsync(jobId, from, to, cancellationToken);
+
+            if (jobId is { } id && report.Jobs.Count == 0)
+            {
+                return Results.Problem(
+                    title: "Unknown job.",
+                    detail: $"No backfill job with id {id}.",
+                    statusCode: StatusCodes.Status404NotFound);
+            }
+
+            return Results.Ok(report);
+        }
+        catch (NpgsqlException ex)
+        {
+            return Results.Problem(
+                title: "Could not compute the gap report.",
                 detail: ex.Message,
                 statusCode: StatusCodes.Status503ServiceUnavailable);
         }
