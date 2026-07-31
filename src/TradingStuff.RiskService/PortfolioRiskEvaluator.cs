@@ -7,8 +7,24 @@ public sealed class PortfolioRiskEvaluator(RiskLimits limits)
     public RiskEvaluationResult Evaluate(RiskEvaluationRequest request)
     {
         var breaches = new List<RiskLimitBreach>();
-        var exposureDelta = CalculateExposureDelta(request.Order, request.Quotes);
-        var estimatedMaxLoss = EstimateMaxLoss(request.Order, request.Quotes, breaches);
+        var quoteByContract = BuildQuoteLookup(request.Quotes);
+
+        // Fail closed. Every money and Greek limit below is computed from quotes, so a leg with no
+        // quote contributes nothing and the order reads as risk-free — it would sail through every
+        // check on its way to a real venue. Reject instead, naming the count.
+        var unquotedLegs = request.Order.Legs.Count(leg => !quoteByContract.ContainsKey(leg.Contract.Key()));
+
+        if (unquotedLegs > 0)
+        {
+            breaches.Add(new RiskLimitBreach(
+                "MISSING_QUOTE",
+                "One or more legs have no quote, so the order's risk cannot be evaluated.",
+                unquotedLegs,
+                0m));
+        }
+
+        var exposureDelta = CalculateExposureDelta(request.Order, quoteByContract);
+        var estimatedMaxLoss = EstimateMaxLoss(request.Order, quoteByContract, breaches);
         var estimatedBuyingPowerImpact = estimatedMaxLoss;
         var totalContracts = request.Order.Legs.Sum(leg => leg.Quantity);
 
@@ -93,14 +109,40 @@ public sealed class PortfolioRiskEvaluator(RiskLimits limits)
             limit));
     }
 
-    private static GreeksVector CalculateExposureDelta(SubmitOrderRequest order, IReadOnlyList<QuoteSnapshot> quotes)
+    /// <summary>
+    /// Indexes quotes by contract identity.
+    /// </summary>
+    /// <remarks>
+    /// Keyed on <see cref="OptionContractKey"/>, never on the whole <see cref="OptionContract"/>:
+    /// the record's equality covers every property, so a quote carrying a different routing exchange
+    /// or synthetic symbol than the leg that asked for it would not match. Here that is worse than a
+    /// crash — the leg is skipped, its risk is counted as zero, and the order is approved.
+    /// <para>
+    /// Assignment rather than <c>ToDictionary</c> on purpose: two legs on the same contract produce
+    /// two quotes with the same key, which <c>ToDictionary</c> throws on.
+    /// </para>
+    /// </remarks>
+    private static Dictionary<OptionContractKey, QuoteSnapshot> BuildQuoteLookup(IReadOnlyList<QuoteSnapshot> quotes)
     {
-        var quoteByContract = quotes.ToDictionary(quote => quote.Contract);
+        var lookup = new Dictionary<OptionContractKey, QuoteSnapshot>(quotes.Count);
+
+        foreach (var quote in quotes)
+        {
+            lookup[quote.Contract.Key()] = quote;
+        }
+
+        return lookup;
+    }
+
+    private static GreeksVector CalculateExposureDelta(
+        SubmitOrderRequest order,
+        IReadOnlyDictionary<OptionContractKey, QuoteSnapshot> quoteByContract)
+    {
         var exposure = GreeksVector.Zero;
 
         foreach (var leg in order.Legs)
         {
-            if (!quoteByContract.TryGetValue(leg.Contract, out var quote))
+            if (!quoteByContract.TryGetValue(leg.Contract.Key(), out var quote))
             {
                 continue;
             }
@@ -120,10 +162,9 @@ public sealed class PortfolioRiskEvaluator(RiskLimits limits)
 
     private static decimal EstimateMaxLoss(
         SubmitOrderRequest order,
-        IReadOnlyList<QuoteSnapshot> quotes,
+        IReadOnlyDictionary<OptionContractKey, QuoteSnapshot> quoteByContract,
         List<RiskLimitBreach> breaches)
     {
-        var quoteByContract = quotes.ToDictionary(quote => quote.Contract);
         var netDebit = CalculateNetDebit(order, quoteByContract);
 
         return order.Strategy switch
@@ -137,13 +178,13 @@ public sealed class PortfolioRiskEvaluator(RiskLimits limits)
 
     private static decimal CalculateNetDebit(
         SubmitOrderRequest order,
-        IReadOnlyDictionary<OptionContract, QuoteSnapshot> quoteByContract)
+        IReadOnlyDictionary<OptionContractKey, QuoteSnapshot> quoteByContract)
     {
         var netDebit = 0m;
 
         foreach (var leg in order.Legs)
         {
-            if (!quoteByContract.TryGetValue(leg.Contract, out var quote))
+            if (!quoteByContract.TryGetValue(leg.Contract.Key(), out var quote))
             {
                 continue;
             }

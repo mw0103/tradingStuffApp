@@ -163,13 +163,37 @@ before the regression tests added with them.
 - `IbkrConnection.Dispose` threw `ObjectDisposedException` during host shutdown, surfacing as an
   unhandled crash on every stop.
 
+### Risk engine coverage, and the fail-open bug it found (2026-07-31)
+
+All **13** breach codes are now covered — the 11 the evaluator raises, `DUPLICATE_ORDER` from the
+endpoint's `DuplicateOrderGuard`, and the new `MISSING_QUOTE`. Each test tightens exactly one limit,
+so a failure names the rule rather than reporting that risk rejected something. Tests: 151.
+
+Writing them surfaced a serious defect, now fixed:
+
+- **`PortfolioRiskEvaluator` correlated quotes on the whole `OptionContract` record** — in three
+  places — which `CLAUDE.md` forbids and which `PaperExecutionEngine` had already been fixed for.
+  Record equality covers every property, so a quote carrying a different routing exchange or
+  synthetic symbol than the leg that asked for it does not match. And the miss path is `continue`,
+  not a throw: **the leg's risk silently counts as zero**. With enough mismatched legs, exposure and
+  net debit both compute as 0, every money and Greek limit passes, and the order is approved on its
+  way to a real venue. A risk engine that fails open is worse than one that crashes. Now keyed on
+  `OptionContractKey`.
+- **`ToDictionary` threw on two legs sharing a contract**, since the market-data service returns one
+  quote per leg. The lookup is now built by assignment.
+- **An unquoted leg is now a rejection** (`MISSING_QUOTE`) rather than a silent zero. The partial
+  case is the dangerous one: a priced short leg with an unpriced long leg looks like a pure credit.
+
+The evaluator's arithmetic was sound throughout — 147 of the 150 tests passed before any fix. The
+bug was entirely in correlation.
+
 ## Left
 
 - Replace in-memory order/event stores with Postgres.
 - Replace in-memory event publisher with RabbitMQ.
 - Replace dev bearer-token auth with Keycloak/OIDC JWT validation.
 - Work out why SPX/SPXW combos park in `PreSubmitted` (see the open question above); SPY combos fill.
-- Cover the risk engine's remaining breach codes (12 codes, 1 tested).
+- Persist risk decisions with their inputs, quote references, and reason codes (needs Postgres).
 - Represent equity positions in `PortfolioSnapshot`, or accept that their delta is uncounted.
 - Add Python ML signal service.
 - Add richer audit dashboard.
