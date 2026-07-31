@@ -22,10 +22,36 @@ namespace TradingStuff.ResearchService.Persistence;
 public sealed class PartitionMaintainer(IConfiguration configuration, ILogger<PartitionMaintainer> logger)
     : BackgroundService
 {
-    private static readonly (string Schema, string Table)[] PartitionedTables =
+    /// <summary>
+    /// Tables whose daily partitions must be created ahead of need. Only the raw-event tables:
+    /// they are written continuously and partitioned by day, so they genuinely need a rolling
+    /// window created for them.
+    /// </summary>
+    private static readonly (string Schema, string Table)[] DailyPartitionedTables =
     [
         ("gateway", "option_quote_events"),
         ("gateway", "underlying_tick_events"),
+    ];
+
+    /// <summary>
+    /// Every partitioned table whose DEFAULT partition is an alarm condition — a superset of
+    /// <see cref="DailyPartitionedTables"/>.
+    /// </summary>
+    /// <remarks>
+    /// <c>research.bars</c> needs no partition creation (migration 004 pre-creates every yearly
+    /// partition for 1990-2035 on an empty table) but it very much needs the alarm, and for a
+    /// subtler reason than the raw-event tables: because every in-range partition already exists,
+    /// a correctly-dated bar can never land in DEFAULT. So a row appearing there does not mean
+    /// "maintenance fell behind" — it means the row's timestamp is OUTSIDE 1990-2035, which in
+    /// practice means it was mis-parsed. An epoch-seconds value read as something else lands in
+    /// 1970; that is a data-corruption signal, and pre-creating the partitions is precisely what
+    /// removed the loud insert-time rejection that would otherwise have surfaced it.
+    /// </remarks>
+    private static readonly (string Schema, string Table)[] DefaultPartitionWatchTables =
+    [
+        ("gateway", "option_quote_events"),
+        ("gateway", "underlying_tick_events"),
+        ("research", "bars"),
     ];
 
     private const int DaysAhead = 3;
@@ -75,21 +101,36 @@ public sealed class PartitionMaintainer(IConfiguration configuration, ILogger<Pa
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
 
-        foreach (var (schema, table) in PartitionedTables)
+        foreach (var (schema, table) in DefaultPartitionWatchTables)
         {
-            // Table names are always one of the two fixed literals above, never external input.
+            // Table names are always fixed literals from the arrays above, never external input.
             await using var command = new NpgsqlCommand($"SELECT count(*) FROM {schema}.{table}_default", connection);
             var count = (long)(await command.ExecuteScalarAsync(cancellationToken))!;
 
-            if (count > 0)
+            if (count == 0)
             {
-                logger.LogCritical(
-                    "{Count} row(s) are stranded in {Schema}.{Table}_default. The dedicated daily " +
-                    "partition for whatever date(s) they carry can no longer be created automatically " +
-                    "— this needs a manual one-time migration (copy the rows into a hand-created " +
-                    "partition, delete them from DEFAULT). See PartitionMaintainer's remarks.",
-                    count, schema, table);
+                continue;
             }
+
+            // Same alarm, two genuinely different diagnoses — say which, or an operator chases the
+            // wrong one.
+            var isPreCreated = !DailyPartitionedTables.Contains((schema, table));
+
+            logger.LogCritical(
+                "{Count} row(s) are stranded in {Schema}.{Table}_default. {Diagnosis} Recovering them " +
+                "needs a manual one-time migration (copy the rows into a hand-created partition, " +
+                "delete them from DEFAULT) — Postgres will not let the covering partition be created " +
+                "while they sit there. See PartitionMaintainer's remarks.",
+                count,
+                schema,
+                table,
+                isPreCreated
+                    ? "Every in-range partition for this table was pre-created, so a correctly-dated row " +
+                      "CANNOT land here — these timestamps fall outside the pre-created range, which in " +
+                      "practice means they were mis-parsed (an epoch value read wrongly lands in 1970). " +
+                      "Treat this as data corruption, not as maintenance lag."
+                    : "The dedicated daily partition for whatever date(s) they carry can no longer be " +
+                      "created automatically.");
         }
     }
 
@@ -100,7 +141,7 @@ public sealed class PartitionMaintainer(IConfiguration configuration, ILogger<Pa
 
         var today = DateOnly.FromDateTime(DateTime.UtcNow);
 
-        foreach (var (schema, table) in PartitionedTables)
+        foreach (var (schema, table) in DailyPartitionedTables)
         {
             for (var offset = 0; offset <= DaysAhead; offset++)
             {

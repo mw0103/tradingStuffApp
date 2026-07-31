@@ -138,11 +138,21 @@ public sealed class IbkrHistoricalClient(
         }
     }
 
-    private HistoricalBar MapBar(Bar bar)
+    internal static HistoricalBar MapBar(Bar bar)
     {
         if (!HistoricalBarTime.TryParse(bar.Time, out var timestamp, out var tradingDate))
         {
-            logger.LogWarning("Could not parse historical bar time '{Time}'; leaving it unset.", bar.Time);
+            // Deliberately fails the whole slice rather than emitting a bar with an unset
+            // timestamp. A timeless bar inside an otherwise-successful response is the worst
+            // available outcome: the coordinator would mark the slice landed, the bar would be
+            // dropped or mis-keyed on insert, and the resulting hole would be invisible to gap
+            // detection — which reconciles against what the slice CLAIMED to deliver. An
+            // unparseable time also means the response is not the shape we believe it to be, so
+            // trusting the other fields of that response is unjustified. A visible slice failure
+            // is retried and, if persistent, surfaces as a failed slice an operator can see.
+            throw new InvalidOperationException(
+                $"TWS returned a historical bar with an unparseable time '{bar.Time}'. Refusing to " +
+                "return a partial slice — a bar with no timestamp cannot be stored or reconciled.");
         }
 
         return new HistoricalBar(

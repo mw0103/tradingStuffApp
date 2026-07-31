@@ -309,4 +309,29 @@ public sealed class IbkrHistoricalTests
         // costs the data.
         Assert.False(IbkrHistoricalClient.IsGenuinelyNoData(message));
     }
+
+    [Fact]
+    public void An_unparseable_bar_time_fails_the_slice_rather_than_yielding_a_timeless_bar()
+    {
+        // The worst available outcome is a bar with no timestamp inside a HasData:true response:
+        // the coordinator marks the slice landed, the bar is dropped or mis-keyed on insert, and
+        // the hole is invisible to gap detection because gap detection reconciles against what the
+        // slice claimed to deliver. Fail loudly instead.
+        var bar = new Bar("not-a-timestamp", 1d, 2d, 0.5d, 1.5d, 10m, 3, 1.2m);
+
+        Assert.Throws<InvalidOperationException>(() => IbkrHistoricalClient.MapBar(bar));
+    }
+
+    [Fact]
+    public void A_well_formed_epoch_bar_still_maps_normally()
+    {
+        // Guards the above against over-correction — the throw must be reachable only by genuinely
+        // unparseable input, not by any bar at all.
+        var bar = new Bar("1785504600", 1d, 2d, 0.5d, 1.5d, 10m, 3, 1.2m);
+
+        var mapped = IbkrHistoricalClient.MapBar(bar);
+
+        Assert.NotNull(mapped.Timestamp);
+        Assert.Null(mapped.TradingDate);
+    }
 }
