@@ -1,4 +1,5 @@
 using IBApi;
+using TradingStuff.IbkrGateway.History;
 
 namespace TradingStuff.IbkrGateway;
 
@@ -143,6 +144,20 @@ public sealed class IbkrClientWrapper(
         registry.Get<ListRequest<OptionChainSegment>>(reqId)?.Complete();
         registry.Remove(reqId);
     }
+
+    // ---- historical data --------------------------------------------------------------------
+
+    public override void historicalData(int reqId, Bar bar) =>
+        registry.Get<ListRequest<Bar>>(reqId)?.Add(bar);
+
+    public override void historicalDataEnd(int reqId, string start, string end)
+    {
+        registry.Get<ListRequest<Bar>>(reqId)?.Complete();
+        registry.Remove(reqId);
+    }
+
+    public override void headTimestamp(int reqId, string headTimestamp) =>
+        registry.Get<HeadTimestampSink>(reqId)?.Apply(headTimestamp);
 
     // ---- market data ----------------------------------------------------------------------
 

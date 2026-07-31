@@ -22,6 +22,20 @@ public static class IbkrErrorCodes
     /// <summary>Requested market data is not subscribed, and no delayed fallback is being sent.</summary>
     public const int MarketDataNotSubscribed = 354;
 
+    /// <summary>
+    /// "HMDS query returned no data" — this historical slice is empty, not a transport failure. A
+    /// different date range on the same contract can still have data, so this is deliberately NOT
+    /// classified as a permanent failure; callers should mark only the requested slice as empty.
+    /// </summary>
+    public const int NoHistoricalData = 162;
+
+    /// <summary>
+    /// "Setting end date/time for continuous future security type is not allowed" — a live
+    /// <c>CONTFUT</c> rejects a past <c>endDateTime</c>. Deep futures history requires walking
+    /// individual expired contracts with <c>IncludeExpired</c> set instead of retrying this request.
+    /// </summary>
+    public const int ContinuousFutureEndDateNotAllowed = 10339;
+
     /// <summary>Market data not subscribed, but TWS is sending delayed data instead. Informational.</summary>
     public const int DisplayingDelayedData = 10167;
 
@@ -68,6 +82,7 @@ public static class IbkrErrorCodes
         201 => true, // order rejected
         202 => true, // order cancelled
         321 => true, // server error validating the request
+        ContinuousFutureEndDateNotAllowed => true, // CONTFUT + past endDateTime never becomes valid
         _ => false,
     };
 

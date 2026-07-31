@@ -1,6 +1,8 @@
+using System.Globalization;
 using Microsoft.AspNetCore.Mvc;
 using TradingStuff.Contracts;
 using TradingStuff.IbkrGateway;
+using TradingStuff.IbkrGateway.History;
 using TradingStuff.IbkrGateway.Pacing;
 using TradingStuff.IbkrGateway.Persistence;
 using TradingStuff.IbkrGateway.Recording;
@@ -27,6 +29,7 @@ builder.Services.AddSingleton<PacedSocket>();
 builder.Services.AddSingleton<OrderIdStore>();
 
 builder.Services.AddSingleton<IbkrMarketDataClient>();
+builder.Services.AddSingleton<IbkrHistoricalClient>();
 builder.Services.AddSingleton<IbkrOrderTracker>();
 builder.Services.AddSingleton<IbkrOrderClient>();
 builder.Services.AddSingleton<IbkrAccountClient>();
@@ -230,6 +233,127 @@ app.MapPost("/ibkr/options/quotes", async (
                 title: "Not connected to TWS.",
                 detail: ex.Message,
                 statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+    })
+    .RequireAuthorization();
+
+// ---- historical data ----------------------------------------------------------------------------
+// The only surface that reaches reqHistoricalData / reqHeadTimeStamp. Callers are the research
+// backfill coordinator, which needs to tell retry-now (429 + Retry-After), retry-later-differently
+// (400, permanent), and genuinely-empty (200, HasData=false) apart — see the catch order below.
+
+app.MapPost("/ibkr/history/bars", async (
+        HistoricalBarsRequest request,
+        IbkrHistoricalClient historical,
+        HttpContext httpContext,
+        CancellationToken cancellationToken) =>
+    {
+        if (string.IsNullOrWhiteSpace(request.Contract?.Symbol) || string.IsNullOrWhiteSpace(request.Contract.SecType))
+        {
+            return Results.BadRequest(new { error = "A contract symbol and security type are required." });
+        }
+
+        if (string.IsNullOrWhiteSpace(request.Duration) ||
+            string.IsNullOrWhiteSpace(request.BarSize) ||
+            string.IsNullOrWhiteSpace(request.WhatToShow))
+        {
+            return Results.BadRequest(new { error = "Duration, bar size, and whatToShow are required." });
+        }
+
+        try
+        {
+            return Results.Ok(await historical.GetHistoricalBarsAsync(request, cancellationToken));
+        }
+        catch (IbkrPacingRejectedException ex)
+        {
+            // The coordinator's backpressure signal: back off exactly this long and retry the same
+            // slice, rather than treating pacing exhaustion as a request failure.
+            httpContext.Response.Headers["Retry-After"] =
+                Math.Ceiling(ex.RetryAfter.TotalSeconds).ToString(CultureInfo.InvariantCulture);
+
+            return Results.Problem(
+                title: "Historical data pacing budget exhausted.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status429TooManyRequests);
+        }
+        catch (IbkrRequestException ex)
+        {
+            return Results.Problem(
+                title: "IBKR rejected the historical data request.",
+                detail: ex.Message,
+                statusCode: ex.IsPermanent ? StatusCodes.Status400BadRequest : StatusCodes.Status502BadGateway,
+                extensions: new Dictionary<string, object?> { ["ibkrErrorCode"] = ex.ErrorCode });
+        }
+        catch (IbkrConnectionException ex)
+        {
+            return Results.Problem(
+                title: "Not connected to TWS.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+        catch (TimeoutException ex)
+        {
+            // TWS accepted the request and never terminated it (no historicalDataEnd, no error).
+            // Upstream slowness, not a bug here.
+            return Results.Problem(
+                title: "TWS did not answer the historical data request in time.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status504GatewayTimeout);
+        }
+    })
+    .RequireAuthorization();
+
+app.MapPost("/ibkr/history/head-timestamp", async (
+        HeadTimestampQuery request,
+        IbkrHistoricalClient historical,
+        HttpContext httpContext,
+        CancellationToken cancellationToken) =>
+    {
+        if (string.IsNullOrWhiteSpace(request.Contract?.Symbol) || string.IsNullOrWhiteSpace(request.Contract.SecType))
+        {
+            return Results.BadRequest(new { error = "A contract symbol and security type are required." });
+        }
+
+        if (string.IsNullOrWhiteSpace(request.WhatToShow))
+        {
+            return Results.BadRequest(new { error = "whatToShow is required." });
+        }
+
+        try
+        {
+            return Results.Ok(await historical.GetHeadTimestampAsync(request, cancellationToken));
+        }
+        catch (IbkrPacingRejectedException ex)
+        {
+            httpContext.Response.Headers["Retry-After"] =
+                Math.Ceiling(ex.RetryAfter.TotalSeconds).ToString(CultureInfo.InvariantCulture);
+
+            return Results.Problem(
+                title: "Historical data pacing budget exhausted.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status429TooManyRequests);
+        }
+        catch (IbkrRequestException ex)
+        {
+            return Results.Problem(
+                title: "IBKR rejected the head timestamp request.",
+                detail: ex.Message,
+                statusCode: ex.IsPermanent ? StatusCodes.Status400BadRequest : StatusCodes.Status502BadGateway,
+                extensions: new Dictionary<string, object?> { ["ibkrErrorCode"] = ex.ErrorCode });
+        }
+        catch (IbkrConnectionException ex)
+        {
+            return Results.Problem(
+                title: "Not connected to TWS.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+        catch (TimeoutException ex)
+        {
+            return Results.Problem(
+                title: "TWS did not answer the head timestamp request in time.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status504GatewayTimeout);
         }
     })
     .RequireAuthorization();

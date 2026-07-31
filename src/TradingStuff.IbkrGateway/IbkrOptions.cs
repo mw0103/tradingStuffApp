@@ -45,6 +45,14 @@ public sealed class IbkrOptions
     public int RequestTimeoutSeconds { get; set; } = 20;
 
     /// <summary>
+    /// Ceiling for a historical bars or head-timestamp round trip. Longer than
+    /// <see cref="RequestTimeoutSeconds"/> because a multi-month bar request can legitimately take
+    /// longer than a contract lookup, and the request may also have queued behind the historical
+    /// pacing window before ever reaching the wire.
+    /// </summary>
+    public int HistoricalRequestTimeoutSeconds { get; set; } = 60;
+
+    /// <summary>
     /// How long to wait for a quote to become complete (bid, ask, and model Greeks) before returning
     /// whatever ticks did arrive. Illiquid option series can legitimately never fill every field.
     /// </summary>

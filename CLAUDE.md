@@ -97,6 +97,25 @@ one), then match the work against this table:
 | ALL leakage reviews and order-safety reviews, any phase | Opus | high |
 | UI (`ClientApp/`) and documentation work | Haiku | low |
 
+**Class-based overrides — these beat the phase row above, whatever phase the work falls in.**
+Derived from measured review outcomes (see `docs/STATE.md`), not from guesses about difficulty:
+
+- **(a) Split-path lifetime state machines → Opus/high.** Any object or row whose
+  acquire/complete/release is managed across two or more interleaving code paths: leases,
+  registries, replay/reconnect reconciliation, claim-then-update coordinators, crash/inflight
+  reapers. *This class produced 4 of Phase 1's 8 confirmed defects, all top-severity.*
+- **(b) Ground-truth manufacturers → Opus/high.** Anything producing the reference data other
+  components are validated *against* — session calendars, clocks, the as-of/cutoff machinery. A
+  defect here is invisible by construction: the validating artifact inherits the same bug.
+- **(c) Negative-claim acceptance criteria → minimum Sonnet/high.** Packages whose correctness
+  statement is "nothing is silently missing / a rerun adds nothing / no duplicates exist" — gap
+  reports, coverage, idempotency assertions. The phase review must name the absent-row check AND
+  which table the negative claim is measured on. *Three Phase 1 defects shared one root: a query
+  cannot emit a row for the absent case, so absence renders as health.*
+- **(d) Read-only UI stays Haiku/low** even when listed beside backend work — empirically zero
+  defects across two shipped phases. Defend this row against escalation. A server-side aggregation
+  endpoint is NOT UI: it belongs to the package owning its query semantics.
+
 **The two exceptions, and only these — both require words in the prompt itself:**
 1. The prompt says not to apply this policy (for this task, or generally).
 2. The prompt names a specific model or effort level to use for this task.
@@ -125,6 +144,53 @@ work through `leakage-reviewer` rather than reviewing inline on a smaller model.
 agent isn't yet visible to the current session's Agent tool (a known lag right after the agent
 files are added), fall back to `general-purpose` with an explicit `model` override matching the
 table rather than dropping the policy.
+
+### Phase-start validation: adversarial, with a separate arbiter
+
+Before starting a phase, decide the per-work-package model assignment with a three-agent
+adversarial structure, not a single validator:
+
+1. **Attacker (Opus, high)** — argues the standing table is already correct for every package, and
+   attacks each candidate escalation on its merits.
+2. **Justifier (Opus, high)** — argues for escalation wherever warranted, making the strongest
+   available case.
+3. **Arbiter (Fable)** — decides per package, on the arguments presented.
+
+The table is a prior written in advance from a guess at phase difficulty; it is not a measurement,
+and this step exists to correct it. But a single validator both *generates* the escalation case and
+*judges* it, which is precisely where bias hides — telling one model to "watch its own bias" is a
+weak corrective. Assigning the two sides removes the stake: an agent instructed to argue against
+escalation has no incentive to escalate, and the arbiter adjudicates a narrow question (which brief
+is better supported) rather than an open-ended one.
+
+Constraints that make this work rather than just cost three times as much:
+
+- **Per work package, not per phase.** A phase mixes genuinely subtle work with plumbing; one
+  verdict for the whole phase is too coarse to act on.
+- **The table wins ties.** If the briefs are evenly matched, the default stands. Deviation requires
+  positive justification, or "balanced" quietly becomes a ratchet upward.
+- **Escalation triggers** — a deviation must name at least one; "seems complex/important" is not
+  one: novel concurrency or process-lifecycle invariants; correctness that is hard to cover with
+  tests (timezone/session semantics — **especially any single authority whose output downstream
+  artifacts are validated against**, because the operative hazard is not that conversion is hard
+  but that the validator and the validated share an assumption, which is exactly what defeats the
+  "but it is a testable oracle" counter-argument; decimal/precision boundaries; idempotency under
+  concurrency; partitioning/storage-engine semantics); safety invariants (order placement,
+  live-capital gates, the leakage firewall); irreversible or unrecoverable data paths (anything
+  writing the prospective recording, which cannot be re-collected); cross-cutting refactors
+  touching many call sites.
+- **Both advocates must steelman the other side** and concede its strongest point explicitly.
+  Otherwise the arbiter is choosing between two weak briefs on style.
+- **De-escalation is in scope.** A package that is plainly CRUD, plumbing, or docs should be named
+  as such even where the table says otherwise.
+- **Calibrate from outcomes, not forecasts.** All three agents get the PREVIOUS phase's
+  adversarial-review results — how many defects were confirmed and of what *class* — and are told
+  to weight that over any impression of difficulty. Confirmed-defect classes are the only real
+  signal about where the table is mis-calibrated, and the durable output is a correction **by class
+  of work**, not by phase number.
+- **Record the verdict, the winning argument, and the conceded counterpoint in `docs/STATE.md`**
+  with the phase entry — so the next phase can check what was predicted against what its review
+  actually found, and so a wrong call is visible rather than folklore.
 
 ## Trading safety
 

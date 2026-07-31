@@ -95,6 +95,81 @@ public sealed class PacedSocket(
         }
     }
 
+    /// <summary>
+    /// Requests historical bars. Acquires the historical pacing window (its 15s identical-request
+    /// cooldown, 5-per-2s per-contract limit, and 54-per-10min budget with BID_ASK costing double)
+    /// before the general message-rate budget, since TWS paces historical data far more
+    /// aggressively than the ~50 msg/s wire limit.
+    /// </summary>
+    /// <param name="pacingRequestKey">Exact request identity — see <see cref="IbkrPacingGovernor.AcquireHistoricalAsync"/>.</param>
+    /// <param name="pacingContractKey">Contract identity, for the per-contract short window.</param>
+    /// <param name="countsDouble">True for BID_ASK, which costs double against the window.</param>
+    public async Task ReqHistoricalDataAsync(
+        int requestId,
+        IbContract contract,
+        string endDateTime,
+        string durationString,
+        string barSizeSetting,
+        string whatToShow,
+        int useRth,
+        int formatDate,
+        bool keepUpToDate,
+        List<TagValue>? chartOptions,
+        string pacingRequestKey,
+        string pacingContractKey,
+        bool countsDouble,
+        CancellationToken cancellationToken)
+    {
+        var client = connection.RequireClient();
+        await governor.AcquireHistoricalAsync(pacingRequestKey, pacingContractKey, countsDouble, cancellationToken);
+        await governor.AcquireMessagesAsync(1, SocketMessageClass.Normal, cancellationToken);
+        client.reqHistoricalData(
+            requestId, contract, endDateTime, durationString, barSizeSetting, whatToShow, useRth, formatDate,
+            keepUpToDate, chartOptions);
+    }
+
+    /// <summary>
+    /// Requests the earliest available timestamp for a contract. Counts as an ongoing historical
+    /// request against the same pacing window as bars, so it draws from
+    /// <see cref="IbkrPacingGovernor.AcquireHistoricalAsync"/> too.
+    /// <see cref="CancelHeadTimestampAsync"/> MUST follow once the caller is done with it, or the
+    /// request leaks against TWS's own bookkeeping.
+    /// </summary>
+    public async Task ReqHeadTimestampAsync(
+        int requestId,
+        IbContract contract,
+        string whatToShow,
+        int useRth,
+        int formatDate,
+        string pacingRequestKey,
+        string pacingContractKey,
+        bool countsDouble,
+        CancellationToken cancellationToken)
+    {
+        var client = connection.RequireClient();
+        await governor.AcquireHistoricalAsync(pacingRequestKey, pacingContractKey, countsDouble, cancellationToken);
+        await governor.AcquireMessagesAsync(1, SocketMessageClass.Normal, cancellationToken);
+        client.reqHeadTimestamp(requestId, contract, whatToShow, useRth, formatDate);
+    }
+
+    /// <summary>
+    /// Cancels a head-timestamp request. Never throws: freeing TWS's bookkeeping matters more than
+    /// the cancel message landing, and a dead socket has already dropped the request.
+    /// </summary>
+    public async Task CancelHeadTimestampAsync(int requestId)
+    {
+        try
+        {
+            var client = connection.RequireClient();
+            await governor.AcquireMessagesAsync(1, SocketMessageClass.Normal, CancellationToken.None);
+            client.cancelHeadTimestamp(requestId);
+        }
+        catch (Exception ex)
+        {
+            logger.LogDebug(ex, "Ignoring failure to cancel head timestamp request {RequestId}.", requestId);
+        }
+    }
+
     public async Task PlaceOrderAsync(int orderId, IbContract contract, Order order, CancellationToken cancellationToken)
     {
         var client = connection.RequireClient();
