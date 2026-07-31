@@ -58,7 +58,10 @@ public static class ServiceClientConfiguration
 
         builder.AddStandardResilienceHandler(options =>
         {
-            options.Retry.MaxRetryAttempts = 0;
+            // Not MaxRetryAttempts = 0: that fails options validation at startup (the field must be
+            // at least 1) and takes the whole service down. Refusing every outcome is how the
+            // standard handler is disabled — the strategy stays configured but never fires.
+            options.Retry.ShouldHandle = _ => ValueTask.FromResult(false);
             options.AttemptTimeout.Timeout = attemptTimeout;
             options.TotalRequestTimeout.Timeout = attemptTimeout + TimeSpan.FromSeconds(10);
 

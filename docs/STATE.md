@@ -48,8 +48,8 @@ Updated: 2026-07-31
 
 ### IBKR account and position sync (stage 5)
 
-Written 2026-07-31. Unit-tested; **not yet exercised against a running TWS** — everything above it in
-this section has been, so treat this one as unverified until a live read is done.
+Written and **verified live against the `DU` paper account on 2026-07-31**, including a filled
+round trip that put a real position through the portfolio read (details at the end of this section).
 
 - **`IbkrAccountClient`** serves `GET /ibkr/account/portfolio` from `reqAccountSummary` (buying
   power, falling back through `BuyingPower` → `AvailableFunds` → `ExcessLiquidity`),
@@ -77,6 +77,46 @@ this section has been, so treat this one as unverified until a live read is done
 - **Known limit:** `PositionSnapshot` carries an `OptionContract`, so equity and futures positions in
   the account have no representation. They are counted and warned about, not counted against the
   Greek limits.
+
+**Live verification (2026-07-31, ~11:30 ET).** A 1-lot SPY 740/741 call vertical opened at a 0.56
+debit and closed at a 0.54 credit through the full `Execution:Router=ibkr` +
+`Portfolio:Source=ibkr` path, leaving the account flat. With the position open the portfolio read
+returned:
+
+| Check | Observed |
+|---|---|
+| Contract mapping | `SPY 2026-07-31 740 C`, `tradingClass=SPY`, `multiplier=100` |
+| `avgCost` ÷ multiplier | filled @ 1.90 → `AveragePrice` 1.910333 |
+| Greeks × quantity × multiplier | long 740C delta 52.03 (≈ 0.52 × 1 × 100) |
+| Short leg sign flip | short 741C delta −42.46, theta **+**127.28 against the long's −159.87 |
+| Aggregate `ExistingGreeks` | delta 9.56 = 52.03 − 42.46 |
+| Flags | `DailyPnLAvailable` and `GreeksComplete` true, `NonOptionPositionCount` 0 |
+
+Buying power and daily P&L both moved with the trade. Six consecutive portfolio reads succeeded,
+confirming the subscription rewrite: the previous design failed on the third. The close reported an
+average fill price of **−0.54** — signed, so the credit survived rather than being discarded.
+
+Two earlier fixes re-confirmed in the same run: the BAG summary execution was excluded (two leg
+fills, not three), and legs were attributed by conId rather than arrival order — leg 1's execution
+arrived before leg 0's.
+
+### Open question: SPX/SPXW combos park in PreSubmitted
+
+Not resolved, and **not a defect in this codebase** — the same code fills SPY combos immediately.
+
+Every SPXW combo sent on 2026-07-31 during regular hours was accepted by TWS and sat at
+`PreSubmitted` indefinitely with **no error and no `whyHeld`**. Ruled out by direct test: price (held
+at a 3.50 limit against a 3.30 natural, at 4.50, and as a plain `MKT` order), session (11:20 ET on a
+Friday, inside 09:30–16:15), `IBKR:OutsideRegularTradingHours` (held with it both false and true),
+TWS precautionary settings (disabled, and no error 163 was raised), and combo construction (leg
+actions, ratios, and the signed net verified correct in `IbkrOrderBuilder`, and identical in shape to
+the SPY order that filled).
+
+The remaining candidates are account-level: index-option trading permission on the paper account, or
+SPX combo routing needing a destination other than `SMART`. TWS's own order row shows a hold reason
+that the API does not expose — check there first. Note the SPXW round trip recorded further up this
+file did fill, so this is a change in account or session state rather than something that never
+worked.
 
 ### Bugs the stage 5 live run exposed (2026-07-31)
 
@@ -128,8 +168,7 @@ before the regression tests added with them.
 - Replace in-memory order/event stores with Postgres.
 - Replace in-memory event publisher with RabbitMQ.
 - Replace dev bearer-token auth with Keycloak/OIDC JWT validation.
-- Verify the stage 5 account/position read against a running paper TWS — it is the only IBKR stage
-  never exercised live.
+- Work out why SPX/SPXW combos park in `PreSubmitted` (see the open question above); SPY combos fill.
 - Cover the risk engine's remaining breach codes (12 codes, 1 tested).
 - Represent equity positions in `PortfolioSnapshot`, or accept that their delta is uncounted.
 - Add Python ML signal service.

@@ -147,8 +147,13 @@ type, whether trading is permitted, in-flight request count).
 
 ## Staged migration — current position
 
-All six stages are implemented; stages 1–4 and 6 are **verified against a live paper account**.
-Details and acceptance criteria in `references/migration-plan.md`.
+All six stages are implemented and **verified against a live paper account**. Details and acceptance
+criteria in `references/migration-plan.md`.
+
+**Use SPY, not SPX/SPXW, when you need a combo to actually fill.** As of 2026-07-31 every SPXW combo
+parks at `PreSubmitted` with no error — at any price, including `MKT`, inside regular hours, with and
+without `OutsideRth`. SPY combos on the identical code path fill immediately. Unexplained and
+account-level rather than a code defect; see the open question in `docs/STATE.md`.
 
 | Stage | Status |
 |---|---|
@@ -156,7 +161,7 @@ Details and acceptance criteria in `references/migration-plan.md`.
 | 2. Contract resolution + conId cache | **Done** |
 | 3. Chains (`reqSecDefOptParams`) | **Done** |
 | 4. Streaming quotes + Greeks | **Done** |
-| 5. Account/position sync → `PortfolioProvider` | **Done — not yet exercised against a live TWS** |
+| 5. Account/position sync → `PortfolioProvider` | **Done — verified live with an open position** |
 | 6. Order placement (paper only, opt-in) | **Done — round trip filled on the paper account** |
 
 ### Account and positions (stage 5)

@@ -1,9 +1,8 @@
 # Staged migration: deterministic provider → IBKR
 
-> **Status (2026-07-31): all six stages implemented.** Stages 1–4 and 6 are verified live against a
-> `DU` paper account on TWS server version 223 — real chains, real conIds, real Greeks, and a filled
-> SPXW vertical round trip. Stage 5 (account/position sync) is written and unit-tested but has not
-> yet been exercised against a running TWS.
+> **Status (2026-07-31): all six stages implemented and verified live** against a `DU` paper account
+> on TWS server version 223 — real chains, real conIds, real Greeks, filled combo round trips, and a
+> portfolio read carrying a real position with correctly scaled Greeks.
 
 `DeterministicOptionMarketDataProvider` is the only reason the 6 tests in
 `tests/TradingStuff.Tests/TradingWorkflowTests.cs` are repeatable. It does not get deleted — it
@@ -112,8 +111,9 @@ and futures positions in the account have no representation and their exposure i
 warning.
 
 **Done when:** `RiskEvaluationRequest.Portfolio` reflects actual paper-account buying power and
-positions. **Met**, pending live verification against TWS — the mapping logic is unit-tested, but no
-round trip has been run against a real account yet.
+positions. **Met and verified live** on 2026-07-31 — a SPY vertical round trip put a real position
+through the read, confirming contract mapping, the `avgCost` conversion, Greek scaling, and the short
+leg's sign flip. Figures in `docs/STATE.md`.
 
 ## Stage 6 (DONE) — Order placement (paper only)
 

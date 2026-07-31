@@ -70,10 +70,9 @@ Outstanding (from `docs/STATE.md`):
 - In-memory order/event stores → Postgres
 - In-memory event publisher → RabbitMQ
 - `DevelopmentJwtAuthenticationHandler` → Keycloak OIDC/JWT validation
-- Verify IBKR stage 5 (account/position sync) against a running paper TWS — it is the only IBKR
-  stage never exercised live
 - Risk engine has 12 breach codes and 1 is tested (**highest priority** now that the risk inputs are
   real)
+- SPX/SPXW combos park in `PreSubmitted` at TWS while SPY combos fill — unexplained, see `docs/STATE.md`
 - Python ML signal service
 - Aspire transitive `MessagePack` advisory, pending an upstream patch
 
