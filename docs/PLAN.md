@@ -83,6 +83,8 @@ Execution, risk, and market data:
 IBKR gateway (internal; not part of the public trading surface):
 
 - `GET /ibkr/status`: TWS socket state, managed accounts, whether trading is permitted.
+- `GET /ibkr/account/portfolio`: buying power, daily P&L, positions, and aggregate Greeks, with flags
+  for whatever the read could not establish.
 - `POST /ibkr/contracts/resolve`: resolve option contracts to IBKR conIds.
 - `GET /ibkr/options/chains/{underlying}`: chain segment for a trading class.
 - `POST /ibkr/options/quotes`: streaming quotes with Greeks.
@@ -120,12 +122,16 @@ V1 risk checks:
 - Delta, gamma, theta, and vega exposure limits.
 - Rejection of uncovered short volatility spreads.
 
-All are implemented. **Their portfolio inputs are not yet real**: the portfolio provider returns a
-fixed buying power, zero daily P&L, zero existing Greeks, and no positions. Consequently the daily
-loss check cannot fire, and the Greek limits measure only the incoming order rather than accumulated
-exposure. Replacing the provider with real account/position data is a prerequisite for treating any
-risk decision as meaningful — and is now the highest-priority gap, because paper-brokerage routing
-already places real orders through these checks.
+All are implemented, and real portfolio inputs are now available: with `Portfolio:Source=ibkr` the
+provider reads buying power, daily P&L, positions, and position Greeks from the IBKR account through
+the gateway. The default remains the fixed development figures — a fixed buying power, zero daily
+P&L, zero existing Greeks, and no positions — under which the daily loss check cannot fire and the
+Greek limits measure only the incoming order.
+
+**`Portfolio:Source` must be set to `ibkr` whenever `Execution:Router` is**, or real orders are
+approved against fabricated inputs. Two limits remain even on the real source: equity and futures
+positions cannot be represented by `PositionSnapshot`, so their exposure is reported as a warning
+rather than counted; and a position whose Greeks cannot be quoted is flagged rather than estimated.
 
 Every risk decision should retain inputs, quote snapshot references, computed exposure, result, and
 reason codes once persistence is added.

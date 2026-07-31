@@ -7,7 +7,7 @@ Updated: 2026-07-31
 - Aspire/.NET solution scaffolded.
 - Execution, risk, market-data, audit dashboard, contracts, service defaults, and AppHost projects created.
 - Paper options workflow implemented with strategy validation, Greeks-aware risk, deterministic quotes, fills, lifecycle events, and local auth.
-- Tests pass: 91/91. Full solution builds.
+- Tests pass: 119/119. Full solution builds.
 
 ### IBKR integration (stages 1-4 and 6 of `.claude/skills/ibkr/references/migration-plan.md`)
 
@@ -46,6 +46,36 @@ Updated: 2026-07-31
 - Reconnect backoff now treats a short-lived session as a failure. TWS can accept a socket and
   immediately reset it, and the previous logic reconnected at the base interval indefinitely.
 
+### IBKR account and position sync (stage 5)
+
+Written 2026-07-31. Unit-tested; **not yet exercised against a running TWS** — everything above it in
+this section has been, so treat this one as unverified until a live read is done.
+
+- **`IbkrAccountClient`** serves `GET /ibkr/account/portfolio` from `reqAccountSummary` (buying
+  power, falling back through `BuyingPower` → `AvailableFunds` → `ExcessLiquidity`),
+  `reqPositionsMulti` (positions), and `reqPnL` (daily P&L).
+- **The reqId-scoped request variants**, not `reqPositions` / `reqAccountUpdates`. The account-wide
+  forms carry no request id, so `IbkrRequestRegistry` cannot correlate them or fault them on error.
+- **All three are subscriptions.** Their `...End` callback terminates the *initial* delivery only;
+  TWS streams updates afterwards, so every read cancels in a `finally`. `reqPnL` has no `...End`
+  callback at all and settles on the first callback with a non-sentinel daily P&L.
+- **`ExistingGreeks` is built by quoting the open positions** — IBKR has no portfolio-Greeks API —
+  scaled by quantity × multiplier so it sums with the order exposure `PortfolioRiskEvaluator`
+  computes. Capped at `IBKR:MaxPositionsQuoted` (50) against the 100-line market data limit, and
+  cached for `IBKR:PortfolioCacheSeconds` (5) because every order submission reads the portfolio.
+- **`IbkrPortfolioProvider`** in ExecutionService, selected by `Portfolio:Source=ibkr`. Anything
+  unrecognised stays on `DevelopmentPortfolioProvider`, matching how `Execution:Router` and
+  `MarketData:Source` degrade.
+- **No fallback on failure.** An unreadable portfolio raises `PortfolioUnavailableException`, which
+  `POST /orders` turns into a 503 with no order placed. Substituting development figures when the
+  broker is unreachable would approve a real order against numbers nobody checked.
+- **Gaps are reported rather than defaulted**: `DailyPnLAvailable`, `GreeksComplete`, and
+  `NonOptionPositionCount` ride on the gateway response and are logged as warnings by the provider.
+  A daily P&L defaulted to zero silently disables `MAX_DAILY_LOSS`.
+- **Known limit:** `PositionSnapshot` carries an `OptionContract`, so equity and futures positions in
+  the account have no representation. They are counted and warned about, not counted against the
+  Greek limits.
+
 ### Bugs the live round trip exposed
 
 - **Combo fills counted the BAG summary as a leg.** IBKR reports three executions for a two-leg
@@ -71,7 +101,10 @@ Updated: 2026-07-31
 - Replace in-memory order/event stores with Postgres.
 - Replace in-memory event publisher with RabbitMQ.
 - Replace dev bearer-token auth with Keycloak/OIDC JWT validation.
-- IBKR stage 5: read-only account/position sync to replace the stubbed `PortfolioProvider`.
+- Verify the stage 5 account/position read against a running paper TWS — it is the only IBKR stage
+  never exercised live.
+- Cover the risk engine's remaining breach codes (12 codes, 1 tested).
+- Represent equity positions in `PortfolioSnapshot`, or accept that their delta is uncounted.
 - Add Python ML signal service.
 - Add richer audit dashboard.
 - Address Aspire transitive `MessagePack` advisories when upstream package is patched.
@@ -95,13 +128,17 @@ To route orders through IBKR, with the gateway running:
 
 ```bash
 export Execution__Router=ibkr                # route orders to IBKR, not the simulated engine
+export Portfolio__Source=ibkr                # set this too, or risk checks run on fabricated inputs
 export IBKR__OutsideRegularTradingHours=true # required outside 09:30-16:15 ET (SPX/SPXW)
 
-curl -H "Authorization: Bearer dev-internal-token" localhost:<port>/ibkr/orders/open   # reconcile
+curl -H "Authorization: Bearer dev-internal-token" localhost:<port>/ibkr/orders/open       # reconcile
+curl -H "Authorization: Bearer dev-internal-token" localhost:<port>/ibkr/account/portfolio # risk inputs
 ```
 
 Order routing stays opt-in: `Execution:Router` must be exactly `ibkr`, and the gateway's
-`IBKR:AllowLiveTrading` must be true for any non-`DU` account.
+`IBKR:AllowLiveTrading` must be true for any non-`DU` account. `Portfolio:Source` is a separate
+opt-in and defaults to the development figures — routing real orders without setting it evaluates
+them against a fixed buying power and a flat day.
 
 ### Trade SPX, not SPY, outside regular hours
 

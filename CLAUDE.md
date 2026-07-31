@@ -18,7 +18,7 @@ mkdir -p /tmp/dotnet_home
 
 ```bash
 dotnet build TradingStuff.slnx
-dotnet test tests/TradingStuff.Tests/TradingStuff.Tests.csproj -m:1    # 91 tests, all should pass
+dotnet test tests/TradingStuff.Tests/TradingStuff.Tests.csproj -m:1    # 119 tests, all should pass
 aspire start --non-interactive                                        # full distributed app
 ```
 
@@ -33,9 +33,9 @@ For logic changes, `dotnet test` alone is the fast loop.
 |---|---|
 | `TradingStuff.Contracts` | All shared records/enums, single file `TradingContracts.cs`. Changes here ripple everywhere. |
 | `TradingStuff.ExecutionService` | Order REST API, validation, lifecycle, paper fills, event publishing |
-| `TradingStuff.RiskService` | Pre-trade risk: buying power, max loss, contract count, daily loss, Greeks limits |
+| `TradingStuff.RiskService` | Pre-trade risk: buying power, max loss, contract count, daily loss, Greeks limits. Inputs come from the stubbed provider or the real IBKR account, per `Portfolio:Source`. |
 | `TradingStuff.MarketDataService` | Option quotes, Greeks, chains. Deterministic generator or IBKR, per `MarketData:Source`. |
-| `TradingStuff.IbkrGateway` | Owns the **single** TWS socket. Contract resolution, chains, quotes, order placement. |
+| `TradingStuff.IbkrGateway` | Owns the **single** TWS socket. Contract resolution, chains, quotes, account/positions, order placement. |
 | `third_party/IBApi` | Vendored IBKR TWS API 10.45.01. Do not edit. |
 | `TradingStuff.AuditDashboard` | Local operator surface |
 | `TradingStuff.ServiceDefaults` | OpenTelemetry, health checks, resilience, dev auth handler |
@@ -70,9 +70,10 @@ Outstanding (from `docs/STATE.md`):
 - In-memory order/event stores → Postgres
 - In-memory event publisher → RabbitMQ
 - `DevelopmentJwtAuthenticationHandler` → Keycloak OIDC/JWT validation
-- IBKR stage 5: account/position sync → replace the stubbed `PortfolioProvider` (**highest priority**:
-  paper-brokerage routing already sends real orders through risk checks fed by fabricated data)
-- Risk engine has 12 breach codes and 1 is tested
+- Verify IBKR stage 5 (account/position sync) against a running paper TWS — it is the only IBKR
+  stage never exercised live
+- Risk engine has 12 breach codes and 1 is tested (**highest priority** now that the risk inputs are
+  real)
 - Python ML signal service
 - Aspire transitive `MessagePack` advisory, pending an upstream patch
 

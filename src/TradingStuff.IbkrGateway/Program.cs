@@ -16,6 +16,7 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<IbkrConnection>())
 builder.Services.AddSingleton<IbkrMarketDataClient>();
 builder.Services.AddSingleton<IbkrOrderTracker>();
 builder.Services.AddSingleton<IbkrOrderClient>();
+builder.Services.AddSingleton<IbkrAccountClient>();
 
 // Reports unhealthy while the socket is down, so Aspire shows the real state instead of "running".
 builder.Services.AddHealthChecks()
@@ -126,6 +127,45 @@ app.MapPost("/ibkr/options/quotes", async (
                 title: "Not connected to TWS.",
                 detail: ex.Message,
                 statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+    })
+    .RequireAuthorization();
+
+// ---- account ----------------------------------------------------------------------------------
+// Read-only. This is what feeds the risk engine real buying power, daily P&L, and Greeks instead of
+// the stubbed portfolio it used to be given.
+
+app.MapGet("/ibkr/account/portfolio", async (
+        [FromQuery] string? accountId,
+        IbkrAccountClient accounts,
+        CancellationToken cancellationToken) =>
+    {
+        try
+        {
+            return Results.Ok(await accounts.GetPortfolioAsync(accountId, cancellationToken));
+        }
+        catch (IbkrRequestException ex)
+        {
+            return Results.Problem(
+                title: "IBKR rejected the account request.",
+                detail: ex.Message,
+                statusCode: ex.IsPermanent ? StatusCodes.Status400BadRequest : StatusCodes.Status502BadGateway,
+                extensions: new Dictionary<string, object?> { ["ibkrErrorCode"] = ex.ErrorCode });
+        }
+        catch (IbkrConnectionException ex)
+        {
+            return Results.Problem(
+                title: "Not connected to TWS.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+        catch (TimeoutException ex)
+        {
+            // TWS accepted the request and never terminated it. Upstream slowness, not a bug here.
+            return Results.Problem(
+                title: "TWS did not answer the account request in time.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status504GatewayTimeout);
         }
     })
     .RequireAuthorization();

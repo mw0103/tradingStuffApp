@@ -121,6 +121,37 @@ public sealed class TradingWorkflowTests
         Assert.Contains(publisher.List(), @event => @event.Name == nameof(OrderLifecycleStatus.Filled));
     }
 
+    [Fact]
+    public async Task An_unreadable_portfolio_stops_the_order_before_it_reaches_a_router()
+    {
+        // The portfolio is a risk input, not a nicety. If it cannot be read, falling back to fixed
+        // figures would approve a real order against numbers nobody checked.
+        var order = SampleOrders.VerticalSpread(OrderType.Market);
+        var quoteResponse = new MarketDataQuoteResponse(
+            SampleOrders.Quotes(order),
+            DateTimeOffset.UtcNow,
+            "test-quotes");
+
+        var repository = new InMemoryOrderRepository();
+        var router = new RecordingOrderRouter();
+
+        var workflow = new ExecutionWorkflow(
+            new OrderRequestValidator(),
+            new FakeMarketDataClient(quoteResponse),
+            new FakeRiskClient(new PortfolioRiskEvaluator(RiskLimits.DevelopmentDefaults)),
+            new UnavailablePortfolioProvider(),
+            router,
+            repository,
+            new InMemoryExecutionEventPublisher(
+                LoggerFactory.Create(_ => { }).CreateLogger<InMemoryExecutionEventPublisher>()));
+
+        await Assert.ThrowsAsync<PortfolioUnavailableException>(
+            () => workflow.SubmitAsync(order, CancellationToken.None));
+
+        Assert.False(router.WasCalled);
+        Assert.Empty(await repository.ListAsync(CancellationToken.None));
+    }
+
     private sealed class FakeMarketDataClient(MarketDataQuoteResponse response) : IMarketDataClient
     {
         public Task<MarketDataQuoteResponse> GetQuotesAsync(
@@ -141,6 +172,30 @@ public sealed class TradingWorkflowTests
     {
         public Task<PortfolioSnapshot> GetPortfolioAsync(string accountId, CancellationToken cancellationToken) =>
             Task.FromResult(portfolio);
+    }
+
+    private sealed class UnavailablePortfolioProvider : IPortfolioProvider
+    {
+        public Task<PortfolioSnapshot> GetPortfolioAsync(string accountId, CancellationToken cancellationToken) =>
+            throw new PortfolioUnavailableException("The IBKR gateway is unreachable.");
+    }
+
+    private sealed class RecordingOrderRouter : IOrderRouter
+    {
+        public string Name => "recording";
+
+        public bool WasCalled { get; private set; }
+
+        public Task<RoutedOrderResult> RouteAsync(
+            Guid orderId,
+            SubmitOrderRequest request,
+            IReadOnlyList<QuoteSnapshot> quotes,
+            CancellationToken cancellationToken)
+        {
+            WasCalled = true;
+
+            return Task.FromResult(new RoutedOrderResult(OrderLifecycleStatus.Filled, []));
+        }
     }
 }
 

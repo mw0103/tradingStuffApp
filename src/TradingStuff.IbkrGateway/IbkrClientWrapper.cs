@@ -166,6 +166,37 @@ public sealed class IbkrClientWrapper(
     public override void tickSnapshotEnd(int tickerId) =>
         registry.Get<ITickSink>(tickerId)?.CompletePartial();
 
+    // ---- account and positions --------------------------------------------------------------
+
+    public override void accountSummary(int reqId, string account, string tag, string value, string currency) =>
+        registry.Get<ListRequest<AccountSummaryValue>>(reqId)?
+            .Add(new AccountSummaryValue(account, tag, value, currency));
+
+    public override void accountSummaryEnd(int reqId)
+    {
+        registry.Get<ListRequest<AccountSummaryValue>>(reqId)?.Complete();
+        registry.Remove(reqId);
+    }
+
+    public override void positionMulti(
+        int requestId,
+        string account,
+        string modelCode,
+        Contract contract,
+        decimal pos,
+        double avgCost) =>
+        registry.Get<ListRequest<AccountPositionRow>>(requestId)?
+            .Add(new AccountPositionRow(account, contract, pos, avgCost));
+
+    public override void positionMultiEnd(int requestId)
+    {
+        registry.Get<ListRequest<AccountPositionRow>>(requestId)?.Complete();
+        registry.Remove(requestId);
+    }
+
+    public override void pnl(int reqId, double dailyPnL, double unrealizedPnL, double realizedPnL) =>
+        registry.Get<PnLRequest>(reqId)?.Apply(dailyPnL, unrealizedPnL, realizedPnL);
+
     // ---- orders ---------------------------------------------------------------------------
 
     public override void orderStatus(

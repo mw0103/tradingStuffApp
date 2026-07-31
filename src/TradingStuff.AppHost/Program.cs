@@ -81,6 +81,10 @@ var execution = builder.AddProject(
     // "paper" simulates fills locally. Set to "ibkr" to send approved orders to the paper account
     // through the gateway. Anything unrecognised stays on paper.
     .WithEnvironment("Execution__Router", "paper")
+    // Fixed development buying power with no positions. Set to "ibkr" to feed risk the real account's
+    // buying power, daily P&L, and position Greeks. Set this whenever Execution__Router is "ibkr":
+    // otherwise real orders are approved against fabricated portfolio inputs.
+    .WithEnvironment("Portfolio__Source", "development")
     .WaitFor(risk)
     .WaitFor(marketData)
     .WaitFor(rabbitmq)

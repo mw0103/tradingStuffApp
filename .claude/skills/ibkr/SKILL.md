@@ -142,8 +142,8 @@ type, whether trading is permitted, in-flight request count).
 
 ## Staged migration — current position
 
-Stages 1–4 are **done and verified against a live paper account**. Details and acceptance criteria in
-`references/migration-plan.md`.
+All six stages are implemented; stages 1–4 and 6 are **verified against a live paper account**.
+Details and acceptance criteria in `references/migration-plan.md`.
 
 | Stage | Status |
 |---|---|
@@ -151,8 +151,26 @@ Stages 1–4 are **done and verified against a live paper account**. Details and
 | 2. Contract resolution + conId cache | **Done** |
 | 3. Chains (`reqSecDefOptParams`) | **Done** |
 | 4. Streaming quotes + Greeks | **Done** |
-| 5. Account/position sync → `PortfolioProvider` | Not started |
+| 5. Account/position sync → `PortfolioProvider` | **Done — not yet exercised against a live TWS** |
 | 6. Order placement (paper only, opt-in) | **Done — round trip filled on the paper account** |
+
+### Account and positions (stage 5)
+
+`IbkrAccountClient` serves `GET /ibkr/account/portfolio` from `reqAccountSummary` +
+`reqPositionsMulti` + `reqPnL`. ExecutionService consumes it through `IbkrPortfolioProvider` when
+`Portfolio:Source=ibkr` (opt-in on the same footing as `Execution:Router`; anything unrecognised
+stays on the fixed development figures).
+
+Three rules the implementation holds to:
+
+- **Every one of those three requests is a subscription.** Cancel in a `finally`, or each portfolio
+  read leaks one. `reqPnL` has no `...End` callback and settles on its first non-sentinel callback.
+- **Greeks come from quoting positions**, because IBKR exposes no portfolio-Greeks API. Scaled by
+  quantity × multiplier so they sum with `PortfolioRiskEvaluator`'s order exposure.
+- **Never default a missing input.** `DailyPnLAvailable`, `GreeksComplete`, and
+  `NonOptionPositionCount` ride along on the response, and an unreadable portfolio raises
+  `PortfolioUnavailableException` (503, no order placed) rather than falling back to stub figures.
+  A defaulted zero daily P&L silently disables `MAX_DAILY_LOSS`.
 
 The deterministic provider remains the default and is what the test suite uses; it is not going away.
 Selection is via `MarketData:Source` (`MarketDataSources.UsesIbkrGateway`), and anything

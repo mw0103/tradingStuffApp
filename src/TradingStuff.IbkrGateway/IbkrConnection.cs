@@ -123,8 +123,9 @@ public sealed class IbkrConnection : IHostedService, IDisposable
     /// Gate that every real order-placement path must call first.
     /// </summary>
     /// <remarks>
-    /// Nothing calls this yet — order routing is deliberately not implemented. It exists so the guard
-    /// is already in place when it is, rather than being retrofitted onto a live code path.
+    /// <see cref="IbkrOrderClient"/> is the only caller, and calls it before touching the socket. The
+    /// read-only account and market-data paths deliberately do not: refusing to read data helps
+    /// nobody, and blocking placement is what matters.
     /// </remarks>
     public void EnsureTradingPermitted()
     {

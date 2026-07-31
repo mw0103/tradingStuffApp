@@ -9,7 +9,7 @@ builder.AddServiceDefaults();
 builder.Services.AddSingleton<OrderRequestValidator>();
 builder.Services.AddSingleton<PaperExecutionEngine>();
 builder.Services.AddSingleton<IOrderRepository, InMemoryOrderRepository>();
-builder.Services.AddSingleton<IPortfolioProvider, DevelopmentPortfolioProvider>();
+builder.Services.AddSingleton<DevelopmentPortfolioProvider>();
 builder.Services.AddSingleton<InMemoryExecutionEventPublisher>();
 builder.Services.AddSingleton<IExecutionEventPublisher>(sp => sp.GetRequiredService<InMemoryExecutionEventPublisher>());
 builder.Services.AddSingleton<IPublishedExecutionEventStore>(sp => sp.GetRequiredService<InMemoryExecutionEventPublisher>());
@@ -40,6 +40,34 @@ builder.Services.AddHttpClient<IbkrOrderRouter>((sp, client) =>
         sp.GetRequiredService<IConfiguration>(),
         "IbkrGateway:BaseUrl",
         "http://ibkrgateway");
+});
+
+builder.Services.AddHttpClient<IbkrPortfolioProvider>((sp, client) =>
+{
+    ServiceClientConfiguration.ConfigureInternalClient(
+        client,
+        sp.GetRequiredService<IConfiguration>(),
+        "IbkrGateway:BaseUrl",
+        "http://ibkrgateway");
+});
+
+// Fixed development figures unless real account data is explicitly opted into. Routing orders to
+// IBKR while leaving this on 'development' evaluates real orders against fabricated buying power,
+// so the two settings belong together.
+builder.Services.AddSingleton<IPortfolioProvider>(sp =>
+{
+    var source = sp.GetRequiredService<IConfiguration>()["Portfolio:Source"];
+
+    if (!PortfolioSources.UsesIbkr(source))
+    {
+        return sp.GetRequiredService<DevelopmentPortfolioProvider>();
+    }
+
+    sp.GetRequiredService<ILogger<Program>>().LogInformation(
+        "Portfolio:Source is '{Source}': risk inputs come from the real IBKR account.",
+        PortfolioSources.Ibkr);
+
+    return sp.GetRequiredService<IbkrPortfolioProvider>();
 });
 
 builder.Services.AddSingleton<PaperOrderRouter>();
@@ -80,6 +108,15 @@ app.MapPost("/orders", async (
         catch (OrderValidationException exception)
         {
             return Results.BadRequest(new { errors = exception.Errors });
+        }
+        catch (PortfolioUnavailableException exception)
+        {
+            // No order is placed. Approving one against a portfolio that could not be read would be
+            // the same failure as approving it against fabricated numbers.
+            return Results.Problem(
+                title: "Portfolio data is unavailable, so the order was not evaluated.",
+                detail: exception.Message,
+                statusCode: StatusCodes.Status503ServiceUnavailable);
         }
     })
     .RequireAuthorization();

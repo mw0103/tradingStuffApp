@@ -1,8 +1,9 @@
 # Staged migration: deterministic provider → IBKR
 
-> **Status (2026-07-31): stages 1–4 and 6 complete**, verified live against a `DU` paper account
-> on TWS server version 223 — real chains, real conIds, real Greeks, and a filled SPXW vertical
-> round trip. Only stage 5 (account/position sync) remains.
+> **Status (2026-07-31): all six stages implemented.** Stages 1–4 and 6 are verified live against a
+> `DU` paper account on TWS server version 223 — real chains, real conIds, real Greeks, and a filled
+> SPXW vertical round trip. Stage 5 (account/position sync) is written and unit-tested but has not
+> yet been exercised against a running TWS.
 
 `DeterministicOptionMarketDataProvider` is the only reason the 6 tests in
 `tests/TradingStuff.Tests/TradingWorkflowTests.cs` are repeatable. It does not get deleted — it
@@ -78,15 +79,38 @@ path.
 subscription count returns to zero after each call; the 6 tests still pass on the deterministic
 source.
 
-## Stage 5 (not started) — Account and positions (read-only)
+## Stage 5 (DONE) — Account and positions (read-only)
 
-`reqAccountSummary` / `reqPositions` → replace the stub behind
-`ExecutionService/PortfolioProvider.cs` so `PortfolioSnapshot.BuyingPower` and `ExistingGreeks`
-reflect the real paper account. Risk checks in `PortfolioRiskEvaluator` get meaningful inputs here —
-this is what makes the existing risk limits real, and it carries zero order-placement risk.
+`IbkrAccountClient` reads `reqAccountSummary`, `reqPositionsMulti`, and `reqPnL`, and
+`IbkrPortfolioProvider` in ExecutionService replaces the stub behind `IPortfolioProvider` when
+`Portfolio:Source=ibkr`. `PortfolioSnapshot.BuyingPower`, `DailyPnL`, `Positions`, and
+`ExistingGreeks` now come from the account orders are actually routed to.
+
+Four things this stage forced:
+
+- **The reqId-scoped variants, not the account-wide ones.** `reqPositions` has no request id, so it
+  cannot be correlated through `IbkrRequestRegistry`; `reqPositionsMulti` can. Same reasoning for
+  `reqAccountSummary` over `reqAccountUpdates`.
+- **All three are subscriptions, not queries.** The `...End` callback ends the *initial* delivery and
+  TWS keeps streaming afterwards, so every read cancels in a `finally`. `reqPnL` has no `...End`
+  callback at all — it settles on the first callback carrying a non-sentinel daily P&L.
+- **IBKR has no portfolio-Greeks API.** `ExistingGreeks` is built by quoting each open option
+  position and scaling by quantity × multiplier, matching how `PortfolioRiskEvaluator` scales the
+  incoming order. Capped at `IBKR:MaxPositionsQuoted` (50) against the 100-line market data limit,
+  and cached for `IBKR:PortfolioCacheSeconds` (5) because every order submission triggers a read.
+- **Gaps are reported, never defaulted.** `IbkrPortfolioSnapshot` carries `DailyPnLAvailable`,
+  `GreeksComplete`, and `NonOptionPositionCount`. A daily P&L silently read as zero disables
+  `MAX_DAILY_LOSS`; a non-option position silently dropped removes its delta from the Greek limits.
+  `IbkrPortfolioProvider` logs each gap, and an unreadable portfolio throws rather than falling back
+  to the development figures.
+
+Note the account-model limit this exposes: `PositionSnapshot` carries an `OptionContract`, so equity
+and futures positions in the account have no representation and their exposure is counted only as a
+warning.
 
 **Done when:** `RiskEvaluationRequest.Portfolio` reflects actual paper-account buying power and
-positions.
+positions. **Met**, pending live verification against TWS — the mapping logic is unit-tested, but no
+round trip has been run against a real account yet.
 
 ## Stage 6 (DONE) — Order placement (paper only)
 
@@ -119,9 +143,14 @@ selection, provider selection fallback, and the `OptionContractKey` regressions.
 Also covered: combo construction (ratio/GCD/spread-count arithmetic, credit sign), `orderStatus` →
 lifecycle mapping, BAG-summary exclusion, and conId-based fill attribution.
 
-Still to add when stage 5 lands:
+Also covered: account selection, account-summary tag fallback and currency preference, position
+contract mapping, `avgCost`-to-per-share conversion, and position Greek scaling including the short
+sign.
+
+Still to add:
 
 - **Integration** — marked with a trait so they are excluded by default, requiring a running paper
-  TWS. Never in the default `dotnet test` run.
+  TWS. Never in the default `dotnet test` run. Stage 5 is the first thing they should cover, since
+  it is the only stage not yet exercised live.
 
 Record the pinned `IBApi` version in `docs/STATE.md`; callback signatures change between releases.

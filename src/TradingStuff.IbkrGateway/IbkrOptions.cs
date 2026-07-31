@@ -38,6 +38,33 @@ public sealed class IbkrOptions
     /// </summary>
     public int QuoteTimeoutSeconds { get; set; } = 8;
 
+    /// <summary>
+    /// How long to wait for the first <c>reqPnL</c> callback before reporting daily P&amp;L as
+    /// unavailable. Short on purpose: a slow P&amp;L subscription must not stall every order.
+    /// </summary>
+    public int PnLTimeoutSeconds { get; set; } = 5;
+
+    /// <summary>
+    /// How long a portfolio read is reused before TWS is asked again.
+    /// </summary>
+    /// <remarks>
+    /// Every order submission reads the portfolio, and reading it quotes each option position for its
+    /// Greeks. Zero disables the cache, at the cost of a market-data fan-out per order.
+    /// </remarks>
+    public int PortfolioCacheSeconds { get; set; } = 5;
+
+    /// <summary>
+    /// Whether to quote open positions for their Greeks. IBKR exposes no portfolio-Greeks API, so
+    /// this is the only way to fill <c>PortfolioSnapshot.ExistingGreeks</c>.
+    /// </summary>
+    public bool IncludePositionGreeks { get; set; } = true;
+
+    /// <summary>
+    /// Ceiling on positions quoted in one portfolio read. Market data lines are capped per account
+    /// (100 by default); past this the Greeks are reported as unavailable rather than partial.
+    /// </summary>
+    public int MaxPositionsQuoted { get; set; } = 50;
+
     public int ReconnectDelaySeconds { get; set; } = 5;
 
     public int MaxReconnectDelaySeconds { get; set; } = 60;
