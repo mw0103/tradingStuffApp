@@ -1,0 +1,529 @@
+.coverage-container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 2rem;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  color: #333;
+  background: #fafafa;
+}
+
+@media (prefers-color-scheme: dark) {
+  .coverage-container {
+    background: #1a1a1a;
+    color: #e0e0e0;
+  }
+}
+
+.coverage-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 2rem;
+  flex-wrap: wrap;
+  gap: 1rem;
+}
+
+.coverage-header h1 {
+  margin: 0;
+  font-size: 2rem;
+  font-weight: 600;
+}
+
+.header-controls {
+  display: flex;
+  gap: 1rem;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.refresh-button {
+  padding: 0.5rem 1rem;
+  background: #0066cc;
+  color: white;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 0.95rem;
+  font-weight: 500;
+  transition: background 0.2s;
+}
+
+.refresh-button:hover:not(:disabled) {
+  background: #0052a3;
+}
+
+.refresh-button:disabled {
+  background: #99ccff;
+  cursor: not-allowed;
+}
+
+.auto-refresh {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  cursor: pointer;
+  font-size: 0.95rem;
+}
+
+.auto-refresh input[type='checkbox'] {
+  cursor: pointer;
+  width: 18px;
+  height: 18px;
+}
+
+.error-box {
+  background: #fee;
+  border-left: 4px solid #d32f2f;
+  padding: 1rem;
+  margin-bottom: 2rem;
+  border-radius: 4px;
+  color: #d32f2f;
+}
+
+@media (prefers-color-scheme: dark) {
+  .error-box {
+    background: #3a1a1a;
+    color: #ff8a8a;
+  }
+}
+
+.loading-box {
+  padding: 2rem;
+  text-align: center;
+  background: #f5f5f5;
+  border-radius: 4px;
+  color: #666;
+}
+
+@media (prefers-color-scheme: dark) {
+  .loading-box {
+    background: #2a2a2a;
+    color: #aaa;
+  }
+}
+
+.coverage-section {
+  margin-bottom: 3rem;
+}
+
+.coverage-section h2 {
+  font-size: 1.3rem;
+  font-weight: 600;
+  margin: 0 0 1rem 0;
+  color: #222;
+}
+
+@media (prefers-color-scheme: dark) {
+  .coverage-section h2 {
+    color: #e8e8e8;
+  }
+}
+
+/* Overall Coverage Summary */
+.coverage-summary {
+  padding: 2rem;
+  border-radius: 8px;
+  border-left: 5px solid;
+  background: #f9f9f9;
+}
+
+@media (prefers-color-scheme: dark) {
+  .coverage-summary {
+    background: #242424;
+  }
+}
+
+.coverage-summary.good {
+  border-left-color: #2e7d32;
+  background: #f1f8f4;
+}
+
+@media (prefers-color-scheme: dark) {
+  .coverage-summary.good {
+    background: #1b3a1f;
+  }
+}
+
+.coverage-summary.warning {
+  border-left-color: #f57c00;
+  background: #fff8f1;
+}
+
+@media (prefers-color-scheme: dark) {
+  .coverage-summary.warning {
+    background: #3a2a1a;
+  }
+}
+
+.coverage-summary.bad {
+  border-left-color: #d32f2f;
+  background: #fdf2f2;
+}
+
+@media (prefers-color-scheme: dark) {
+  .coverage-summary.bad {
+    background: #3a1a1a;
+  }
+}
+
+.coverage-value {
+  font-size: 3rem;
+  font-weight: 700;
+  margin-bottom: 0.5rem;
+}
+
+.coverage-summary.good .coverage-value {
+  color: #2e7d32;
+}
+
+.coverage-summary.warning .coverage-value {
+  color: #f57c00;
+}
+
+.coverage-summary.bad .coverage-value {
+  color: #d32f2f;
+}
+
+.coverage-meta {
+  font-size: 0.95rem;
+  opacity: 0.8;
+}
+
+.coverage-flag {
+  font-size: 0.9rem;
+  font-weight: 500;
+  margin-top: 0.5rem;
+  opacity: 0.9;
+}
+
+.time-range {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+  font-size: 0.95rem;
+  background: #f9f9f9;
+  padding: 1rem;
+  border-radius: 4px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .time-range {
+    background: #242424;
+  }
+}
+
+.time-range div {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.time-range strong {
+  min-width: 50px;
+}
+
+/* Tables */
+.table-wrapper {
+  overflow-x: auto;
+  background: white;
+  border-radius: 4px;
+  border: 1px solid #e0e0e0;
+}
+
+@media (prefers-color-scheme: dark) {
+  .table-wrapper {
+    background: #242424;
+    border-color: #3a3a3a;
+  }
+}
+
+.coverage-table,
+.gaps-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.95rem;
+}
+
+.coverage-table thead th,
+.gaps-table thead th {
+  background: #f5f5f5;
+  border-bottom: 2px solid #ddd;
+  padding: 0.75rem;
+  text-align: left;
+  font-weight: 600;
+  color: #333;
+}
+
+@media (prefers-color-scheme: dark) {
+  .coverage-table thead th,
+  .gaps-table thead th {
+    background: #333;
+    border-bottom-color: #555;
+    color: #e0e0e0;
+  }
+}
+
+.coverage-table tbody tr,
+.gaps-table tbody tr {
+  border-bottom: 1px solid #e0e0e0;
+}
+
+@media (prefers-color-scheme: dark) {
+  .coverage-table tbody tr,
+  .gaps-table tbody tr {
+    border-bottom-color: #3a3a3a;
+  }
+}
+
+.coverage-table tbody tr:hover,
+.gaps-table tbody tr:hover {
+  background: #f9f9f9;
+}
+
+@media (prefers-color-scheme: dark) {
+  .coverage-table tbody tr:hover,
+  .gaps-table tbody tr:hover {
+    background: #2a2a2a;
+  }
+}
+
+.coverage-table td,
+.gaps-table td {
+  padding: 0.75rem;
+}
+
+.coverage-table tbody tr.good {
+  --row-accent: #2e7d32;
+}
+
+.coverage-table tbody tr.warning {
+  --row-accent: #f57c00;
+}
+
+.coverage-table tbody tr.bad {
+  --row-accent: #d32f2f;
+}
+
+.coverage-table tbody tr.good,
+.coverage-table tbody tr.warning,
+.coverage-table tbody tr.bad {
+  border-left: 3px solid var(--row-accent);
+}
+
+.expand-cell {
+  width: 40px;
+  text-align: center;
+  padding: 0 0.5rem;
+}
+
+.expand-button {
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 0.85rem;
+  padding: 0;
+  width: 24px;
+  height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #0066cc;
+  transition: color 0.2s;
+}
+
+.expand-button:hover {
+  color: #0052a3;
+}
+
+.role-cell {
+  font-weight: 500;
+  font-family: 'Courier New', monospace;
+}
+
+.conid-cell {
+  font-weight: 500;
+  font-family: 'Courier New', monospace;
+}
+
+.number-cell {
+  text-align: right;
+  font-family: 'Courier New', monospace;
+}
+
+.coverage-cell {
+  min-width: 200px;
+}
+
+.coverage-bar {
+  height: 24px;
+  background: #e0e0e0;
+  border-radius: 2px;
+  overflow: hidden;
+  margin-bottom: 0.25rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  .coverage-bar {
+    background: #3a3a3a;
+  }
+}
+
+.coverage-fill {
+  height: 100%;
+  background: linear-gradient(90deg, #2e7d32 0%, #66bb6a 100%);
+  transition: width 0.3s ease;
+}
+
+.coverage-bar {
+  border: 1px solid #d0d0d0;
+}
+
+@media (prefers-color-scheme: dark) {
+  .coverage-bar {
+    border-color: #4a4a4a;
+  }
+}
+
+.coverage-percent {
+  font-size: 0.85rem;
+  font-weight: 500;
+  font-family: 'Courier New', monospace;
+}
+
+.coverage-not-measured {
+  font-size: 0.9rem;
+  font-weight: 500;
+  color: #f57c00;
+}
+
+@media (prefers-color-scheme: dark) {
+  .coverage-not-measured {
+    color: #ffb74d;
+  }
+}
+
+/* Segment rows (nested under expanded nodes) */
+.segment-row {
+  background: #fafafa;
+  font-size: 0.9rem;
+}
+
+@media (prefers-color-scheme: dark) {
+  .segment-row {
+    background: #1f1f1f;
+  }
+}
+
+.segment-row td {
+  padding-top: 0.5rem;
+  padding-bottom: 0.5rem;
+}
+
+.segment-conid-cell {
+  padding-left: 2rem;
+}
+
+.segment-label {
+  opacity: 0.85;
+  font-size: 0.85rem;
+}
+
+.segment-bar {
+  height: 16px;
+  margin-bottom: 0.15rem;
+}
+
+.segment-percent {
+  font-size: 0.8rem;
+}
+
+.section-note {
+  font-size: 0.9rem;
+  opacity: 0.75;
+  margin: -0.5rem 0 1rem 0;
+  font-style: italic;
+}
+
+/* Gaps Table */
+.scope-cell {
+  font-family: 'Courier New', monospace;
+  font-size: 0.85rem;
+  max-width: 250px;
+  word-break: break-all;
+}
+
+.reason-cell {
+  font-weight: 500;
+  min-width: 150px;
+}
+
+.datetime-cell {
+  white-space: nowrap;
+  font-size: 0.9rem;
+}
+
+.gaps-table tbody tr.open-gap {
+  font-weight: 500;
+  background: #fffbf0;
+  border-left: 3px solid #f57c00;
+}
+
+@media (prefers-color-scheme: dark) {
+  .gaps-table tbody tr.open-gap {
+    background: #3a2a1a;
+  }
+}
+
+.gaps-table small {
+  opacity: 0.8;
+  font-size: 0.85rem;
+}
+
+.no-data {
+  padding: 1.5rem;
+  text-align: center;
+  color: #666;
+  font-style: italic;
+  background: #f9f9f9;
+  border-radius: 4px;
+}
+
+@media (prefers-color-scheme: dark) {
+  .no-data {
+    background: #242424;
+    color: #aaa;
+  }
+}
+
+/* Responsive */
+@media (max-width: 768px) {
+  .coverage-container {
+    padding: 1rem;
+  }
+
+  .coverage-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+
+  .coverage-header h1 {
+    font-size: 1.5rem;
+  }
+
+  .coverage-value {
+    font-size: 2rem;
+  }
+
+  .coverage-table,
+  .gaps-table {
+    font-size: 0.85rem;
+  }
+
+  .coverage-table td,
+  .gaps-table td {
+    padding: 0.5rem;
+  }
+
+  .coverage-summary {
+    padding: 1.5rem;
+  }
+}

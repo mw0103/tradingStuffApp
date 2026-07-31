@@ -1,9 +1,14 @@
+using TradingStuff.IbkrGateway.Pacing;
+
 namespace TradingStuff.IbkrGateway;
 
 /// <summary>Connection and behaviour settings for the single TWS/IB Gateway socket.</summary>
 public sealed class IbkrOptions
 {
     public const string SectionName = "IBKR";
+
+    /// <summary>Pacing budgets enforced by <see cref="IbkrPacingGovernor"/>.</summary>
+    public IbkrPacingOptions Pacing { get; set; } = new();
 
     /// <summary>Host running TWS or IB Gateway. It must list this machine under Trusted IPs.</summary>
     public string Host { get; set; } = "127.0.0.1";
@@ -26,11 +31,26 @@ public sealed class IbkrOptions
     /// </summary>
     public bool AllowLiveTrading { get; set; }
 
+    /// <summary>
+    /// When true, an order is refused unless its internal-order → broker-order mapping was durably
+    /// persisted first. Off by default so a paper gateway still trades with Postgres down; turn it
+    /// on for any account where an orphaned live order is unacceptable.
+    /// </summary>
+    public bool RequireOrderPersistence { get; set; }
+
     /// <summary>1 live, 2 frozen, 3 delayed, 4 delayed-frozen. Delayed needs no OPRA subscription.</summary>
     public int MarketDataType { get; set; } = 3;
 
     /// <summary>Ceiling for contract-detail and chain round trips.</summary>
     public int RequestTimeoutSeconds { get; set; } = 20;
+
+    /// <summary>
+    /// Ceiling for a historical bars or head-timestamp round trip. Longer than
+    /// <see cref="RequestTimeoutSeconds"/> because a multi-month bar request can legitimately take
+    /// longer than a contract lookup, and the request may also have queued behind the historical
+    /// pacing window before ever reaching the wire.
+    /// </summary>
+    public int HistoricalRequestTimeoutSeconds { get; set; } = 60;
 
     /// <summary>
     /// How long to wait for a quote to become complete (bid, ask, and model Greeks) before returning
@@ -77,6 +97,17 @@ public sealed class IbkrOptions
     /// cancel — a resting limit order legitimately stays working past this.
     /// </summary>
     public int OrderSettleTimeoutSeconds { get; set; } = 20;
+
+    /// <summary>
+    /// Extra time to wait, AFTER a terminal order status, for the per-leg executions to arrive.
+    /// </summary>
+    /// <remarks>
+    /// TWS sends <c>orderStatus="Filled"</c> before the <c>execDetails</c> carrying the fills.
+    /// Returning on the status alone yields a filled order with an empty fill list, which
+    /// ExecutionService then persists — losing the fills. Observed live: fills appeared roughly
+    /// four seconds after the status on a paper SPY vertical.
+    /// </remarks>
+    public int FillSettleGraceSeconds { get; set; } = 10;
 
     /// <summary>
     /// Lets SMART fill combo legs independently. Fills more readily, but accepts leg risk: the order

@@ -1,0 +1,89 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <ItemGroup>
+    <ProjectReference Include="..\TradingStuff.Contracts\TradingStuff.Contracts.csproj" />
+    <ProjectReference Include="..\TradingStuff.ResearchContracts\TradingStuff.ResearchContracts.csproj" />
+    <ProjectReference Include="..\TradingStuff.ServiceDefaults\TradingStuff.ServiceDefaults.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Npgsql" Version="10.0.3" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Migrations ship inside the binary and are applied in name order by MigrationRunner. -->
+    <EmbeddedResource Include="Persistence\Migrations\*.sql" />
+    <!-- Holiday/closure data ships with the generator that reads it, for the same reason: the
+         sessions every downstream consumer is validated against must not be able to drift from the
+         binary that produced them. -->
+    <EmbeddedResource Include="Sessions\exchange-calendars.json" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="TradingStuff.Tests" />
+  </ItemGroup>
+
+  <!-- Build the React ClientApp before the main build target -->
+  <Target Name="BuildClientApp" BeforeTargets="Build">
+    <!-- Ensure directories exist -->
+    <MakeDir Directories="$(IntermediateOutputPath)staticwebassets" />
+    <Exec Command="npm ci" WorkingDirectory="ClientApp" />
+    <Exec Command="npm run build" WorkingDirectory="ClientApp" />
+  </Target>
+
+  <!--
+    wwwroot is a BUILD ARTIFACT here, not source: Vite empties it and rewrites content-hashed
+    filenames on every SPA build. The Web SDK's implicit Content glob runs at EVALUATION, before
+    that has happened, which breaks in two different directions depending on what is on disk:
+
+      - clean checkout, no wwwroot yet -> the glob matches nothing, the assets never reach bin/ or a
+        publish output, and the service starts perfectly while every /ui/* path 404s;
+      - dirty tree with a previous build's hashes -> the glob captures index-<oldhash>.js, npm then
+        deletes it and emits index-<newhash>.js, and the copy fails with MSB3030 on a file that no
+        longer exists.
+
+    Neither is visible from the build log until it bites. So the implicit glob is removed and the
+    item list is populated ONLY after the SPA build has actually emitted, making this target the
+    single authority on what ships.
+  -->
+  <ItemGroup>
+    <Content Remove="wwwroot\**" />
+  </ItemGroup>
+
+  <!--
+    Copied explicitly rather than declared as Content. An ItemGroup written INSIDE a target lands too
+    late to influence CopyToOutputDirectory, so a target-time <Content Include> looks right and does
+    nothing — an earlier attempt did exactly that and appeared to work only because the implicit glob
+    above was still picking wwwroot up on the second and later builds. Verified by deleting wwwroot
+    and building: zero assets reached bin/ until this became a real Copy.
+  -->
+  <Target Name="CopyClientAppToOutput" AfterTargets="Build" DependsOnTargets="BuildClientApp">
+    <ItemGroup>
+      <ClientAppAsset Include="wwwroot\**" />
+    </ItemGroup>
+    <Copy SourceFiles="@(ClientAppAsset)"
+          DestinationFiles="@(ClientAppAsset->'$(OutDir)wwwroot\%(RecursiveDir)%(Filename)%(Extension)')"
+          SkipUnchangedFiles="true" />
+  </Target>
+
+  <!--
+    Publish needs the same treatment through its own item list; without it `dotnet publish` produces
+    a service whose every /ui/* path 404s while the build reports success.
+  -->
+  <Target Name="PublishClientApp" BeforeTargets="ComputeFilesToPublish" DependsOnTargets="BuildClientApp">
+    <ItemGroup>
+      <ClientAppPublishAsset Include="wwwroot\**" />
+      <ResolvedFileToPublish Include="@(ClientAppPublishAsset)">
+        <RelativePath>wwwroot\%(RecursiveDir)%(Filename)%(Extension)</RelativePath>
+        <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+      </ResolvedFileToPublish>
+    </ItemGroup>
+  </Target>
+
+</Project>

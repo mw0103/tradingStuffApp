@@ -1,6 +1,13 @@
+using System.Globalization;
 using Microsoft.AspNetCore.Mvc;
 using TradingStuff.Contracts;
 using TradingStuff.IbkrGateway;
+using TradingStuff.IbkrGateway.History;
+using TradingStuff.IbkrGateway.Pacing;
+using TradingStuff.IbkrGateway.Persistence;
+using TradingStuff.IbkrGateway.Recording;
+using TradingStuff.IbkrGateway.Subscriptions;
+using TradingStuff.ResearchContracts;
 using TradingStuff.ServiceDefaults;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -9,14 +16,30 @@ builder.AddServiceDefaults();
 
 builder.Services.Configure<IbkrOptions>(builder.Configuration.GetSection(IbkrOptions.SectionName));
 
+builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<IbkrRequestRegistry>();
 builder.Services.AddSingleton<IbkrClientWrapper>();
 builder.Services.AddSingleton<IbkrConnection>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<IbkrConnection>());
+
+// Every outbound socket call flows through the governor via PacedSocket — TWS enforces its pacing
+// limits by disconnecting, so nothing is allowed to talk to the wire directly.
+builder.Services.AddSingleton<IbkrPacingGovernor>();
+builder.Services.AddSingleton<PacedSocket>();
+builder.Services.AddSingleton<OrderIdStore>();
+
 builder.Services.AddSingleton<IbkrMarketDataClient>();
+builder.Services.AddSingleton<IbkrHistoricalClient>();
 builder.Services.AddSingleton<IbkrOrderTracker>();
 builder.Services.AddSingleton<IbkrOrderClient>();
 builder.Services.AddSingleton<IbkrAccountClient>();
+
+// Recording plane: raw ticks land here append-only; standing subscriptions are leased through
+// SubscriptionManager rather than fire-and-forget, so a heartbeat failure or a reconnect has a
+// single place that knows what should be subscribed.
+builder.Services.AddSingleton<ObservationRecorder>();
+builder.Services.AddSingleton<SubscriptionManager>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<SubscriptionManager>());
 
 // Reports unhealthy while the socket is down, so Aspire shows the real state instead of "running".
 builder.Services.AddHealthChecks()
@@ -28,6 +51,59 @@ app.UseAuthentication();
 app.UseAuthorization();
 
 app.MapGet("/ibkr/status", (IbkrConnection connection) => Results.Ok(connection.GetStatus()))
+    .RequireAuthorization();
+
+app.MapGet("/ibkr/pacing", (IbkrPacingGovernor governor) => Results.Ok(governor.GetLineBudget()))
+    .RequireAuthorization();
+
+// ---- standing subscriptions ------------------------------------------------------------------
+// Leased, not fire-and-forget: a caller acquires a lease, heartbeats it, and either releases it
+// explicitly or lets it expire (evicted after 3 missed heartbeats). Every lease survives a
+// reconnect via SubscriptionManager's replay — callers never need to notice a disconnect happened.
+
+app.MapPost("/ibkr/subscriptions", async (
+        SubscriptionLeaseRequest request,
+        SubscriptionManager subscriptions,
+        CancellationToken cancellationToken) =>
+    {
+        try
+        {
+            return Results.Ok(await subscriptions.GrantAsync(request, cancellationToken));
+        }
+        catch (ArgumentException ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+        catch (TimeoutException ex)
+        {
+            // No market-data line available (or the pacing budget is exhausted).
+            return Results.Problem(
+                title: "Could not grant the subscription lease.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status429TooManyRequests);
+        }
+        catch (IbkrConnectionException ex)
+        {
+            return Results.Problem(
+                title: "Not connected to TWS.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+    })
+    .RequireAuthorization();
+
+app.MapGet("/ibkr/subscriptions", (SubscriptionManager subscriptions) => Results.Ok(subscriptions.ActiveLeases()))
+    .RequireAuthorization();
+
+app.MapPost("/ibkr/subscriptions/{leaseId:guid}/heartbeat", (Guid leaseId, SubscriptionManager subscriptions) =>
+        subscriptions.Heartbeat(leaseId) ? Results.NoContent() : Results.NotFound())
+    .RequireAuthorization();
+
+app.MapDelete("/ibkr/subscriptions/{leaseId:guid}", async (
+        Guid leaseId,
+        SubscriptionManager subscriptions,
+        CancellationToken cancellationToken) =>
+        await subscriptions.ReleaseAsync(leaseId, cancellationToken) ? Results.NoContent() : Results.NotFound())
     .RequireAuthorization();
 
 app.MapPost("/ibkr/contracts/resolve", async (
@@ -57,6 +133,70 @@ app.MapPost("/ibkr/contracts/resolve", async (
         }
 
         return Results.Ok(new ResolveContractsResponse(resolved));
+    })
+    .RequireAuthorization();
+
+// Underlying resolution as its own endpoint: NodeSelector and RecorderOrchestrator need an
+// underlying's conId (to lease a core-underlying tick subscription) without going through the
+// option-chain path, which resolves it only as an internal step.
+app.MapGet("/ibkr/underlyings/{symbol}/resolve", async (
+        string symbol,
+        IbkrMarketDataClient client,
+        CancellationToken cancellationToken) =>
+    {
+        try
+        {
+            return Results.Ok(await client.ResolveUnderlyingAsync(symbol, cancellationToken));
+        }
+        catch (IbkrRequestException ex)
+        {
+            return Results.Problem(
+                title: "IBKR could not resolve the underlying.",
+                detail: ex.Message,
+                statusCode: ex.IsPermanent ? StatusCodes.Status400BadRequest : StatusCodes.Status502BadGateway,
+                extensions: new Dictionary<string, object?> { ["ibkrErrorCode"] = ex.ErrorCode });
+        }
+        catch (IbkrConnectionException ex)
+        {
+            return Results.Problem(
+                title: "Not connected to TWS.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+    })
+    .RequireAuthorization();
+
+// Enumerates a futures family's contracts, expired and current alike — the discovery step a deep
+// ES intraday backfill needs before it can walk individual quarterly contracts (a CONTFUT rejects a
+// past endDateTime with error 10339; see docs/research/ibkr-data-capability-matrix.md constraint 3
+// and ResearchService's EsContractWalker, the only caller today).
+app.MapGet("/ibkr/futures/{symbol}/contracts", async (
+        string symbol,
+        [FromQuery] string? exchange,
+        [FromQuery] string? currency,
+        IbkrMarketDataClient client,
+        CancellationToken cancellationToken) =>
+    {
+        try
+        {
+            return Results.Ok(await client.GetFuturesFamilyAsync(
+                symbol, exchange ?? "CME", currency ?? "USD", cancellationToken));
+        }
+        catch (IbkrRequestException ex)
+        {
+            return Results.Problem(
+                title: "IBKR could not enumerate the futures family.",
+                detail: ex.Message,
+                statusCode: ex.IsPermanent ? StatusCodes.Status400BadRequest : StatusCodes.Status502BadGateway,
+                extensions: new Dictionary<string, object?> { ["ibkrErrorCode"] = ex.ErrorCode });
+        }
+        catch (IbkrConnectionException ex)
+        {
+            return Results.Problem(
+                title: "Not connected to TWS.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
     })
     .RequireAuthorization();
 
@@ -127,6 +267,127 @@ app.MapPost("/ibkr/options/quotes", async (
                 title: "Not connected to TWS.",
                 detail: ex.Message,
                 statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+    })
+    .RequireAuthorization();
+
+// ---- historical data ----------------------------------------------------------------------------
+// The only surface that reaches reqHistoricalData / reqHeadTimeStamp. Callers are the research
+// backfill coordinator, which needs to tell retry-now (429 + Retry-After), retry-later-differently
+// (400, permanent), and genuinely-empty (200, HasData=false) apart — see the catch order below.
+
+app.MapPost("/ibkr/history/bars", async (
+        HistoricalBarsRequest request,
+        IbkrHistoricalClient historical,
+        HttpContext httpContext,
+        CancellationToken cancellationToken) =>
+    {
+        if (string.IsNullOrWhiteSpace(request.Contract?.Symbol) || string.IsNullOrWhiteSpace(request.Contract.SecType))
+        {
+            return Results.BadRequest(new { error = "A contract symbol and security type are required." });
+        }
+
+        if (string.IsNullOrWhiteSpace(request.Duration) ||
+            string.IsNullOrWhiteSpace(request.BarSize) ||
+            string.IsNullOrWhiteSpace(request.WhatToShow))
+        {
+            return Results.BadRequest(new { error = "Duration, bar size, and whatToShow are required." });
+        }
+
+        try
+        {
+            return Results.Ok(await historical.GetHistoricalBarsAsync(request, cancellationToken));
+        }
+        catch (IbkrPacingRejectedException ex)
+        {
+            // The coordinator's backpressure signal: back off exactly this long and retry the same
+            // slice, rather than treating pacing exhaustion as a request failure.
+            httpContext.Response.Headers["Retry-After"] =
+                Math.Ceiling(ex.RetryAfter.TotalSeconds).ToString(CultureInfo.InvariantCulture);
+
+            return Results.Problem(
+                title: "Historical data pacing budget exhausted.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status429TooManyRequests);
+        }
+        catch (IbkrRequestException ex)
+        {
+            return Results.Problem(
+                title: "IBKR rejected the historical data request.",
+                detail: ex.Message,
+                statusCode: ex.IsPermanent ? StatusCodes.Status400BadRequest : StatusCodes.Status502BadGateway,
+                extensions: new Dictionary<string, object?> { ["ibkrErrorCode"] = ex.ErrorCode });
+        }
+        catch (IbkrConnectionException ex)
+        {
+            return Results.Problem(
+                title: "Not connected to TWS.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+        catch (TimeoutException ex)
+        {
+            // TWS accepted the request and never terminated it (no historicalDataEnd, no error).
+            // Upstream slowness, not a bug here.
+            return Results.Problem(
+                title: "TWS did not answer the historical data request in time.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status504GatewayTimeout);
+        }
+    })
+    .RequireAuthorization();
+
+app.MapPost("/ibkr/history/head-timestamp", async (
+        HeadTimestampQuery request,
+        IbkrHistoricalClient historical,
+        HttpContext httpContext,
+        CancellationToken cancellationToken) =>
+    {
+        if (string.IsNullOrWhiteSpace(request.Contract?.Symbol) || string.IsNullOrWhiteSpace(request.Contract.SecType))
+        {
+            return Results.BadRequest(new { error = "A contract symbol and security type are required." });
+        }
+
+        if (string.IsNullOrWhiteSpace(request.WhatToShow))
+        {
+            return Results.BadRequest(new { error = "whatToShow is required." });
+        }
+
+        try
+        {
+            return Results.Ok(await historical.GetHeadTimestampAsync(request, cancellationToken));
+        }
+        catch (IbkrPacingRejectedException ex)
+        {
+            httpContext.Response.Headers["Retry-After"] =
+                Math.Ceiling(ex.RetryAfter.TotalSeconds).ToString(CultureInfo.InvariantCulture);
+
+            return Results.Problem(
+                title: "Historical data pacing budget exhausted.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status429TooManyRequests);
+        }
+        catch (IbkrRequestException ex)
+        {
+            return Results.Problem(
+                title: "IBKR rejected the head timestamp request.",
+                detail: ex.Message,
+                statusCode: ex.IsPermanent ? StatusCodes.Status400BadRequest : StatusCodes.Status502BadGateway,
+                extensions: new Dictionary<string, object?> { ["ibkrErrorCode"] = ex.ErrorCode });
+        }
+        catch (IbkrConnectionException ex)
+        {
+            return Results.Problem(
+                title: "Not connected to TWS.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+        catch (TimeoutException ex)
+        {
+            return Results.Problem(
+                title: "TWS did not answer the head timestamp request in time.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status504GatewayTimeout);
         }
     })
     .RequireAuthorization();
@@ -234,20 +495,28 @@ app.MapGet("/ibkr/orders/{ibkrOrderId:int}", (int ibkrOrderId, IbkrOrderClient o
         orders.Get(ibkrOrderId) is { } state ? Results.Ok(state) : Results.NotFound())
     .RequireAuthorization();
 
-app.MapPost("/ibkr/orders/{ibkrOrderId:int}/cancel", (
+app.MapPost("/ibkr/orders/{ibkrOrderId:int}/cancel", async (
         int ibkrOrderId,
         CancelOrderRequest request,
-        IbkrOrderClient orders) =>
+        IbkrOrderClient orders,
+        CancellationToken cancellationToken) =>
     {
         try
         {
-            return orders.Cancel(ibkrOrderId, request.Reason) is { } state
+            return await orders.CancelAsync(ibkrOrderId, request.Reason, cancellationToken) is { } state
                 ? Results.Ok(state)
                 : Results.NotFound();
         }
         catch (InvalidOperationException ex)
         {
             return Results.Problem(title: "Cancel refused.", detail: ex.Message, statusCode: StatusCodes.Status409Conflict);
+        }
+        catch (IbkrConnectionException ex)
+        {
+            return Results.Problem(
+                title: "Not connected to TWS.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status503ServiceUnavailable);
         }
     })
     .RequireAuthorization();

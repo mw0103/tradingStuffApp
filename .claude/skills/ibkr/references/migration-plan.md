@@ -136,7 +136,7 @@ Guards, all of them required:
 
 ## Test strategy
 
-The suite is 91 unit tests using fake clients — none of them touch a socket, and none may. Keep them
+The suite is 149 unit tests using fake clients — none of them touch a socket, and none may. Keep them
 on the deterministic provider permanently.
 
 Already covered: tick sentinel guarding (price vs Greek sign rules), delayed-tick-field handling,

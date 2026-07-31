@@ -7,7 +7,7 @@ Updated: 2026-07-31
 - Aspire/.NET solution scaffolded.
 - Execution, risk, market-data, audit dashboard, contracts, service defaults, and AppHost projects created.
 - Paper options workflow implemented with strategy validation, Greeks-aware risk, deterministic quotes, fills, lifecycle events, and local auth.
-- Tests pass: 119/119. Full solution builds.
+- Tests pass: 149/149 (plus 5 Postgres-gated integration tests). Full solution builds.
 
 ### IBKR integration (stages 1-4 and 6 of `.claude/skills/ibkr/references/migration-plan.md`)
 
@@ -163,7 +163,466 @@ before the regression tests added with them.
 - `IbkrConnection.Dispose` threw `ObjectDisposedException` during host shutdown, surfacing as an
   unhandled crash on every stop.
 
+### Research platform planning (milestone 2, 2026-07-31)
+
+Planned end-to-end and documented; no research code written yet. Deliverables:
+`docs/plans/ibkr-edge-research-roadmap.md` (architecture, ranked studies, phases),
+`docs/research/ibkr-data-capability-matrix.md` (runtime-verified data feasibility),
+`docs/research/volatility-forecast-residual-study.md` (pre-registered first study),
+`docs/research/literature-evidence-matrix.md` (~30 verified sources + platform controls).
+
+Key runtime-verified facts (read-only wire probes against paper TWS, 2026-07-31):
+
+- **Live streaming entitlements are shared to the paper account** — `marketDataType=1` came back
+  for SPX, SPY, ES, and an SPXW option (Cboe indexes + OPRA + CME all active). The
+  `ibkr-market-data-type=3` default is safe but no longer necessary for research recording.
+- **SPX option history is weeks deep even for long-listed contracts** (Aug-2026 monthly 7500C:
+  BID_ASK head 2026-06-10; an April request returns no data), and expired options return nothing.
+  Option data must be recorded live-forward; every unrecorded day is unrecoverable.
+- Deep underlying history exists: SPX 1-min TRADES pulled at 2010 (head 2004-03-04), SPY 1-min at
+  2005 (head 1993-01-29), VIX 10y daily (head 2005-10), ES via per-expired-contract walk (~2–3y
+  each; CONTFUT rejects past `endDateTime`, error 10339).
+- SPX/SPXW GTH (overnight) option bars exist (`useRTH=0` bars from 19:15 CT).
+- Historical bar timestamps arrive exchange-local with `formatDate=1`; research ingestion will use
+  `formatDate=2` (epoch) exclusively.
+
+### Research platform Phase 0 (milestone 2, 2026-07-31) — DONE
+
+- **Pacing governor** (`IbkrGateway/Pacing/`): every outbound socket call now flows through
+  `PacedSocket` → `IbkrPacingGovernor`. Budgets ~10% inside TWS's documented limits: 45 msg/s
+  token bucket (order placement/cancel jumps the queue but still consumes tokens), historical
+  window 54/10 min with BID_ASK counting double + 15 s identical-request cooldown + 5-per-2s
+  same-contract limit (throws `IbkrPacingRejectedException` with `RetryAfter` when the wait would
+  exceed the acquire timeout — the future backfill coordinator's 429), and a market-data **line
+  ledger** capped at 90 of the account's 100 with 10 lines reserved for execution-class transient
+  quotes. The previously unbounded quote fan-out now queues at the ledger instead of blowing the
+  account cap. Metrics on Meter `TradingStuff.IbkrGateway`; `GET /ibkr/pacing` reports the ledger.
+- **Broker order-id persistence** (`gateway.ibkr_order_map` + `Persistence/OrderIdStore.cs`): the
+  internal-order → broker-order mapping is written BEFORE `placeOrder` and consulted on every
+  placement, so a caller retry after a gateway restart is refused instead of transmitting a second
+  live order (verified by an integration test that restarts the store). Postgres-down degrades
+  loudly (LogCritical) unless `IBKR:RequireOrderPersistence=true`, which refuses orders instead.
+  Cancel no longer requires the trading gate — cancelling reduces risk and must work exactly when
+  the gate slams shut.
+- **Postgres wired for real**: AppHost `AddPostgres`/`AddDatabase("trading")` (was a decorative
+  `AddContainer`), connection string referenced by the gateway and the new
+  **TradingStuff.ResearchService**, whose advisory-locked `MigrationRunner` owns ALL schema
+  (including `gateway.*`) via embedded ordered migrations. Migration 001: schemas, seeded
+  `research.instruments`, `research.capability_probes`, `gateway.ibkr_order_map`. Migration 002:
+  the 2026-07-31 probe session persisted as ~26 capability rows (`GET /research/capabilities`).
+  New `TradingStuff.ResearchContracts` project for research-domain records.
+- **`IbkrOptionMarketDataProvider` param fix**: `window` and `tradingClass` now survive the
+  MarketDataService hop, so SPXW is reachable without calling the gateway directly.
+- Tests: 125 → **149** (pacing budgets under `FakeTimeProvider`, provider forwarding, migration
+  set), plus 5 `Category=RequiresPostgres` integration tests (migration idempotency + probe seed +
+  order-map restart survival + never-transmitted compensation + broker-id integrity) run via
+  `TRADING_TEST_POSTGRES="Host=...;Username=postgres;Password=..." dotnet test --filter Category=RequiresPostgres`.
+
+### Research platform Phase 1 (milestone 2, 2026-07-31) — CODE-COMPLETE, ACCEPTANCE NOT MET
+
+**Status corrected 2026-07-31.** This section previously said "DONE". That was an overclaim and is
+retracted. Phase 1's own acceptance criterion, written in
+`docs/plans/ibkr-edge-research-roadmap.md`, is *"a full RTH+GTH session at ≥95% coverage, all gaps
+explained, visible in the UI"*. No such session was ever recorded. The phase was marked done on
+unit and Postgres tests alone — **not one line of the recorder had ever run against TWS.**
+
+That was not a bookkeeping slip. It let a fatal defect ship undetected: the recorder subscribed
+with a bare conId and a hardcoded `Exchange = "SMART"`, which TWS **rejects for index conIds with
+error 200**, so SPX and VIX — two of the three core underlyings, including the price series the
+entire research programme depends on — recorded **nothing at all**, silently. Every unit test
+passed the whole time, because they all stub the socket. Found only when a live probe was finally
+run (see the Phase 2 entry). **The Track B recording clock had not actually started.**
+
+The code below is written and unit/Postgres-tested. Treat it as unverified against the broker
+until a live session has been recorded end to end.
+
+- **Migration 003**: `research.option_nodes` (54-row registered grid, 6 DTE buckets × 9 delta
+  nodes, seeded in SQL), `research.node_assignments` (role → conId over time, `assigned_from`/
+  `assigned_to`), `gateway.option_quote_events` + `gateway.underlying_tick_events` (daily
+  RANGE-partitioned, append-only, each with a `DEFAULT` partition safety net), `gateway.recorder_gaps`.
+- **`PartitionMaintainer`** (ResearchService) creates 3 days of partitions ahead on a 6 h sweep.
+  **Verified directly against Postgres 17** that once a row lands in a table's `DEFAULT` partition,
+  Postgres permanently refuses to create the real partition for that date afterward (`updated
+  partition constraint for default partition ... would be violated by some row`) — recovering a
+  stray row needs a manual one-time migration. Mitigated, not automated: fast retry (1 min, not
+  6 h) after a failed sweep, and a `LogCritical` + row-count check every sweep if anything is ever
+  sitting in `..._default` so it cannot go unnoticed.
+- **Gateway `SubscriptionManager`** (`IbkrGateway/Subscriptions/`): standing leases on top of the
+  pacing governor's line ledger — grant/heartbeat/release, `LeasePriority` (CoreRecording/
+  Rotation/AdHoc; `ExecutionReserved` is refused through this API, reserved for the gateway's own
+  transient quotes), eviction after 3 missed heartbeats. `IbkrConnection` gained
+  `SubscriptionsMustReplay`, raised on a fresh `startApi` handshake and on TWS's 1101
+  ("connectivity restored, data lost") — both reset the pacing governor's line ledger first (a
+  fresh `EClientSocket` has zero real TWS lines regardless of what the ledger still thinks) then
+  replay every lease in priority order with a fresh ticker id.
+- **Gateway `ObservationRecorder`** (`IbkrGateway/Recording/`): `RecordingTickSink` (one per
+  standing subscription) accumulates `tickPrice`/`tickSize`/`tickOptionComputation` into full-state
+  rows with a changed-fields bitmask, computes locked/crossed, tags the first tick after a replay
+  so its lease's gap closes automatically. `ITickSink` widened (`tickSize` routed for the first
+  time; `ApplyOptionComputation` now carries IV and underlying price). Two bounded
+  `Channel<T>` (50k, `DropOldest`) feed background batched Npgsql binary `COPY` loops
+  (5000 rows/500 ms). Gap bookkeeping (`OpenGapAsync`/`CloseGapAsync`, deduplicated per scope)
+  records `disconnect`, `line_evicted`, `buffer_overflow`, `write_failure`. A dropped-batch write
+  failure loses the batch (documented — the `write_failures` counter records how much, the gap
+  records that it happened); a saturated channel's `buffer_overflow` gap now **closes** once the
+  backlog drains and a later enqueue observes headroom again — the first version of this only
+  opened it, verified as a real defect and fixed with two deterministic Postgres tests
+  (`ObservationRecorderPostgresTests`) rather than a timing-based one (an earlier attempt at an
+  end-to-end "blast 50k ticks and watch it overflow" test was flaky against a live drain loop and
+  was replaced with direct `OpenGapAsync`/`CloseGapAsync` tests).
+- **`ContractUniverseService`/`NodeSelector`** (ResearchService): bootstrap-only in v1 — strikes
+  picked by a fixed moneyness offset per node role (spot proxy = median strike of a wide chain-window
+  response), never by delta, since there is no delta to target before anything has streamed.
+  **Delta-based drift detection/reassignment is deliberately deferred** — see Left, below.
+  `UpsertAssignmentAsync` closes the prior `node_assignments` row and opens a new one only when the
+  conId actually changes (idempotent reruns are no-ops); `FOR UPDATE` added as cheap insurance
+  against a future concurrent caller even though today's only caller is sequential.
+- **`RecorderOrchestrator`** (ResearchService): every 2 min, bootstraps nodes, ensures leases for
+  **SPX, VIX, SPY** (core underlyings) and every current node assignment, heartbeats everything
+  every 20 s. **ES is deliberately deferred to Phase 2** — front-month resolution needs expiry/roll
+  logic that Phase 2's `EsContractWalker` already owns; duplicating it here for Phase 1 would be
+  exactly the premature abstraction the plan argues against.
+- **`CoverageMonitor`** + `GET /research/coverage`: per-conId and overall coverage ratio (distinct
+  1-minute buckets with data ÷ expected minutes) over a window, plus overlapping `recorder_gaps`
+  rows. `GET /research/nodes` reports current assignments. **Superseded in Phase 2:** the
+  denominator was a fixed UTC window here, which Phase 2 replaced with real session minutes — see
+  the Phase 2 entry for why that made the 95 % gate unreachable by construction.
+- **`/research/*` is anonymous** (matching AuditDashboard's existing unauthenticated `/`) — a
+  deliberate posture change from Phase 0's `RequireAuthorization()` on `/research/status` and
+  `/research/capabilities`, applied consistently to the new endpoints too.
+- **React + Vite research UI** (`src/TradingStuff.ResearchService/ClientApp/`), build wired into
+  the csproj (`npm ci && npm run build` before the C# build), output to `wwwroot/` served under
+  `/ui`. First and only page: **`/ui/coverage`** — overall coverage % (color-coded against the 95%
+  threshold), per-conId table sorted worst-first, gaps table (most recent first, open gaps
+  flagged), manual + 30 s auto-refresh, clear loading/error states.
+- Tests: 149 → **182** unit (`RecordingTickSinkTests` — pure, no Postgres — plus pacing-ledger
+  reset coverage), plus 5 → **18** `Category=RequiresPostgres` integration tests.
+
+### Phase 1 adversarial review — 8 confirmed defects fixed, 2 refuted, 12 investigated
+
+A repeat of Phase 0's practice: a multi-dimension review (concurrency/lifecycle, SQL/persistence,
+data-integrity) against the Phase 1 diff, findings independently re-verified by direct code
+reading and, where possible, live-Postgres reproduction rather than trusted at face value — the
+review tool's own finding-to-verdict pairing across concurrently-completing reviewer agents proved
+unreliable for a couple of entries, so every "confirmed" claim below was re-traced by hand before
+being accepted. Fixed, with a regression test for each unless noted:
+
+- **`node_assignments` could silently hold two "current" rows for one node.** `SELECT ... FOR
+  UPDATE` does NOT prevent this under Read Committed: a blocked FOR UPDATE query re-checks its
+  WHERE clause against the row's new committed version once the blocking transaction's lock
+  releases, and a row that no longer matches (`assigned_to` just got set) is silently excluded —
+  the blocked caller then sees "no current row" and inserts its own. **Reproduced directly against
+  live Postgres 17** (two concurrent transactions, exact race). Fixed with a real guarantee:
+  `CREATE UNIQUE INDEX node_assignments_one_current_idx ON research.node_assignments (node_id)
+  WHERE assigned_to IS NULL` (migration 003) plus a catch-and-retry-once in
+  `NodeSelector.UpsertAssignmentAsync`. Test reproduces the race with two concurrent callers and
+  asserts exactly one current row survives.
+- **A second `SubscriptionsMustReplay` trigger arriving mid-pass was silently dropped**, with no
+  follow-up scheduled — any lease that failed to reissue on the in-flight pass had no other retry
+  path for the rest of the session. `SubscriptionManager.ReplayAsync` now coalesces instead of
+  discarding: a losing trigger sets a pending flag the in-flight pass checks before releasing its
+  gate, looping for one more full pass if set.
+- **The OLD `RecordingTickSink`'s registry entry leaked on every 1101-triggered replay** (TWS
+  "connectivity restored, data lost" — the socket never drops, so `registry.FailAll` never runs,
+  unlike a real disconnect). Fixed: the replay pass now explicitly removes the previous ticker's
+  registry entry once the new one is issued.
+- **A lease's `LineLease` could go stale on a failed replay attempt** and later get disposed by
+  `TeardownAsync` — decrementing the pacing ledger for a line that was never actually re-acquired
+  post-reset, letting the governor silently over-admit relative to the true TWS-side count. Fixed:
+  a failed replay attempt now clears the lease's `LineLease` reference.
+- **Reassigning a node to a new conId leaked its old lease forever.**
+  `RecorderOrchestrator._nodeLeasesByConId` was keyed by conId and only ever grew; an old conId
+  simply stopped appearing in `NodeSelector.GetCurrentAssignmentsAsync`'s result and was never
+  revisited, never released, and kept being heartbeated — permanently consuming a research line
+  per reassignment. Fixed: tracked by nodeId instead, with the old lease explicitly released on
+  detected reassignment.
+- **Coverage silently excluded conIds with zero ticks** — a plain `GROUP BY con_id` over the raw
+  event tables cannot produce a row for a conId that never ticked, so a fully-dead subscription
+  (the worst case this report exists to catch) was invisible rather than showing 0%. Fixed:
+  `CoverageMonitor` now unions tick counts with every current `node_assignments` conId, defaulting
+  missing ones to 0 minutes. (Core underlyings aren't in `node_assignments`, so a fully-dead
+  underlying subscription is a smaller residual gap — noted in the class remarks, not yet closed.)
+- **One un-creatable partition date blocked every other date in the same sweep, for both tables,
+  on every retry, forever** — `EnsureUpcomingPartitionsAsync` had no per-call try/catch. Fixed:
+  each date is now isolated; a failure logs and the sweep continues. Regression test poisons one
+  date (a row already in `DEFAULT` for it, per the earlier-verified Postgres behavior) and confirms
+  the other three still get their partitions.
+- **`WriteOptionBatchAsync`/`WriteUnderlyingBatchAsync` shared one gap scope** (`"recorder:write"`)
+  despite running as two independent concurrent loops — one pipeline's success could close a gap
+  that should still reflect the other still failing. Split into `recorder:write:option` /
+  `recorder:write:underlying`. Same change also added **one bounded retry** before dropping a
+  failed batch (up to 5,000 already-dequeued, otherwise-unrecoverable observations) — a single
+  transient blip now recovers instead of being discarded outright.
+- **`PartitionMaintainer`'s "Created partition" log could fire regardless of whether anything was
+  actually created**, undermining the exact operator trust the `DEFAULT`-row Critical alert (added
+  earlier this phase) depends on. Fixed with an explicit existence check before the
+  `CREATE TABLE IF NOT EXISTS`, rather than trusting the DDL statement's return value.
+
+**Refuted after independent verification** (not fixed — investigated and found not to be real):
+open-interest recording trusting whichever of tick 27/28 fires (correct: IBKR sends only one per
+contract, matching that contract's own right — verified against the documented tick semantics);
+and one theorized stale-`LineLease` disposal path that, on closer trace, does not actually
+occur the way first described (the *related*, real stale-reference issue above was found and
+fixed independently while re-verifying this claim by hand).
+
+### Research platform Phase 2 (milestone 2, 2026-07-31) — sessions, history, backfill
+
+Roadmap Phase 2 (`docs/plans/ibkr-edge-research-roadmap.md`): the historical plane. Shipped:
+
+- **Migrations 004–006.** 004: `sessions`, `backfill_jobs`, `backfill_requests`, `bars`. 005: claim
+  ownership (`claimed_by`, `lease_expires_at`) with a CHECK making every inflight row reclaimable,
+  plus `kind` (historical vs top-up) and per-job `slice_duration`. 006: gap-close provenance (below).
+- **`IbkrHistoricalClient`** — `reqHeadTimeStamp` and `reqHistoricalData` with `formatDate=2`
+  (epoch) so exchange-local timezone strings never enter parsing. `reqRealTimeBars` stays cut.
+- **`SessionCalendarService` + `SessionClock` + `SessionCalendarSynchronizer`** — the platform's
+  single authority for "what data was expected when". `SessionClock` is the only type permitted to
+  call `TimeZoneInfo.ConvertTime`, and it is registered under both its own type and `ISessionClock`
+  so resolving the interface cannot hand out a second clock with a second cache. The synchronizer is
+  a hosted service because `research.sessions` has no other writer and an unwritten session table
+  does not fail loudly — it shrinks every denominator, which makes coverage read *higher*; its timer
+  exists to move the `today + N` horizon under a process that runs for weeks, not to detect change.
+  Verified live: one startup pass materialised 32,682 rows across 4 calendars for 1993→2026.
+- **The coverage denominator was wrong, and wrong in the flattering direction.** It divided
+  tick-bearing minutes by `(to - from)`, so the default trailing-24 h window asked for 1,440 minutes
+  of a market open for about 1,185 and reported single-digit percentages on a perfectly healthy day —
+  which made the roadmap's 95 % acceptance threshold **unreachable by construction, and therefore
+  meaningless**. Expected minutes now come from the union of the RTH and GTH sessions overlapping the
+  window, clipped to it, counted by an ordered sweep rather than summed (`CME_ES` nests RTH inside
+  its Globex row; summing would inflate that denominator by 405 min/day). The numerator is filtered
+  by the same clipped intervals, so numerator ⊆ denominator by construction and an out-of-session
+  tick cannot push a conId past 100 %.
+- **Coverage refuses to report a number it cannot justify.** `research.sessions` is reconciled
+  boundary-for-boundary against what `ISessionClock` generates for the same window; on any
+  disagreement the ratio is `null` with status `sessions-out-of-sync`. This is the class (c)
+  absent-row discipline applied to a denominator: a query over the table cannot emit a row for a
+  *missing* session, and the missing row shrinks the denominator, so absence renders as health in
+  the one direction nobody checks. The clock is a pure function of the checked-in calendar data and
+  never reads the table, so it is a genuinely independent witness. A weekend now reports
+  `no-session-in-window` with no ratio rather than a fabricated 0 % — migration 006's lesson, that a
+  permanently-red gate is a gate nobody reads, applied a second time.
+- **`GET /research/sessions`** — generated vs persisted rows side by side with an `in-sync` /
+  `missing` / `mismatched` / `phantom` state per row, so the calendar everything downstream is
+  validated against can itself be checked.
+- **`BackfillPlanner` / `BackfillCoordinator` / `BackfillStore`** — resumable and idempotent by
+  construction; the request row IS the checkpoint. Claiming is one `UPDATE ... RETURNING` over a
+  `FOR UPDATE ... SKIP LOCKED` candidate subquery, because `SKIP LOCKED` has no
+  "unblock-and-silently-re-evaluate" window (the same Read Committed hazard that produced the Phase 1
+  `node_assignments` defect).
+- **`EsContractWalker`** — enumerates expired ES quarterlies and walks each within-contract, because
+  CONTFUT cannot page into the past (runtime-verified error 10339).
+- **`/research/backfill` + `/ui/backfill`** — per-job slice states, water marks, bars landed.
+
+**Model arbitration for this phase** (per the CLAUDE.md phase-start protocol): Opus attacker vs
+Opus justifier, Fable arbiter. The table's Sonnet/medium row was overridden to **Sonnet/high** for
+the coordinator package on the attacker's argument that a claim/lease/reclaim state machine is a
+split-path lifetime — the class that produced 4 of Phase 1's 8 confirmed defects. Conceded
+counterpoint, recorded because it was not dismissed: the planner's slice arithmetic on its own is
+ordinary date math and does not justify the tier; it rode along on package cohesion, not merit.
+
+### Phase 2 live verification against the paper account (2026-07-31)
+
+Per CLAUDE.md's standing rule that anything touching TWS is exercised against the paper account
+before it is claimed to work. Everything below is an observation from a real socket, not a fixture.
+Two defects were found this way that no amount of mocked testing could have surfaced.
+
+**Defect: settlement returned before the fills existed.** A 1-lot SPY vertical returned
+`filled=1, avgFillPrice=1.28, fills=[], commission=0`; four seconds later the same order read two
+fills (1.67 and 0.39, differencing to exactly 1.28) and commission 1.598693. `WaitForSettlementAsync`
+awaited only terminal `orderStatus`, but TWS sends that BEFORE `execDetails` and those before
+`commissionAndFeesReport` — so ExecutionService would have persisted a filled order with no fills as
+its permanent record. Fixed with a post-settlement grace (`IbkrOptions.FillSettleGraceSeconds`,
+default 10 s) that waits for every leg to report an execution AND every execution to report its
+commission; expiry is logged loudly, never thrown, because a filled order reported with partial
+fills still beats failing a completed order. Re-verified by placing another live paper vertical:
+fills and commission both present at return.
+
+**Defect: a dead recorder's gap stayed open forever.** Only the process that opens a
+`recorder_gaps` row ever closes it, so an ungraceful exit leaves `ended_at` NULL permanently — and
+`CoverageMonitor` counts an unended gap as overlapping EVERY later window. One crash would have
+made coverage permanently red, and coverage is the gate that admits a recorded day into a study.
+Found by killing the gateway three times during this session and noticing two immortal gaps. Fixed:
+migration 006 adds `closed_by` (`observed` | `inferred`) with a CHECK tying it to `ended_at`, and the
+gateway bounds orphaned gaps at startup — marked `inferred`, because the interval really was
+unrecorded but nobody watched it end, so `ended_at` is an upper bound rather than a measurement.
+
+**Verified working live** (paper account `DU…`, TWS 127.0.0.1:7497, serverVersion 223):
+
+- Head timestamps match the plan's recorded floors exactly: SPX 2004-03-04, SPY 1993-01-29,
+  VIX 2005-10-03, SPY BID_ASK 2004-01-23.
+- Expired-futures history is deeper than assumed: ESZ4 (conId 495512557) reports a head of
+  **2021-06-06**, ~3.5 years before its expiry, against the roadmap's 2-year guaranteed floor.
+  60 one-minute bars pulled from it. 29 ES contracts enumerated.
+- Daily bars carry `tradingDate` with a null `timestamp`; intraday bars the reverse — the intended
+  split, confirmed on the wire rather than assumed.
+- **Pacing governor under real load**: 20 concurrent historical requests all returned 200 with
+  latencies staggered 0.1 s → 24 s. No 162, no pacing violation, and the socket never reconnected.
+- **Reconnect and lease replay**, the path that had never once executed: forced a genuine socket
+  drop via a local TCP proxy (no root needed to kill the connection). A `disconnect` gap opened at
+  19:34:49.48 and closed at 19:34:51.18; recorded ticks stop at :49 and resume at :51, exactly the
+  one missing second. The lease survived and replayed.
+- **Backfill backpressure**: the coordinator claimed a slice, the governor returned 429 with
+  `Retry-After`, and it backed off 253 s and released the slice with its attempt refunded — no
+  stranded inflight row, no attempt burned on a rejection that never reached TWS.
+- Order cancel: a resting limit order (0.05 on a spread worth ~1.7) reached `Cancelled`.
+- Portfolio with position Greeks and daily P&L, against positions the test orders had just opened.
+- `gateway.ibkr_order_map` persists internal id ↔ broker id ↔ permId ↔ terminal status across
+  restarts. With a deliberately wrong connection string the gateway logged Critical and still
+  traded, which is `RequireOrderPersistence=false` behaving as documented.
+
+**Defect: an evicted lease's gap was never closed, on purpose.** `SweepExpiredAsync` opened a
+`line_evicted` gap and deliberately left it open, reasoning that the lease is finished permanently.
+That reasoning is right about the lease and wrong about the row: `CoverageMonitor` does not read an
+unended gap as "this lease ended", it reads it as "recording is missing, and still missing", against
+every window from then on. Because ResearchService is expected to redeploy constantly — that is the
+stated reason the recorder lives in the gateway rather than beside it — each redeploy abandons its
+~54 node leases, the gateway evicts them after 3 missed heartbeats, and **one redeploy would poison
+coverage forever**. Observed live: 80 immortal gaps from a single afternoon of restarts. Fixed by
+bounding the gap at teardown with `closed_by = 'inferred'`. The real question ("was this conId
+covered?") is answered by the per-conId tick counts, which span lease changes; the row now only
+explains where one lease's stream stopped.
+
+**Defect: every `/ui/*` path returned 404 while the service reported healthy.** Two independent
+causes, both invisible to the build. First, `WebApplication` inserts `UseRouting` ahead of all user
+middleware, so the `/ui/{**slug}` SPA fallback was selected as an endpoint before
+`StaticFileMiddleware` ran — and that middleware deliberately does nothing once an endpoint is
+chosen, so no real asset was ever reachable. Routing is now declared explicitly after
+`UseStaticFiles`. Second, the fallback's `StaticFileOptions` carried `RequestPath = "/ui"`, but the
+fallback rewrites the path to the bare file name, which can never carry that prefix, so the lookup
+missed every time. Separately, Vite writes into `wwwroot` after MSBuild evaluation, so the SDK's
+implicit glob matched nothing and the assets never reached `bin/` or a publish output — a published
+service would have shipped with no UI at all. All three fixed and verified by loading both pages.
+
+**Known nit, not fixed:** `/ui/backfill` can render a negative relative age ("-95s ago") when the
+Postgres container's clock leads the browser's. Cosmetic, but a negative age on an operator
+dashboard reads as a bug in the data rather than in the clock; worth clamping at zero.
+
+**Live observation worth keeping:** portfolio positions come back with `exchange: "AMEX"` while
+chains and quotes use `SMART`. `PortfolioRiskEvaluator` joins quotes to order legs by whole-record
+equality, so this would silently zero every Greeks and max-loss check if the two ever met — they do
+not, because `QuoteRequest` echoes the contract it was ASKED for rather than TWS's normalized one
+(verified live: requested SMART, returned SMART). Worth remembering before anyone "simplifies" that
+echo into using the resolved contract.
+
+### Phase 2 adversarial review — 19 confirmed defects fixed, 7 refuted
+
+Two review passes, 89 agents: one over the committed Phase 2 diff (11 confirmed of 22 raised), one
+over the gap-detection package (8 confirmed of 20). Structure was deliberately adversarial — diverse
+finder lenses, then a **three-lens refutation panel per finding** (read-the-code, reproduce-it,
+does-it-actually-mislead), defaulting to refuted and killing anything ≥2 reviewers rejected. That
+killed 7 findings, and on one survivor a dissenter established that exhausted-counts-as-settled is
+deliberate, documented and tested, which scoped the fix to four narrow faults instead of tearing out
+a working design. A single reviewer both generating and judging its own claims would have done
+neither.
+
+**One theme accounts for most of it: a subsystem reporting "finished" or "clean" over work that was
+never done.** Six instances, all fixed:
+
+- **The gap detector had a hole exactly where losses accumulate.** A historical job's audit ceiling
+  was its frozen `target_to` and a top-up's was a 2-day lookback, so the band between them widened by
+  a day per day of operation and no job's analysis covered it. Reproduced: three deliberately-emptied
+  RTH sessions reported `checked` with zero gaps, and asking for those days explicitly returned
+  `window-rejected` on both jobs. Fixed by auditing to `now` and adding `GapReport.Series`, a
+  cross-job reconciliation grouped on `(conId, whatToShow, barSize, useRth)` that subtracts audited
+  from claimed windows, plus per-job `Unaudited` ranges — a window nothing looked at can no longer
+  render as an empty gap list. **Verified live**: SPX's historical and top-up jobs now reconcile as
+  one series with no unaudited remainder.
+- **Nothing planned that band either.** `PlanHistorical` walked backward from the frozen `target_to`
+  and `PlanTopUp` planned only the current 15-minute bucket, so any outage longer than an hour lost
+  minute bars permanently. Added `PlanForward` (to a floored UTC midnight, so same-day reruns still
+  add zero rows) and a bounded top-up catch-up window. **Verified live**: the forward anchor returns
+  390 SPX bars for exactly the band nothing used to request.
+- **The ES walker declared 100% with 25 of 29 contracts unplanned.** Completion was derived from
+  request-row counts, and a contract skipped on a failed head probe contributes no rows, so it cannot
+  lower any count. It now counts contracts it could not plan and forces `running` when planning was
+  partial.
+- **Exhausted slices flipped a job to `complete` at 100%.** Kept the exhausted-is-settled accounting;
+  added terminal status `complete_with_gaps` (migration 009), made `PercentComplete` count only
+  resolved slices, and made status derived each pass rather than latched. The operator path back is
+  raising `MaxAttempts` — which already makes exhausted rows claimable, and now reopens the job too.
+- **A transient failure burned an attempt with no backoff.** Added `GatewayOutcome.Unreachable` split
+  on `HttpRequestError`: a connection/DNS/TLS failure provably never reached TWS, so it refunds the
+  attempt like `Paced` does; genuinely ambiguous failures stay `Transient` and now back off instead of
+  spinning. `BrokenCircuitException` was escaping the catch filter and stranding `inflight` rows.
+- **Coverage capped a flawless day near 50%.** Every conId was measured against the whole window
+  regardless of how long it held its node assignment, and node rotation is routine (every 2 minutes,
+  and at every UTC date roll). Now reported **per node role** — the identity the 95 % gate is actually
+  about — summing each conId's own tenure intersected with session minutes, with per-conId segments
+  kept visible underneath so a contract that dies on assignment still shows 0 % rather than being
+  smoothed into a healthy average. A latent bug fell out of this: the expected-conId query had **no
+  window filter at all**, so a historical report mixed in current assignments.
+
+**Order safety.** The fill-settle grace added earlier the same day was itself defective: it completed
+on the first execution per leg, so a 5-lot vertical would persist 2 fills totalling 7 contracts
+instead of 3 totalling 10 — and its comment claimed distinct-leg counting was what made it correct,
+which is backwards. The sound predicate needed information the tracker did not have: `orderStatus`
+counts a BAG in **spreads** while `execDetails` counts each leg in **contracts**, so leg *i* owes
+`filled × ratio[i]` and the combo ratio now travels with the leg index. It sums stored fill
+quantities (not TWS's cumulative field — the question is whether the list about to be persisted is
+complete) and only evaluates once terminal, since a predicate satisfied mid-partial-fill would latch
+a `TaskCompletionSource` that cannot be un-set. It fails safe: if `filled` were ever in leg contracts
+the expected total is only too high, giving a timeout and a warning rather than a truncated record.
+
+**Lease lifetime, rewritten rather than patched.** `ActiveLease` is now an encapsulated state machine
+— ticker, line lease, heartbeat and terminated flag private behind one lock, reachable only through
+check-and-mutate-as-one-step methods. Four defects fell out of that: `ReleaseAsync` never bounded its
+gap (the eviction-path fix had been applied to only one of two termination paths, and release runs
+every 2 minutes on rotation); replay and teardown raced through `ContainsKey` check-then-act, leaking
+a market-data line and a live TWS subscription per occurrence against a budget of 80; a lease granted
+*during* a replay pass was never replayed and silently recorded nothing for the session; and
+`OnSinkFailed` fired its gap-open loose, so with `FailAll` faulting ~54 sinks at once the INSERT could
+land after termination had already looked for something to close. The structural claim holds:
+`TryClaimTermination` is the only way to obtain the state needed to unwind, and one `TerminateAsync`
+is its only caller, so a future third termination path cannot skip the gap close.
+
+**Also fixed:** `reqHeadTimeStamp` classified a genuine no-data 162 as transient and re-probed forever
+at one paced request per attempt (162 is overloaded — the existing bars-path discriminator now
+applies); basis priority ranked `empty`/`permanent` above `exhausted`, so an abandoned range read as
+benign; the daily-bar path compared date-overlap expectations against instant-containment landings,
+fabricating `succeeded_but_absent` for present data; an in-progress session flagged as the
+checkpoint-lied alarm on every poll during market hours; the reported bars figure summed pre-dedup
+TWS counts (migration 009 adds `bars_landed`, populated from the insert's row count); and the overall
+coverage ratio returned a fabricated 0 % when *no instrument was being measured at all* — a fresh
+deployment reading as total failure, the loudest possible false alarm.
+
+**Two verification notes worth keeping.** Every agent verified its regression tests by reintroducing
+the defect and confirming they fail — the negative control that distinguishes a test which would have
+caught the bug from one that merely encodes it. And the lease agent caught its own false-green from a
+stale incremental build by probing rather than trusting the run. Both practices are now the standard
+for this project.
+
+**Unfixed, deliberately.** `CBOE_VIX_GTH` is not added to `exchange-calendars.json` despite the live
+measurement (VIX 1-min runs 02:15–15:59 CT, not `CBOE_INDEX_GTH`'s 19:15–08:15): that file is the
+ground truth every downstream artifact is validated against (CLAUDE.md class (b)) and one day's
+observation is not a published schedule. The evidence is recorded in `InstrumentCalendars` for
+whoever writes it. The RTH expectation currently under-flags, which is the safe direction.
+
 ## Left
+
+Milestone 2 (research platform — sequenced in `docs/plans/ibkr-edge-research-roadmap.md`):
+
+- **Node drift detection and reassignment** — Phase 1 shipped bootstrap-only node selection
+  (fixed moneyness offsets). Re-evaluating a node's assigned strike against its own recorded delta
+  once streaming (the roadmap's "|Δ−target| > 0.10 sustained 30 min" rule), with dual-subscribe
+  overlap and a churn cap, is a deliberate, documented follow-up — not implemented yet.
+- **Per-conId session calendars.** Coverage uses ONE denominator (Cboe RTH+GTH) for every conId,
+  but SPY is NYSE-calendared and neither the SPX nor the VIX index level updates through Cboe GTH,
+  so those three underlying lines cannot exceed roughly a third of the denominator however healthy
+  the recording is — and `OverallCoverageRatio` is an unweighted mean, so they drag it down a couple
+  of points. Not a regression (the old wall-clock denominator was worse for everything), but until
+  this is fixed **read the 95 % gate against the option-node rows, not the overall figure**. Doing
+  it properly needs a conId → instrument → calendar mapping, and the core underlyings are not in
+  `node_assignments` to hang one off.
+- **A dead core-underlying subscription is still invisible.** Phase 1 fixed this for option nodes by
+  unioning tick counts with `node_assignments`, but the core underlyings are not in that table, so a
+  fully-dead SPX/VIX/SPY line still produces no row rather than a 0 % row. Same absent-row class as
+  the defects above; carried forward knowingly.
+- **No repair-on-demand for a drifted `research.sessions`.** Recovery is a restart or the 12 h
+  timer. A sync trigger on an endpoint was rejected deliberately: regenerating can retire a
+  published session row, which must not be a side effect of a page refresh.
+- Phases 3–8: snapshots → features/labels/baselines/study runner → residual models →
+  implied-vs-forecast study → execution simulator → shadow ops.
+
+Milestone 1 remainder:
 
 - Replace in-memory order/event stores with Postgres.
 - Replace in-memory event publisher with RabbitMQ.
@@ -234,8 +693,11 @@ Index options need four things equities do not, all now handled:
 
 ## Notes
 
-- Market data defaults to **delayed** (`ibkr-market-data-type=3`) because it needs no OPRA
-  subscription. Set to `1` for live once the account has market data subscriptions.
+- Market data defaults to **delayed** (`ibkr-market-data-type=3`) so the stack works without
+  subscriptions. The account's live entitlements (Cboe indexes, OPRA, CME) are verified shared to
+  the paper user (2026-07-31 probes) — set `1` for live. Caveat from the official FAQ: if live and
+  paper sessions run simultaneously they must be on the same device, or the paper session
+  receives no data.
 - `SubmitOrderRequest.LimitPrice` is a **whole-order** net (matching `PaperExecutionEngine`); TWS
   wants a **per-combo** net. `IbkrOrderBuilder.PerSpreadPrice` converts. They are identical at one
   spread, so the difference only appears on multi-lot orders.

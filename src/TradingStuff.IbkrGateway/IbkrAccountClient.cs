@@ -33,6 +33,7 @@ public sealed record IbkrPortfolioSnapshot(
 /// </remarks>
 public sealed class IbkrAccountClient(
     IbkrConnection connection,
+    Pacing.PacedSocket socket,
     IbkrMarketDataClient marketData,
     IOptions<IbkrOptions> options,
     ILogger<IbkrAccountClient> logger)
@@ -327,7 +328,6 @@ public sealed class IbkrAccountClient(
         DateTimeOffset connectedAt,
         CancellationToken cancellationToken)
     {
-        var client = connection.RequireClient();
         var registry = connection.Registry;
         var timeout = TimeSpan.FromSeconds(_options.RequestTimeoutSeconds);
 
@@ -337,17 +337,17 @@ public sealed class IbkrAccountClient(
 
         // "All" rather than the account id: TWS rejects a group naming a single account unless it has
         // been defined as an account group in TWS itself. Rows are filtered by account on the way out.
-        client.reqAccountSummary(summaryId, "All", SummaryTags);
+        await socket.ReqAccountSummaryAsync(summaryId, "All", SummaryTags, cancellationToken);
 
         var positions = new PositionsSubscription();
         var positionsId = registry.NextRequestId();
         registry.Register(positionsId, positions);
-        client.reqPositionsMulti(positionsId, account, string.Empty);
+        await socket.ReqPositionsMultiAsync(positionsId, account, string.Empty, cancellationToken);
 
         await summary.InitialDelivery.WaitAsync(timeout, cancellationToken);
         await positions.InitialDelivery.WaitAsync(timeout, cancellationToken);
 
-        var pnl = await TryOpenPnLAsync(client, registry, account, cancellationToken);
+        var pnl = await TryOpenPnLAsync(registry, account, cancellationToken);
 
         logger.LogInformation(
             "Opened account streams for the connection established at {ConnectedAt} " +
@@ -361,7 +361,6 @@ public sealed class IbkrAccountClient(
     }
 
     private async Task<PnLSubscription?> TryOpenPnLAsync(
-        EClientSocket client,
         IbkrRequestRegistry registry,
         string account,
         CancellationToken cancellationToken)
@@ -372,7 +371,7 @@ public sealed class IbkrAccountClient(
 
         try
         {
-            client.reqPnL(pnlId, account, string.Empty);
+            await socket.ReqPnLAsync(pnlId, account, string.Empty, cancellationToken);
 
             await pnl.InitialDelivery
                 .WaitAsync(TimeSpan.FromSeconds(_options.PnLTimeoutSeconds), cancellationToken);

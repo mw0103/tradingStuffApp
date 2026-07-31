@@ -72,7 +72,7 @@ public sealed class IbkrGatewayTests
         request.ApplyPrice(TickType.ASK, 2.05d);
         Assert.False(request.Task.IsCompleted);
 
-        request.ApplyOptionComputation(TickType.MODEL_OPTION, 0.55d, 0.02d, 0.09d, -0.03d);
+        request.ApplyOptionComputation(TickType.MODEL_OPTION, 0.20d, 0.55d, 0.02d, 0.09d, -0.03d, 100d);
 
         var quote = await request.Task;
         Assert.Equal(1.95m, quote.Bid);
@@ -90,7 +90,7 @@ public sealed class IbkrGatewayTests
 
         request.ApplyPrice(TickType.DELAYED_BID, 1.10d);
         request.ApplyPrice(TickType.DELAYED_ASK, 1.20d);
-        request.ApplyOptionComputation(TickType.DELAYED_MODEL_OPTION, -0.40d, 0.03d, 0.08d, -0.02d);
+        request.ApplyOptionComputation(TickType.DELAYED_MODEL_OPTION, 0.20d, -0.40d, 0.03d, 0.08d, -0.02d, 100d);
 
         var quote = await request.Task;
         Assert.Equal(1.10m, quote.Bid);
@@ -106,7 +106,7 @@ public sealed class IbkrGatewayTests
 
         request.ApplyPrice(TickType.BID, 1.95d);
         request.ApplyPrice(TickType.ASK, 2.05d);
-        request.ApplyOptionComputation(TickType.BID_OPTION, 0.55d, 0.02d, 0.09d, -0.03d);
+        request.ApplyOptionComputation(TickType.BID_OPTION, 0.20d, 0.55d, 0.02d, 0.09d, -0.03d, 100d);
 
         Assert.False(request.Task.IsCompleted);
     }
@@ -118,7 +118,7 @@ public sealed class IbkrGatewayTests
 
         request.ApplyPrice(TickType.BID, 1.95d);
         request.ApplyPrice(TickType.ASK, 2.05d);
-        request.ApplyOptionComputation(TickType.MODEL_OPTION, -2d, double.MaxValue, double.MaxValue, double.MaxValue);
+        request.ApplyOptionComputation(TickType.MODEL_OPTION, 0.20d, -2d, double.MaxValue, double.MaxValue, double.MaxValue, 100d);
 
         Assert.False(request.Task.IsCompleted);
     }

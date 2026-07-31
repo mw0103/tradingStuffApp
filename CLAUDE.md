@@ -18,7 +18,7 @@ mkdir -p /tmp/dotnet_home
 
 ```bash
 dotnet build TradingStuff.slnx
-dotnet test tests/TradingStuff.Tests/TradingStuff.Tests.csproj -m:1    # 119 tests, all should pass
+dotnet test tests/TradingStuff.Tests/TradingStuff.Tests.csproj -m:1    # 149 tests, all should pass
 aspire start --non-interactive                                        # full distributed app
 ```
 
@@ -81,17 +81,155 @@ Milestone 1 is **not** complete: persistence and event transport are unmet, and 
 Keycloak start but nothing connects to them. Prerequisites and gotchas are in `docs/STATE.md`; API
 detail is in the `ibkr` skill.
 
+## Model and effort policy (milestone 2 research phases) — MANDATORY DEFAULT
+
+This is a default that governs behavior, not a suggestion to surface and move past. **Use the
+recommended model and reasoning effort for the work at hand unless one of the two exceptions below
+applies.** At the start of any research-platform task, check which phase is active in
+`docs/STATE.md` (the "Left" list names the next phase; the last "Done" entry names the completed
+one), then match the work against this table:
+
+| Work | Model | Reasoning effort |
+|---|---|---|
+| Phase 1–3 and Phase 7 implementation (recorder, backfill, snapshots, execution simulator) | Sonnet | medium |
+| Phase 4 implementation (features, labels, baselines, study runner) | Sonnet | high |
+| Phase 5, 6, 8 (residual models + gates, implied-vs-forecast study, shadow/live ops) | Opus | high |
+| ALL leakage reviews and order-safety reviews, any phase | Opus | high |
+| UI (`ClientApp/`) and documentation work | Haiku | low |
+
+**Class-based overrides — these beat the phase row above, whatever phase the work falls in.**
+Derived from measured review outcomes (see `docs/STATE.md`), not from guesses about difficulty:
+
+- **(a) Split-path lifetime state machines → Opus/high.** Any object or row whose
+  acquire/complete/release is managed across two or more interleaving code paths: leases,
+  registries, replay/reconnect reconciliation, claim-then-update coordinators, crash/inflight
+  reapers. *This class produced 4 of Phase 1's 8 confirmed defects, all top-severity.*
+- **(b) Ground-truth manufacturers → Opus/high.** Anything producing the reference data other
+  components are validated *against* — session calendars, clocks, the as-of/cutoff machinery. A
+  defect here is invisible by construction: the validating artifact inherits the same bug.
+- **(c) Negative-claim acceptance criteria → minimum Sonnet/high.** Packages whose correctness
+  statement is "nothing is silently missing / a rerun adds nothing / no duplicates exist" — gap
+  reports, coverage, idempotency assertions. The phase review must name the absent-row check AND
+  which table the negative claim is measured on. *Three Phase 1 defects shared one root: a query
+  cannot emit a row for the absent case, so absence renders as health.*
+- **(d) Read-only UI stays Haiku/low** even when listed beside backend work — empirically zero
+  defects across two shipped phases. Defend this row against escalation. A server-side aggregation
+  endpoint is NOT UI: it belongs to the package owning its query semantics.
+
+**The two exceptions, and only these — both require words in the prompt itself:**
+1. The prompt says not to apply this policy (for this task, or generally).
+2. The prompt names a specific model or effort level to use for this task.
+
+**A `/model` switch is NOT an exception**, no matter how immediately it precedes the prompt.
+Changing the session model is ambient state, not an instruction, and is at least as likely to be a
+mistake, a leftover from earlier work, or unrelated to the task being asked for. "The user selected
+Opus, so they must want Opus for this" is exactly the inference this policy exists to prevent —
+only an explicit in-prompt instruction overrides the table.
+
+Absent an in-prompt exception, apply the policy without asking and without waiting for confirmation:
+
+- **Main-loop work**: if the active session model/effort does not match the row for the work about
+  to start, say so in one line and **delegate that work to the matching pinned agent below** — do
+  not do it inline on the wrong model. Delegation is the default remedy, not a preference. Only
+  when delegation is genuinely impossible (a one-line fix mid-task; the work is inseparable from an
+  interactive back-and-forth) may the work proceed on the session's model, and then only by saying
+  so plainly first.
+- **Delegated work (Agent/Workflow tool calls)**: always pass the `model` (and `effort` inside
+  Workflow's `agent()` calls) matching the table — this is fully within direct control and has no
+  excuse for drifting from policy.
+
+Pinned-model agents exist for exactly this: `implementer` (Sonnet), `ui-builder` (Haiku),
+`leakage-reviewer` (Opus, high effort) — see `.claude/agents/`. Route leakage/order-safety review
+work through `leakage-reviewer` rather than reviewing inline on a smaller model. If a project-level
+agent isn't yet visible to the current session's Agent tool (a known lag right after the agent
+files are added), fall back to `general-purpose` with an explicit `model` override matching the
+table rather than dropping the policy.
+
+### Phase-start validation: adversarial, with a separate arbiter
+
+Before starting a phase, decide the per-work-package model assignment with a three-agent
+adversarial structure, not a single validator:
+
+1. **Attacker (Opus, high)** — argues the standing table is already correct for every package, and
+   attacks each candidate escalation on its merits.
+2. **Justifier (Opus, high)** — argues for escalation wherever warranted, making the strongest
+   available case.
+3. **Arbiter (Fable)** — decides per package, on the arguments presented.
+
+The table is a prior written in advance from a guess at phase difficulty; it is not a measurement,
+and this step exists to correct it. But a single validator both *generates* the escalation case and
+*judges* it, which is precisely where bias hides — telling one model to "watch its own bias" is a
+weak corrective. Assigning the two sides removes the stake: an agent instructed to argue against
+escalation has no incentive to escalate, and the arbiter adjudicates a narrow question (which brief
+is better supported) rather than an open-ended one.
+
+Constraints that make this work rather than just cost three times as much:
+
+- **Per work package, not per phase.** A phase mixes genuinely subtle work with plumbing; one
+  verdict for the whole phase is too coarse to act on.
+- **The table wins ties.** If the briefs are evenly matched, the default stands. Deviation requires
+  positive justification, or "balanced" quietly becomes a ratchet upward.
+- **Escalation triggers** — a deviation must name at least one; "seems complex/important" is not
+  one: novel concurrency or process-lifecycle invariants; correctness that is hard to cover with
+  tests (timezone/session semantics — **especially any single authority whose output downstream
+  artifacts are validated against**, because the operative hazard is not that conversion is hard
+  but that the validator and the validated share an assumption, which is exactly what defeats the
+  "but it is a testable oracle" counter-argument; decimal/precision boundaries; idempotency under
+  concurrency; partitioning/storage-engine semantics); safety invariants (order placement,
+  live-capital gates, the leakage firewall); irreversible or unrecoverable data paths (anything
+  writing the prospective recording, which cannot be re-collected); cross-cutting refactors
+  touching many call sites.
+- **Both advocates must steelman the other side** and concede its strongest point explicitly.
+  Otherwise the arbiter is choosing between two weak briefs on style.
+- **De-escalation is in scope.** A package that is plainly CRUD, plumbing, or docs should be named
+  as such even where the table says otherwise.
+- **Calibrate from outcomes, not forecasts.** All three agents get the PREVIOUS phase's
+  adversarial-review results — how many defects were confirmed and of what *class* — and are told
+  to weight that over any impression of difficulty. Confirmed-defect classes are the only real
+  signal about where the table is mis-calibrated, and the durable output is a correction **by class
+  of work**, not by phase number.
+- **Record the verdict, the winning argument, and the conceded counterpoint in `docs/STATE.md`**
+  with the phase entry — so the next phase can check what was predicted against what its review
+  actually found, and so a wrong call is visible rather than folklore.
+
 ## Trading safety
 
-**No orders against a funded account in v1** (`docs/PLAN.md`). Two non-live modes are in scope and
-mean different things: *simulated* (`Execution:Router=paper`, fills invented locally, the default)
-and *paper brokerage* (`Execution:Router=ibkr`, real orders to a `DU` account settled in simulated
-money). A `U`-prefixed account is real money and is out of scope.
+The paper/live boundary is the safety mechanism. Everything on the paper side of it is meant to be
+used hard; everything on the live side is gated. Do not blur the two, and do not import caution
+from the live side into the paper side — that caution is what let a fatal recorder bug ship
+(see `docs/STATE.md`, Phase 1).
 
-TWS paper ports are 7497 (TWS) and 4002 (Gateway).
+### The paper account is FOR testing. Use it. Do not ask permission.
 
-Adding or changing any real order-placement call site is not a routine edit — confirm before doing it.
-Never commit account numbers, API session tokens, or position dumps.
+**On a verified `DU` account, exercise anything you build — without checking first.** Place orders,
+cancel them, fill them, place bad ones, blow through risk limits, exhaust market-data lines, run
+the balance to zero. It is simulated money in an account that can be reset. That is the entire
+reason it exists.
+
+**This is a requirement, not merely a permission.** If you build or change something that talks to
+TWS, run it against the paper account before claiming it works. Unit tests stub the socket, so they
+cannot tell you what TWS *accepts* — contract shapes, tick types, entitlements, error semantics are
+not knowledge until a live connection has demonstrated them. A green unit suite is not evidence
+about broker behaviour, and "all tests pass" must never be reported as though it were.
+
+Deliberately in scope on paper, and expected:
+- Real order placement and cancellation via `Execution:Router=ibkr` + `Portfolio:Source=ibkr`.
+- Failure injection: kill the TWS connection mid-request, force reconnect and 1101 replay, saturate
+  the line ledger, trip pacing limits, stop Postgres under a live recorder.
+- Long-running loads: the full backfill drain, a whole RTH+GTH recording session.
+
+Add a `Category=RequiresTws` test whenever behaviour can be pinned by one, so verification stops
+being a manual ritual that gets skipped.
+
+### The live side stays hard-gated
+
+A `U`-prefixed account is real money and is **out of scope for v1** (`docs/PLAN.md`). Adding or
+changing a real order-placement call site *for a live account* is not a routine edit — confirm
+first. `IBKR:AllowLiveTrading` stays false in every committed file, the `DU`-prefix check stays,
+and no test may reach `placeOrder`.
+
+TWS paper ports are 7497 (TWS) and 4002 (Gateway); 7496/4001 are live. Never commit account
+numbers, API session tokens, or position dumps.
 
 ## IBKR work
 

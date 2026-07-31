@@ -30,7 +30,9 @@ public static class Extensions
         {
             metrics.AddAspNetCoreInstrumentation()
                 .AddHttpClientInstrumentation()
-                .AddRuntimeInstrumentation();
+                .AddRuntimeInstrumentation()
+                // Custom TradingStuff meters (pacing, line budget, recorder) opt in by name here.
+                .AddMeter("TradingStuff.IbkrGateway", "TradingStuff.ResearchService");
         });
 
         openTelemetry.WithTracing(tracing =>

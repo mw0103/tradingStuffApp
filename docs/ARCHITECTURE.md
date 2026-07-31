@@ -63,6 +63,22 @@ In the current slice, RabbitMQ, Postgres, Keycloak, and IBKR are AppHost-modeled
 - `IPortfolioProvider`: development snapshot by default, `IbkrPortfolioProvider` on `Portfolio:Source=ibkr`. Still to add: a position store so risk does not depend on the broker being reachable, and representation for non-option positions.
 - `DevelopmentJwtAuthenticationHandler`: replace with real JWT bearer validation against Keycloak.
 
+## Research Plane (planned — milestone 2)
+
+Defined in `docs/plans/ibkr-edge-research-roadmap.md`. Two processes touch research data:
+`IbkrGateway` gains a pacing governor (the chokepoint for every outbound socket call), historical
+data support, standing subscription leases with a market-data-line ledger, and an append-only raw
+observation recorder that writes directly to Postgres (live option data is unrecoverable, so the
+recording path takes the fewest hops). A new `TradingStuff.ResearchService` owns everything
+derived: schema migrations, backfill planning/checkpoints, node selection and recorder
+orchestration, session/calendar normalization, as-of surface snapshots, point-in-time feature and
+forward-label pipelines behind a cutoff-enforcing reader, baseline forecasters, a study runner
+with an immutable trial registry, a conservative execution simulator, and a React+Vite research UI
+(`ClientApp/` built into ResearchService's `wwwroot` and served by the same process — one
+deployable, no separate frontend host). Postgres (schemas `gateway` and `research`, day-partitioned raw events, ~60-day hot window)
+plus daily verified Parquet exports are the only data infrastructure — no message broker or
+analytics database is part of the design.
+
 ## Data Model Direction
 
 The shared contract model already separates:

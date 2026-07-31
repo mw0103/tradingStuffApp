@@ -3,6 +3,8 @@ using System.Globalization;
 using IBApi;
 using Microsoft.Extensions.Options;
 using TradingStuff.Contracts;
+using TradingStuff.IbkrGateway.History;
+using TradingStuff.IbkrGateway.Pacing;
 using IbContract = IBApi.Contract;
 
 namespace TradingStuff.IbkrGateway;
@@ -12,6 +14,7 @@ namespace TradingStuff.IbkrGateway;
 /// </summary>
 public sealed class IbkrMarketDataClient(
     IbkrConnection connection,
+    PacedSocket socket,
     IOptions<IbkrOptions> options,
     ILogger<IbkrMarketDataClient> logger)
 {
@@ -39,7 +42,7 @@ public sealed class IbkrMarketDataClient(
         }
 
         var details = await RequestListAsync<ContractDetails>(
-            (client, requestId) => client.reqContractDetails(requestId, ToIbOption(contract)),
+            (requestId, ct) => socket.ReqContractDetailsAsync(requestId, ToIbOption(contract), ct),
             cancellationToken);
 
         if (details.Count == 0)
@@ -128,13 +131,13 @@ public sealed class IbkrMarketDataClient(
         try
         {
             return await RequestListAsync<ContractDetails>(
-                (client, requestId) => client.reqContractDetails(requestId, new IbContract
+                (requestId, ct) => socket.ReqContractDetailsAsync(requestId, new IbContract
                 {
                     Symbol = symbol,
                     SecType = secType,
                     Exchange = exchange,
                     Currency = "USD",
-                }),
+                }, ct),
                 cancellationToken);
         }
         catch (IbkrRequestException ex) when (ex.ErrorCode == IbkrErrorCodes.NoSecurityDefinition)
@@ -142,6 +145,57 @@ public sealed class IbkrMarketDataClient(
             // Expected while probing: a stock lookup for an index symbol finds nothing.
             return null;
         }
+    }
+
+    // ---- futures family enumeration ----------------------------------------------------------
+
+    /// <summary>
+    /// Enumerates every contract IBKR lists for a futures family — expired and currently listed
+    /// alike — via <c>reqContractDetails</c> with <c>IncludeExpired</c>. See
+    /// <see cref="FuturesContractDefinition"/> for why this exists: a deep intraday backfill cannot
+    /// page a <c>CONTFUT</c> into the past, so it must instead walk each individual contract, and
+    /// this is how the walker (ResearchService's <c>EsContractWalker</c>) discovers what they are.
+    /// </summary>
+    /// <remarks>
+    /// Unlike <see cref="ResolveOptionConIdAsync"/>, an empty result is not turned into an
+    /// exception here: the caller (a periodic scan) treats "nothing back this pass" as "try again
+    /// later", not a hard failure, and a family enumeration returning zero rows is not on its own
+    /// evidence of a broken symbol/exchange the way an unresolved single option contract is.
+    /// </remarks>
+    public async Task<IReadOnlyList<FuturesContractDefinition>> GetFuturesFamilyAsync(
+        string symbol, string exchange, string currency, CancellationToken cancellationToken)
+    {
+        var details = await RequestListAsync<ContractDetails>(
+            (requestId, ct) => socket.ReqContractDetailsAsync(requestId, new IbContract
+            {
+                Symbol = symbol.ToUpperInvariant(),
+                SecType = "FUT",
+                Exchange = exchange,
+                Currency = currency,
+                IncludeExpired = true,
+            }, ct),
+            cancellationToken);
+
+        var contracts = new List<FuturesContractDefinition>(details.Count);
+
+        foreach (var detail in details)
+        {
+            if (FuturesContractExpiry.Resolve(detail) is not { } expiry)
+            {
+                // Should not happen given IBKR's documented field shapes, but a contract this
+                // walker cannot date is one it must not silently mis-plan either.
+                logger.LogWarning(
+                    "Skipping a {Symbol} futures contract (conId {ConId}): neither RealExpirationDate " +
+                    "('{Real}') nor LastTradeDateOrContractMonth ('{Raw}') parsed as a date.",
+                    symbol, detail.Contract.ConId, detail.RealExpirationDate, detail.Contract.LastTradeDateOrContractMonth);
+                continue;
+            }
+
+            contracts.Add(new FuturesContractDefinition(
+                detail.Contract.ConId, expiry, detail.Contract.TradingClass, detail.Contract.Exchange, detail.Contract.Currency));
+        }
+
+        return contracts;
     }
 
     // ---- chains -----------------------------------------------------------------------------
@@ -165,12 +219,13 @@ public sealed class IbkrMarketDataClient(
         var definition = await ResolveUnderlyingAsync(symbol, cancellationToken);
 
         var segments = await RequestListAsync<OptionChainSegment>(
-            (client, requestId) => client.reqSecDefOptParams(
+            (requestId, ct) => socket.ReqSecDefOptParamsAsync(
                 requestId,
                 symbol,
                 string.Empty,
                 definition.SecType,
-                definition.ConId),
+                definition.ConId,
+                ct),
             cancellationToken);
 
         if (segments.Count == 0)
@@ -262,8 +317,23 @@ public sealed class IbkrMarketDataClient(
     {
         var source = QuoteSource;
 
-        var quotes = await Task.WhenAll(
-            contracts.Select(contract => GetQuoteAsync(contract, source, cancellationToken)));
+        // Bounded fan-out: an unbounded WhenAll over a large chain (SPY lists ~978 contracts)
+        // would park hundreds of waiters on the line ledger and fail most of them by timeout.
+        using var fanOut = new SemaphoreSlim(_options.Pacing.QuoteFanOutLimit);
+
+        var quotes = await Task.WhenAll(contracts.Select(async contract =>
+        {
+            await fanOut.WaitAsync(cancellationToken);
+
+            try
+            {
+                return await GetQuoteAsync(contract, source, cancellationToken);
+            }
+            finally
+            {
+                fanOut.Release();
+            }
+        }));
 
         return new MarketDataQuoteResponse(quotes, DateTimeOffset.UtcNow, source);
     }
@@ -273,16 +343,21 @@ public sealed class IbkrMarketDataClient(
         string source,
         CancellationToken cancellationToken)
     {
-        var client = connection.RequireClient();
         var registry = connection.Registry;
         var tickerId = registry.NextRequestId();
         var request = new QuoteRequest(contract, source);
 
         registry.Register(tickerId, request);
 
+        LineLease? lease = null;
+
         try
         {
-            client.reqMktData(tickerId, ToIbOption(contract), string.Empty, false, false, null);
+            // Execution class: transient pre-trade/portfolio quotes may draw on the full line
+            // budget, including the reserve that research recording can never touch.
+            lease = await socket.ReqMktDataAsync(
+                tickerId, ToIbOption(contract), string.Empty, false, false, null,
+                LineClass.Execution, cancellationToken);
 
             try
             {
@@ -304,9 +379,12 @@ public sealed class IbkrMarketDataClient(
         }
         finally
         {
-            // Market data lines are capped (100 by default). Leaking subscriptions exhausts them and
-            // every later request fails.
-            TryCancelMarketData(client, tickerId);
+            // Releases the market-data line whether or not the cancel message lands.
+            if (lease is not null)
+            {
+                await socket.CancelMktDataAsync(tickerId, lease);
+            }
+
             registry.Remove(tickerId);
         }
     }
@@ -316,22 +394,23 @@ public sealed class IbkrMarketDataClient(
         UnderlyingDefinition definition,
         CancellationToken cancellationToken)
     {
-        var client = connection.RequireClient();
         var registry = connection.Registry;
         var tickerId = registry.NextRequestId();
         var request = new SpotPriceRequest();
 
         registry.Register(tickerId, request);
 
+        LineLease? lease = null;
+
         try
         {
-            client.reqMktData(tickerId, new IbContract
+            lease = await socket.ReqMktDataAsync(tickerId, new IbContract
             {
                 Symbol = underlying,
                 SecType = definition.SecType,
                 Exchange = definition.Exchange,
                 Currency = "USD",
-            }, string.Empty, false, false, null);
+            }, string.Empty, false, false, null, LineClass.Execution, cancellationToken);
 
             return await request.Task
                 .WaitAsync(TimeSpan.FromSeconds(_options.QuoteTimeoutSeconds), cancellationToken);
@@ -343,7 +422,11 @@ public sealed class IbkrMarketDataClient(
         }
         finally
         {
-            TryCancelMarketData(client, tickerId);
+            if (lease is not null)
+            {
+                await socket.CancelMktDataAsync(tickerId, lease);
+            }
+
             registry.Remove(tickerId);
         }
     }
@@ -354,10 +437,9 @@ public sealed class IbkrMarketDataClient(
     /// Issues a request that accumulates callbacks and completes on its <c>...End</c> callback.
     /// </summary>
     private async Task<IReadOnlyList<T>> RequestListAsync<T>(
-        Action<EClientSocket, int> send,
+        Func<int, CancellationToken, Task> send,
         CancellationToken cancellationToken)
     {
-        var client = connection.RequireClient();
         var registry = connection.Registry;
         var requestId = registry.NextRequestId();
         var request = new ListRequest<T>();
@@ -366,7 +448,7 @@ public sealed class IbkrMarketDataClient(
 
         try
         {
-            send(client, requestId);
+            await send(requestId, cancellationToken);
 
             return await request.Task
                 .WaitAsync(TimeSpan.FromSeconds(_options.RequestTimeoutSeconds), cancellationToken);
@@ -374,18 +456,6 @@ public sealed class IbkrMarketDataClient(
         finally
         {
             registry.Remove(requestId);
-        }
-    }
-
-    private void TryCancelMarketData(EClientSocket client, int tickerId)
-    {
-        try
-        {
-            client.cancelMktData(tickerId);
-        }
-        catch (Exception ex)
-        {
-            logger.LogDebug(ex, "Ignoring failure to cancel market data for ticker {TickerId}.", tickerId);
         }
     }
 

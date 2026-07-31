@@ -1,4 +1,5 @@
 using IBApi;
+using TradingStuff.IbkrGateway.History;
 
 namespace TradingStuff.IbkrGateway;
 
@@ -144,10 +145,27 @@ public sealed class IbkrClientWrapper(
         registry.Remove(reqId);
     }
 
+    // ---- historical data --------------------------------------------------------------------
+
+    public override void historicalData(int reqId, Bar bar) =>
+        registry.Get<ListRequest<Bar>>(reqId)?.Add(bar);
+
+    public override void historicalDataEnd(int reqId, string start, string end)
+    {
+        registry.Get<ListRequest<Bar>>(reqId)?.Complete();
+        registry.Remove(reqId);
+    }
+
+    public override void headTimestamp(int reqId, string headTimestamp) =>
+        registry.Get<HeadTimestampSink>(reqId)?.Apply(headTimestamp);
+
     // ---- market data ----------------------------------------------------------------------
 
     public override void tickPrice(int tickerId, int field, double price, TickAttrib attribs) =>
         registry.Get<ITickSink>(tickerId)?.ApplyPrice(field, price);
+
+    public override void tickSize(int tickerId, int field, decimal size) =>
+        registry.Get<ITickSink>(tickerId)?.ApplySize(field, size);
 
     public override void tickOptionComputation(
         int tickerId,
@@ -161,7 +179,8 @@ public sealed class IbkrClientWrapper(
         double vega,
         double theta,
         double undPrice) =>
-        registry.Get<ITickSink>(tickerId)?.ApplyOptionComputation(field, delta, gamma, vega, theta);
+        registry.Get<ITickSink>(tickerId)?.ApplyOptionComputation(
+            field, impliedVolatility, delta, gamma, vega, theta, undPrice);
 
     public override void tickSnapshotEnd(int tickerId) =>
         registry.Get<ITickSink>(tickerId)?.CompletePartial();
@@ -254,11 +273,23 @@ public sealed class IbkrClientWrapper(
 public sealed class IbkrConnectionException(string message) : Exception(message);
 
 /// <summary>TWS rejected a specific request.</summary>
-public sealed class IbkrRequestException(int errorCode, string message)
+/// <param name="permanent">
+/// Overrides the code-only classification. Needed because TWS overloads its error codes: 162 is both
+/// "no data" and "pacing violation", and even among the genuine no-data ones permanence depends on
+/// the question asked — no data for one historical SLICE says nothing about the contract, while no
+/// data for its head timestamp is a standing fact about the contract and whatToShow. Only the call
+/// site that knows which request it issued, and can read the message text, can decide that; the code
+/// alone cannot. Left null everywhere else, so the default stays
+/// <see cref="IbkrErrorCodes.IsPermanentRequestFailure"/>.
+/// </param>
+public sealed class IbkrRequestException(int errorCode, string message, bool? permanent = null)
     : Exception($"TWS error {errorCode}: {message}")
 {
     public int ErrorCode { get; } = errorCode;
 
+    /// <summary>The TWS message text on its own, without this exception's "TWS error N:" prefix.</summary>
+    public string TwsMessage { get; } = message;
+
     /// <summary>True when retrying the identical request cannot succeed.</summary>
-    public bool IsPermanent => IbkrErrorCodes.IsPermanentRequestFailure(ErrorCode);
+    public bool IsPermanent { get; } = permanent ?? IbkrErrorCodes.IsPermanentRequestFailure(errorCode);
 }

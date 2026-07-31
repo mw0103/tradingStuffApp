@@ -11,9 +11,13 @@ public sealed class DeterministicOptionMarketDataProvider(IConfiguration configu
         CancellationToken cancellationToken) =>
         Task.FromResult(GetQuotes(request));
 
+    // The deterministic generator has one synthetic series and a fixed window, so strikeWindow and
+    // tradingClass are accepted for interface compatibility and ignored.
     public Task<IReadOnlyList<OptionContract>> GetOptionChainAsync(
         string underlying,
         DateOnly? expiration,
+        int? strikeWindow,
+        string? tradingClass,
         CancellationToken cancellationToken) =>
         Task.FromResult(GetOptionChain(
             underlying,

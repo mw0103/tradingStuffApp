@@ -10,16 +10,36 @@ public sealed class IbkrOrderTrackerTests
     private static IbkrOrderTracker NewTracker() =>
         new(LoggerFactory.Create(_ => { }).CreateLogger<IbkrOrderTracker>());
 
-    // Two legs of a vertical: conId 1001 is leg 0, conId 1002 is leg 1.
-    private static readonly Dictionary<int, int> LegIndexByConId = new() { [1001] = 0, [1002] = 1 };
+    // Two legs of a 1x1 vertical: conId 1001 is leg 0, conId 1002 is leg 1, one contract of each per
+    // spread. So a spread count of N owes N contracts on each leg.
+    private static readonly Dictionary<int, TrackedComboLeg> VerticalLegs = new()
+    {
+        [1001] = new TrackedComboLeg(0, 1),
+        [1002] = new TrackedComboLeg(1, 1),
+    };
 
-    private static IbkrOrderTracker TrackedOrder(int orderId, out Guid internalId)
+    private static IbkrOrderTracker TrackedOrder(int orderId, out Guid internalId) =>
+        TrackedOrder(orderId, VerticalLegs, out internalId);
+
+    private static IbkrOrderTracker TrackedOrder(
+        int orderId, IReadOnlyDictionary<int, TrackedComboLeg> legs, out Guid internalId)
     {
         var tracker = NewTracker();
         internalId = Guid.NewGuid();
-        tracker.TryTrack(orderId, Guid.NewGuid(), internalId, LegIndexByConId);
+        tracker.TryTrack(orderId, Guid.NewGuid(), internalId, legs);
         return tracker;
     }
+
+    /// <summary>
+    /// Whether settlement completed within a short window. Used for the "must NOT settle yet"
+    /// assertions: <c>FillsSettled</c> runs its continuations asynchronously, so an immediate
+    /// <c>IsCompleted</c> check can read false on a task that is already finishing — which would let
+    /// a regression pass for the wrong reason.
+    /// </summary>
+    private static async Task<bool> SettledWithinAsync(Task<IbkrOrderState?> settlement) =>
+        ReferenceEquals(
+            await Task.WhenAny(settlement, Task.Delay(TimeSpan.FromMilliseconds(200))),
+            settlement);
 
     private static Contract Leg(int conId) => new() { ConId = conId, SecType = "OPT" };
 
@@ -35,8 +55,8 @@ public sealed class IbkrOrderTrackerTests
         var tracker = NewTracker();
         var internalId = Guid.NewGuid();
 
-        Assert.True(tracker.TryTrack(16, Guid.NewGuid(), internalId, LegIndexByConId));
-        Assert.False(tracker.TryTrack(17, Guid.NewGuid(), internalId, LegIndexByConId));
+        Assert.True(tracker.TryTrack(16, Guid.NewGuid(), internalId, VerticalLegs));
+        Assert.False(tracker.TryTrack(17, Guid.NewGuid(), internalId, VerticalLegs));
     }
 
     [Fact]
@@ -46,8 +66,8 @@ public sealed class IbkrOrderTrackerTests
         var tracker = NewTracker();
         var internalId = Guid.NewGuid();
 
-        tracker.TryTrack(16, Guid.NewGuid(), internalId, LegIndexByConId);
-        tracker.TryTrack(17, Guid.NewGuid(), internalId, LegIndexByConId);
+        tracker.TryTrack(16, Guid.NewGuid(), internalId, VerticalLegs);
+        tracker.TryTrack(17, Guid.NewGuid(), internalId, VerticalLegs);
 
         Assert.Equal(16, tracker.FindByInternalOrderId(internalId)?.IbkrOrderId);
         Assert.Null(tracker.Get(17));
@@ -61,11 +81,11 @@ public sealed class IbkrOrderTrackerTests
         var tracker = NewTracker();
         var internalId = Guid.NewGuid();
 
-        tracker.TryTrack(16, Guid.NewGuid(), internalId, LegIndexByConId);
+        tracker.TryTrack(16, Guid.NewGuid(), internalId, VerticalLegs);
         tracker.ApplyError(16, 163, "price exceeds the Percentage constraint of 3%.");
 
         Assert.Equal(OrderLifecycleStatus.Failed, tracker.Get(16)?.Status);
-        Assert.False(tracker.TryTrack(17, Guid.NewGuid(), internalId, LegIndexByConId));
+        Assert.False(tracker.TryTrack(17, Guid.NewGuid(), internalId, VerticalLegs));
     }
 
     [Fact]
@@ -73,8 +93,8 @@ public sealed class IbkrOrderTrackerTests
     {
         var tracker = NewTracker();
 
-        Assert.True(tracker.TryTrack(16, Guid.NewGuid(), Guid.NewGuid(), LegIndexByConId));
-        Assert.True(tracker.TryTrack(17, Guid.NewGuid(), Guid.NewGuid(), LegIndexByConId));
+        Assert.True(tracker.TryTrack(16, Guid.NewGuid(), Guid.NewGuid(), VerticalLegs));
+        Assert.True(tracker.TryTrack(17, Guid.NewGuid(), Guid.NewGuid(), VerticalLegs));
     }
 
     [Fact]
@@ -188,13 +208,199 @@ public sealed class IbkrOrderTrackerTests
     {
         var tracker = TrackedOrder(11, out _);
 
-        var settlement = tracker.WaitForSettlementAsync(11, TimeSpan.FromSeconds(5), CancellationToken.None);
+        var settlement = tracker.WaitForSettlementAsync(
+            11, TimeSpan.FromSeconds(5), TimeSpan.Zero, CancellationToken.None);
         tracker.ApplyOrderStatus(11, "Filled", 1m, 0m, 1.02d, 42L, string.Empty);
 
         var state = await settlement;
         Assert.Equal(OrderLifecycleStatus.Filled, state!.Status);
         Assert.Equal(1.02m, state.AverageFillPrice);
         Assert.Equal(42L, state.PermId);
+    }
+
+    [Fact]
+    public async Task Settlement_waits_past_terminal_status_for_the_fills_and_commissions()
+    {
+        // Regression, observed live on the paper account: a 1-lot SPY vertical returned
+        // filled=1, avgFillPrice=1.28 with fills=[] and commission=0, because orderStatus="Filled"
+        // arrives before the execDetails and those arrive before the commission reports. Four
+        // seconds later the same order read two fills summing to 1.28 and commission 1.598693.
+        // ExecutionService had already persisted the empty version as the record of a filled order.
+        var tracker = TrackedOrder(21, out _);
+
+        var settlement = tracker.WaitForSettlementAsync(
+            21, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5), CancellationToken.None);
+
+        tracker.ApplyOrderStatus(21, "Filled", 1m, 0m, 1.28d, 77L, string.Empty);
+        tracker.ApplyExecution(Leg(1001), new Execution { OrderId = 21, ExecId = "x1", Shares = 1m, Price = 1.67d });
+
+        Assert.False(settlement.IsCompleted, "One leg of two had reported; the fills are still incomplete.");
+
+        tracker.ApplyExecution(Leg(1002), new Execution { OrderId = 21, ExecId = "x2", Shares = 1m, Price = 0.39d });
+        tracker.ApplyCommission(new CommissionAndFeesReport { ExecId = "x1", CommissionAndFees = 0.8d });
+
+        Assert.False(settlement.IsCompleted, "Both legs filled, but one execution's cost is unknown.");
+
+        tracker.ApplyCommission(new CommissionAndFeesReport { ExecId = "x2", CommissionAndFees = 0.8d });
+
+        var state = await settlement;
+        Assert.Equal(OrderLifecycleStatus.Filled, state!.Status);
+        Assert.Equal(2, state.Fills.Count);
+        Assert.Equal(1.6m, state.Commission);
+    }
+
+    [Fact]
+    public async Task Settlement_still_returns_when_the_fills_never_arrive()
+    {
+        // A filled order reported with incomplete fills beats hanging on a callback TWS may never
+        // send. The grace expiring is logged, not thrown.
+        var tracker = TrackedOrder(22, out _);
+
+        var settlement = tracker.WaitForSettlementAsync(
+            22, TimeSpan.FromSeconds(5), TimeSpan.FromMilliseconds(100), CancellationToken.None);
+
+        tracker.ApplyOrderStatus(22, "Filled", 1m, 0m, 1.28d, 78L, string.Empty);
+
+        var state = await settlement;
+        Assert.Equal(OrderLifecycleStatus.Filled, state!.Status);
+        Assert.Empty(state.Fills);
+    }
+
+    // ---- multi-execution legs: settlement is a QUANTITY question ------------------------------
+    // The fix above (wait past terminal status for the fills) was itself defective for anything
+    // bigger than one lot. It decided "the cost is known" from two counters — distinct leg indices
+    // covered, and commissions-seen vs executions-seen — and TWS interleaves each execDetails with
+    // its own commissionAndFeesReport, so both counters reach equality while a leg still owes
+    // contracts. The order then settled on a truncated fill list that ExecutionService persisted as
+    // the permanent record, while the remaining execDetails arrived seconds later and were never
+    // read. Contracts owed per leg is filled (spreads, for a BAG) x that leg's ratio.
+
+    [Fact]
+    public async Task A_leg_that_still_owes_contracts_does_not_settle_the_fills()
+    {
+        // The exact delivery order that defeated the counters: leg0 x5 -> commission ->
+        // leg1 x2 -> commission -> leg1 x3 -> commission. At the SECOND commission both legs are
+        // "covered" and commissions equal executions, yet 3 of the 10 contracts have not reported.
+        var tracker = TrackedOrder(31, out _);
+
+        var settlement = tracker.WaitForSettlementAsync(
+            31, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5), CancellationToken.None);
+
+        tracker.ApplyOrderStatus(31, "Filled", 5m, 0m, 1.30d, 91L, string.Empty);
+
+        tracker.ApplyExecution(Leg(1001), new Execution { OrderId = 31, ExecId = "a1", Shares = 5m, Price = 1.70d });
+        tracker.ApplyCommission(new CommissionAndFeesReport { ExecId = "a1", CommissionAndFees = 3.5d });
+        tracker.ApplyExecution(Leg(1002), new Execution { OrderId = 31, ExecId = "b1", Shares = 2m, Price = 0.40d });
+        tracker.ApplyCommission(new CommissionAndFeesReport { ExecId = "b1", CommissionAndFees = 1.4d });
+
+        Assert.False(
+            await SettledWithinAsync(settlement),
+            "Leg 1 has reported 2 of the 5 contracts it owes; the order's cost is not known yet.");
+
+        tracker.ApplyExecution(Leg(1002), new Execution { OrderId = 31, ExecId = "b2", Shares = 3m, Price = 0.41d });
+        tracker.ApplyCommission(new CommissionAndFeesReport { ExecId = "b2", CommissionAndFees = 2.1d });
+
+        var state = await settlement.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(3, state!.Fills.Count);
+        Assert.Equal(10, state.Fills.Sum(fill => fill.Quantity));
+        Assert.Equal(7.0m, state.Commission);
+    }
+
+    [Fact]
+    public async Task A_ratio_spread_waits_for_the_heavier_leg_to_report_its_multiple()
+    {
+        // Why the leg RATIO travels with the leg index rather than being assumed to be 1. Two spreads
+        // of a 1x2 backspread: leg 0 owes 2 contracts, leg 1 owes 4. Counting spreads-per-leg — or
+        // any predicate that only knows the filled quantity — settles this order half way through
+        // leg 1.
+        var legs = new Dictionary<int, TrackedComboLeg>
+        {
+            [1001] = new TrackedComboLeg(0, 1),
+            [1002] = new TrackedComboLeg(1, 2),
+        };
+
+        var tracker = TrackedOrder(32, legs, out _);
+
+        var settlement = tracker.WaitForSettlementAsync(
+            32, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5), CancellationToken.None);
+
+        tracker.ApplyOrderStatus(32, "Filled", 2m, 0m, 0.90d, 93L, string.Empty);
+
+        tracker.ApplyExecution(Leg(1001), new Execution { OrderId = 32, ExecId = "c1", Shares = 2m, Price = 2.10d });
+        tracker.ApplyCommission(new CommissionAndFeesReport { ExecId = "c1", CommissionAndFees = 1.4d });
+        tracker.ApplyExecution(Leg(1002), new Execution { OrderId = 32, ExecId = "d1", Shares = 2m, Price = 0.60d });
+        tracker.ApplyCommission(new CommissionAndFeesReport { ExecId = "d1", CommissionAndFees = 1.4d });
+
+        Assert.False(
+            await SettledWithinAsync(settlement),
+            "Leg 1 carries two contracts per spread, so 2 of its 4 contracts are still outstanding.");
+
+        tracker.ApplyExecution(Leg(1002), new Execution { OrderId = 32, ExecId = "d2", Shares = 2m, Price = 0.61d });
+        tracker.ApplyCommission(new CommissionAndFeesReport { ExecId = "d2", CommissionAndFees = 1.4d });
+
+        var state = await settlement.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(6, state!.Fills.Sum(fill => fill.Quantity));
+    }
+
+    [Fact]
+    public async Task Executions_that_arrived_before_the_terminal_status_settle_without_waiting()
+    {
+        // Completion is asked on three callbacks, not two. When every execution and commission has
+        // already landed, the terminal orderStatus is the last chance to notice that nothing is
+        // outstanding — miss it and a fully-reported order sits out the entire grace and then warns
+        // about fills it is holding.
+        var tracker = TrackedOrder(33, out _);
+
+        var settlement = tracker.WaitForSettlementAsync(
+            33, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(30), CancellationToken.None);
+
+        tracker.ApplyExecution(Leg(1001), new Execution { OrderId = 33, ExecId = "e1", Shares = 1m, Price = 1.67d });
+        tracker.ApplyExecution(Leg(1002), new Execution { OrderId = 33, ExecId = "e2", Shares = 1m, Price = 0.39d });
+        tracker.ApplyCommission(new CommissionAndFeesReport { ExecId = "e1", CommissionAndFees = 0.8d });
+        tracker.ApplyCommission(new CommissionAndFeesReport { ExecId = "e2", CommissionAndFees = 0.8d });
+
+        tracker.ApplyOrderStatus(33, "Filled", 1m, 0m, 1.28d, 94L, string.Empty);
+
+        var state = await settlement.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(2, state!.Fills.Count);
+        Assert.Equal(1.6m, state.Commission);
+    }
+
+    [Fact]
+    public async Task Settlement_returns_after_the_grace_when_a_leg_never_completes()
+    {
+        // The other half of the contract: a predicate that can refuse to complete must never be able
+        // to hang. Leg 1 of a 5-lot vertical reports nothing at all; the grace expires, the order is
+        // returned with the fills it does have, and the warning names the shortfall.
+        var tracker = TrackedOrder(34, out _);
+
+        var settlement = tracker.WaitForSettlementAsync(
+            34, TimeSpan.FromSeconds(5), TimeSpan.FromMilliseconds(150), CancellationToken.None);
+
+        tracker.ApplyOrderStatus(34, "Filled", 5m, 0m, 1.30d, 95L, string.Empty);
+        tracker.ApplyExecution(Leg(1001), new Execution { OrderId = 34, ExecId = "f1", Shares = 5m, Price = 1.70d });
+        tracker.ApplyCommission(new CommissionAndFeesReport { ExecId = "f1", CommissionAndFees = 3.5d });
+
+        var state = await settlement.WaitAsync(TimeSpan.FromSeconds(3));
+        Assert.Equal(OrderLifecycleStatus.Filled, state!.Status);
+        Assert.Single(state.Fills);
+        Assert.Equal(5m, state.Filled);
+    }
+
+    [Fact]
+    public async Task A_working_partial_fill_is_not_waited_on_for_settlement()
+    {
+        // A partially filled order that is still working owes nothing yet: `filled` is still moving,
+        // so there is no total to check the executions against. Waiting on one would burn the whole
+        // grace and then warn about incomplete fills on an order that is simply mid-fill.
+        var tracker = TrackedOrder(35, out _);
+        tracker.ApplyOrderStatus(35, "Submitted", 2m, 3m, 1.30d, 96L, string.Empty);
+
+        var settlement = tracker.WaitForSettlementAsync(
+            35, TimeSpan.FromMilliseconds(150), TimeSpan.FromSeconds(30), CancellationToken.None);
+
+        var state = await settlement.WaitAsync(TimeSpan.FromSeconds(2));
+        Assert.Equal(OrderLifecycleStatus.PartiallyFilled, state!.Status);
     }
 
     [Fact]
@@ -217,7 +423,8 @@ public sealed class IbkrOrderTrackerTests
         var tracker = TrackedOrder(12, out _);
         tracker.ApplyOrderStatus(12, "Submitted", 0m, 1m, 0d, 7L, string.Empty);
 
-        var state = await tracker.WaitForSettlementAsync(12, TimeSpan.FromMilliseconds(150), CancellationToken.None);
+        var state = await tracker.WaitForSettlementAsync(
+            12, TimeSpan.FromMilliseconds(150), TimeSpan.Zero, CancellationToken.None);
 
         Assert.Equal(OrderLifecycleStatus.Submitted, state!.Status);
     }

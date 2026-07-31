@@ -1,5 +1,6 @@
 using IBApi;
 using Microsoft.Extensions.Options;
+using TradingStuff.IbkrGateway.Pacing;
 
 namespace TradingStuff.IbkrGateway;
 
@@ -32,8 +33,18 @@ public sealed class IbkrConnection : IHostedService, IDisposable
     private readonly IbkrOptions _options;
     private readonly IbkrRequestRegistry _registry;
     private readonly IbkrClientWrapper _wrapper;
+    private readonly IbkrPacingGovernor _pacingGovernor;
     private readonly ILogger<IbkrConnection> _logger;
     private readonly Lock _gate = new();
+
+    /// <summary>
+    /// Raised whenever every standing subscription must be re-issued: a brand-new
+    /// <c>EClientSocket</c> after a reconnect (nothing is subscribed on it yet), or TWS's 1101
+    /// notice on a socket that never dropped ("connectivity restored, data lost"). Handlers run on
+    /// whatever thread raised the underlying event — including the EReader pump — so they must not
+    /// block; fire-and-forget the actual replay work.
+    /// </summary>
+    public event Action? SubscriptionsMustReplay;
 
     private EClientSocket? _client;
     private EReaderMonitorSignal? _signal;
@@ -59,11 +70,13 @@ public sealed class IbkrConnection : IHostedService, IDisposable
         IOptions<IbkrOptions> options,
         IbkrRequestRegistry registry,
         IbkrClientWrapper wrapper,
+        IbkrPacingGovernor pacingGovernor,
         ILogger<IbkrConnection> logger)
     {
         _options = options.Value;
         _registry = registry;
         _wrapper = wrapper;
+        _pacingGovernor = pacingGovernor;
         _logger = logger;
 
         _wrapper.ManagedAccountsReceived += OnManagedAccounts;
@@ -353,6 +366,13 @@ public sealed class IbkrConnection : IHostedService, IDisposable
         {
             _logger.LogInformation("Connected to {Count} managed account(s).", accounts.Length);
         }
+
+        // managedAccounts is TWS's confirmation that a fresh startApi handshake completed. A brand
+        // new EClientSocket has zero real standing subscriptions no matter what the pacing
+        // governor's ledger still thinks, so the ledger is reset before anything replays leases
+        // against it.
+        _pacingGovernor.ResetLineLedgerForReconnect();
+        SubscriptionsMustReplay?.Invoke();
     }
 
     private void OnConnectionClosed()
@@ -369,10 +389,12 @@ public sealed class IbkrConnection : IHostedService, IDisposable
     {
         if (errorCode == IbkrErrorCodes.ConnectivityRestoredDataLost)
         {
-            // Every streaming subscription is gone. This adapter subscribes per request and cancels
-            // immediately, so there is nothing standing to re-subscribe — but that stops being true
-            // the moment a persistent subscription is added here.
+            // 1101: the TWS-to-exchange link blipped and recovered without OUR socket ever
+            // dropping (connectionClosed never fired), but every streaming subscription on it is
+            // gone regardless. Same remedy as a fresh connect: reset the ledger and replay.
             _logger.LogWarning("TWS connectivity restored with data lost; streaming subscriptions must be re-established.");
+            _pacingGovernor.ResetLineLedgerForReconnect();
+            SubscriptionsMustReplay?.Invoke();
         }
     }
 

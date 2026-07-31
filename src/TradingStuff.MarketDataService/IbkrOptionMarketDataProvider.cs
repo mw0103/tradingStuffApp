@@ -47,13 +47,34 @@ public sealed class IbkrOptionMarketDataProvider(
     public async Task<IReadOnlyList<OptionContract>> GetOptionChainAsync(
         string underlying,
         DateOnly? expiration,
+        int? strikeWindow,
+        string? tradingClass,
         CancellationToken cancellationToken)
     {
-        var path = $"/ibkr/options/chains/{Uri.EscapeDataString(underlying)}";
+        // Forward every selector. Dropping tradingClass here silently reduces SPX to the AM-settled
+        // monthly series and makes SPXW unreachable through this service.
+        var query = new List<string>(3);
 
         if (expiration is { } value)
         {
-            path += $"?expiration={value:yyyy-MM-dd}";
+            query.Add($"expiration={value:yyyy-MM-dd}");
+        }
+
+        if (strikeWindow is { } window)
+        {
+            query.Add($"window={window}");
+        }
+
+        if (!string.IsNullOrWhiteSpace(tradingClass))
+        {
+            query.Add($"tradingClass={Uri.EscapeDataString(tradingClass)}");
+        }
+
+        var path = $"/ibkr/options/chains/{Uri.EscapeDataString(underlying)}";
+
+        if (query.Count > 0)
+        {
+            path += "?" + string.Join('&', query);
         }
 
         return await httpClient.GetFromJsonAsync<IReadOnlyList<OptionContract>>(path, cancellationToken)

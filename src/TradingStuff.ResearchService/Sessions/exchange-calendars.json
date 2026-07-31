@@ -1,0 +1,242 @@
+{
+  "generatorVersion": 1,
+  "revision": "2026-07-31",
+  "knownGoodThrough": "2026-12-31",
+  "notes": [
+    "AUDITABLE SOURCE OF TRUTH for every exchange session this platform generates. Downstream code",
+    "(coverage denominators, gap detection, and the Phase 4 leakage firewall's feature cutoffs) is",
+    "validated AGAINST the sessions produced from this file, so a wrong entry here is invisible by",
+    "construction. Read it as data, not as an implementation detail: every field is meant to be",
+    "checkable against a published exchange calendar by a human, without reading any C#.",
+    "",
+    "WHAT IS A RULE AND WHAT IS DATA. Only the statutory, mechanically-defined holidays are rules",
+    "(nth-weekday, fixed-date-with-weekend-observance, Good Friday from the Gregorian Easter",
+    "computation). EVERYTHING an exchange decided rather than derived is data: unscheduled closures",
+    "(9/11, Hurricane Sandy, national days of mourning), unscheduled early closes, the year a holiday",
+    "entered the calendar (MLK 1998, Juneteenth 2022), and every early-close wall-clock time. A purely",
+    "rule-based generator invents sessions on days the market was shut; that is the specific defect",
+    "this split exists to prevent.",
+    "",
+    "CONFIDENCE. Every unscheduled entry carries a `confidence`. 'high' = widely documented and",
+    "cross-checkable; 'medium' = documented but the venue-by-venue detail is inferred; 'unverified' =",
+    "believed correct but NOT confirmed against a published exchange calendar — grep for it and check",
+    "it before trusting any study whose window includes that date.",
+    "",
+    "BUMP generatorVersion ON ANY CHANGE to this file. SessionGenerator.GeneratorVersion must match it",
+    "(a unit test enforces this), and research.sessions.generator_version records it per row, so a",
+    "regenerated calendar is distinguishable from a stale one.",
+    "",
+    "TIMES ARE EXCHANGE-LOCAL WALL CLOCK in the calendar's IANA time zone. They are never offsets.",
+    "SessionClock converts; nothing else in the platform is permitted to."
+  ],
+
+  "holidayRuleSets": {
+    "US_MARKET": [
+      {
+        "name": "New Year's Day",
+        "kind": "fixed",
+        "month": 1,
+        "day": 1,
+        "observance": "sundayToMonday",
+        "note": "Deliberately NOT saturdayToFriday. NYSE Rule 7.2 excepts New Year's Day from the Saturday rule: Jan 1 2005, Jan 1 2011 and Jan 1 2022 all fell on a Saturday and the preceding Fridays (Dec 31) were full trading days."
+      },
+      {
+        "name": "Martin Luther King Jr. Day",
+        "kind": "nthWeekday",
+        "month": 1,
+        "weekday": "Monday",
+        "nth": 3,
+        "fromYear": 1998,
+        "note": "Not an NYSE/Cboe holiday before 1998 — the market traded on MLK Day 1993-1997. A rule without fromYear silently deletes five real January sessions."
+      },
+      { "name": "Washington's Birthday", "kind": "nthWeekday", "month": 2, "weekday": "Monday", "nth": 3 },
+      {
+        "name": "Good Friday",
+        "kind": "goodFriday",
+        "note": "Two days before Gregorian Easter Sunday (Meeus/Butcher). Verified against 2001-04-13, 2012-04-06, 2024-03-29, 2025-04-18, 2026-04-03."
+      },
+      { "name": "Memorial Day", "kind": "lastWeekday", "month": 5, "weekday": "Monday" },
+      {
+        "name": "Juneteenth National Independence Day",
+        "kind": "fixed",
+        "month": 6,
+        "day": 19,
+        "observance": "nearestWeekday",
+        "fromYear": 2022,
+        "note": "First observed 2022-06-20 (Jun 19 2022 was a Sunday). The market was open on Jun 18 2021."
+      },
+      { "name": "Independence Day", "kind": "fixed", "month": 7, "day": 4, "observance": "nearestWeekday" },
+      { "name": "Labor Day", "kind": "nthWeekday", "month": 9, "weekday": "Monday", "nth": 1 },
+      { "name": "Thanksgiving Day", "kind": "nthWeekday", "month": 11, "weekday": "Thursday", "nth": 4 },
+      { "name": "Christmas Day", "kind": "fixed", "month": 12, "day": 25, "observance": "nearestWeekday" }
+    ]
+  },
+
+  "earlyCloseRuleSets": {
+    "US_MARKET": [
+      {
+        "name": "Day before Independence Day",
+        "kind": "dayBefore",
+        "holiday": "Independence Day",
+        "note": "July 3, but only when July 4 itself falls Mon-Fri (so July 3 is neither a weekend nor the observed holiday). Matches 2013/2014/2017/2018/2019/2023/2024/2025 early closes and the absence of one in 2015/2016/2020/2021/2022."
+      },
+      {
+        "name": "Christmas Eve",
+        "kind": "dayBefore",
+        "holiday": "Christmas Day",
+        "note": "Dec 24, only when Dec 25 falls Mon-Fri. Matches the 2012-2015, 2018-2020, 2024, 2025 early closes and the absence of one in 2016, 2017, 2021-2023."
+      },
+      { "name": "Day after Thanksgiving", "kind": "dayAfter", "holiday": "Thanksgiving Day" }
+    ]
+  },
+
+  "closureSets": {
+    "US_EQUITY_UNSCHEDULED": [
+      { "date": "1994-04-27", "reason": "National day of mourning — Richard Nixon", "confidence": "high" },
+      { "date": "1996-01-08", "reason": "Blizzard of 1996", "confidence": "unverified" },
+      { "date": "2001-09-11", "reason": "September 11 attacks (day 1 of 4)", "confidence": "high" },
+      { "date": "2001-09-12", "reason": "September 11 attacks (day 2 of 4)", "confidence": "high" },
+      { "date": "2001-09-13", "reason": "September 11 attacks (day 3 of 4)", "confidence": "high" },
+      { "date": "2001-09-14", "reason": "September 11 attacks (day 4 of 4); trading resumed 2001-09-17", "confidence": "high" },
+      { "date": "2004-06-11", "reason": "National day of mourning — Ronald Reagan", "confidence": "high" },
+      { "date": "2007-01-02", "reason": "National day of mourning — Gerald Ford", "confidence": "high" },
+      { "date": "2012-10-29", "reason": "Hurricane Sandy (day 1 of 2)", "confidence": "high" },
+      { "date": "2012-10-30", "reason": "Hurricane Sandy (day 2 of 2)", "confidence": "high" },
+      { "date": "2018-12-05", "reason": "National day of mourning — George H. W. Bush", "confidence": "high" },
+      { "date": "2025-01-09", "reason": "National day of mourning — Jimmy Carter", "confidence": "high" }
+    ],
+    "CME_UNSCHEDULED": [
+      { "date": "1994-04-27", "reason": "National day of mourning — Richard Nixon", "confidence": "medium" },
+      { "date": "2001-09-11", "reason": "September 11 attacks (day 1 of 4)", "confidence": "high" },
+      { "date": "2001-09-12", "reason": "September 11 attacks (day 2 of 4)", "confidence": "medium" },
+      { "date": "2001-09-13", "reason": "September 11 attacks (day 3 of 4)", "confidence": "medium" },
+      { "date": "2001-09-14", "reason": "September 11 attacks (day 4 of 4)", "confidence": "medium" },
+      { "date": "2004-06-11", "reason": "National day of mourning — Ronald Reagan", "confidence": "medium" },
+      { "date": "2007-01-02", "reason": "National day of mourning — Gerald Ford", "confidence": "medium" },
+      { "date": "2018-12-05", "reason": "National day of mourning — George H. W. Bush", "confidence": "unverified" },
+      { "date": "2025-01-09", "reason": "National day of mourning — Jimmy Carter", "confidence": "unverified" }
+    ]
+  },
+
+  "earlyCloseSets": {
+    "US_EQUITY_UNSCHEDULED": [
+      {
+        "date": "1997-10-27",
+        "close": "15:30",
+        "reason": "Market-wide circuit breaker (-550 DJIA) halted trading for the day",
+        "confidence": "high"
+      }
+    ],
+    "CME_UNSCHEDULED": []
+  },
+
+  "venues": {
+    "NYSE": {
+      "holidayRuleSet": "US_MARKET",
+      "earlyCloseRuleSet": "US_MARKET",
+      "closureSet": "US_EQUITY_UNSCHEDULED",
+      "unscheduledEarlyCloseSet": "US_EQUITY_UNSCHEDULED"
+    },
+    "CBOE": {
+      "holidayRuleSet": "US_MARKET",
+      "earlyCloseRuleSet": "US_MARKET",
+      "closureSet": "US_EQUITY_UNSCHEDULED",
+      "unscheduledEarlyCloseSet": "CME_UNSCHEDULED",
+      "note": "Cboe follows the NYSE holiday and unscheduled-closure schedule, including both Hurricane Sandy days. The 1997-10-27 circuit-breaker close applied to Cboe too, but the exact Cboe index-option halt time is not recorded here, so no unscheduled early close is asserted — an unasserted early close leaves a normal-length session, which shows up as a visible low-coverage afternoon rather than as silently discarded data."
+    },
+    "CME": {
+      "holidayRuleSet": "US_MARKET",
+      "earlyCloseRuleSet": "US_MARKET",
+      "closureSet": "CME_UNSCHEDULED",
+      "unscheduledEarlyCloseSet": "CME_UNSCHEDULED",
+      "note": "Differs from NYSE/Cboe on Hurricane Sandy: CME's electronic markets stayed open on 2012-10-29 and 2012-10-30 while the NYSE and Cboe were shut, so those dates are absent from CME_UNSCHEDULED. The 1996 blizzard entry is likewise absent (a New York weather closure). Day-of-mourning handling for CME equity index is the least certain part of this file — see the per-entry confidence flags."
+    }
+  },
+
+  "calendars": [
+    {
+      "key": "NYSE",
+      "venue": "NYSE",
+      "timeZone": "America/New_York",
+      "effectiveFrom": "1993-01-01",
+      "description": "NYSE/ARCA cash equities regular session. SPY's calendar.",
+      "sessions": [
+        {
+          "label": "RTH",
+          "openDayOffset": 0,
+          "open": "09:30",
+          "closeDayOffset": 0,
+          "close": "16:00",
+          "earlyClose": "13:00",
+          "appliesEarlyClose": true
+        }
+      ]
+    },
+    {
+      "key": "CBOE_INDEX_RTH",
+      "venue": "CBOE",
+      "timeZone": "America/Chicago",
+      "effectiveFrom": "1993-01-01",
+      "description": "Cboe index options regular session (SPX, SPXW, VIX). Closes 15:15 CT = 16:15 ET — fifteen minutes after the cash equity close, on full and half days alike.",
+      "sessions": [
+        {
+          "label": "RTH",
+          "openDayOffset": 0,
+          "open": "08:30",
+          "closeDayOffset": 0,
+          "close": "15:15",
+          "earlyClose": "12:15",
+          "appliesEarlyClose": true
+        }
+      ]
+    },
+    {
+      "key": "CBOE_INDEX_GTH",
+      "venue": "CBOE",
+      "timeZone": "America/Chicago",
+      "effectiveFrom": "2022-11-21",
+      "description": "Cboe Global Trading Hours for SPX/SPXW/VIX options: 19:15 CT the PRIOR calendar day through 08:15 CT on the trading date (20:15-09:15 ET). effectiveFrom is the near-24x5 GTH expansion; before it no overnight index-option session existed, and generating one would manufacture sessions that never happened. The 19:15 CT open is runtime-verified — docs/research/ibkr-data-capability-matrix.md records useRTH=0 SPX bars starting 19:15 US/Central on the prior calendar day, and the 20:15-09:15 ET session in the pacing/limits section.",
+      "sessions": [
+        {
+          "label": "GTH",
+          "openDayOffset": -1,
+          "open": "19:15",
+          "closeDayOffset": 0,
+          "close": "08:15",
+          "appliesEarlyClose": false,
+          "note": "appliesEarlyClose is false because a GTH session ENDS in the morning, before any afternoon early close could shorten it. An early close on trading date D truncates D's RTH, not D's GTH. Whether Cboe suppresses the overnight session on a holiday EVENING (which would remove the GTH session belonging to the next trading date) is not asserted here — see eveningSessionClosedOn."
+        }
+      ],
+      "eveningSessionClosedOn": []
+    },
+    {
+      "key": "CME_ES",
+      "venue": "CME",
+      "timeZone": "America/Chicago",
+      "effectiveFrom": "1997-09-09",
+      "description": "CME Globex E-mini S&P 500. The Globex day for trading date D runs 17:00 CT on D-1 through 16:00 CT on D (recorded as the GTH row); RTH is the 08:30-15:15 CT equity-index regular session nested inside it. effectiveFrom is the ES contract launch.",
+      "sessions": [
+        {
+          "label": "GTH",
+          "openDayOffset": -1,
+          "open": "17:00",
+          "closeDayOffset": 0,
+          "close": "16:00",
+          "earlyClose": "12:15",
+          "appliesEarlyClose": true,
+          "note": "Globex reopens at 17:00 CT on holiday evenings (e.g. the Christmas Day evening session belonging to Dec 26), so this row is generated whenever its TRADING DATE is a trading day, regardless of what the prior calendar day was. The 16:00-17:00 CT daily maintenance halt is the gap between one day's close and the next day's open, so it needs no separate representation."
+        },
+        {
+          "label": "RTH",
+          "openDayOffset": 0,
+          "open": "08:30",
+          "closeDayOffset": 0,
+          "close": "15:15",
+          "earlyClose": "12:15",
+          "appliesEarlyClose": true
+        }
+      ],
+      "eveningSessionClosedOn": []
+    }
+  ]
+}
