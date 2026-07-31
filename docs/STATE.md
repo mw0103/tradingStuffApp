@@ -7,7 +7,7 @@ Updated: 2026-07-31
 - Aspire/.NET solution scaffolded.
 - Execution, risk, market-data, audit dashboard, contracts, service defaults, and AppHost projects created.
 - Paper options workflow implemented with strategy validation, Greeks-aware risk, deterministic quotes, fills, lifecycle events, and local auth.
-- Tests pass: 119/119. Full solution builds.
+- Tests pass: 125/125. Full solution builds.
 
 ### IBKR integration (stages 1-4 and 6 of `.claude/skills/ibkr/references/migration-plan.md`)
 
@@ -163,7 +163,43 @@ before the regression tests added with them.
 - `IbkrConnection.Dispose` threw `ObjectDisposedException` during host shutdown, surfacing as an
   unhandled crash on every stop.
 
+### Research platform planning (milestone 2, 2026-07-31)
+
+Planned end-to-end and documented; no research code written yet. Deliverables:
+`docs/plans/ibkr-edge-research-roadmap.md` (architecture, ranked studies, phases),
+`docs/research/ibkr-data-capability-matrix.md` (runtime-verified data feasibility),
+`docs/research/volatility-forecast-residual-study.md` (pre-registered first study),
+`docs/research/literature-evidence-matrix.md` (~30 verified sources + platform controls).
+
+Key runtime-verified facts (read-only wire probes against paper TWS, 2026-07-31):
+
+- **Live streaming entitlements are shared to the paper account** — `marketDataType=1` came back
+  for SPX, SPY, ES, and an SPXW option (Cboe indexes + OPRA + CME all active). The
+  `ibkr-market-data-type=3` default is safe but no longer necessary for research recording.
+- **SPX option history is weeks deep even for long-listed contracts** (Aug-2026 monthly 7500C:
+  BID_ASK head 2026-06-10; an April request returns no data), and expired options return nothing.
+  Option data must be recorded live-forward; every unrecorded day is unrecoverable.
+- Deep underlying history exists: SPX 1-min TRADES pulled at 2010 (head 2004-03-04), SPY 1-min at
+  2005 (head 1993-01-29), VIX 10y daily (head 2005-10), ES via per-expired-contract walk (~2–3y
+  each; CONTFUT rejects past `endDateTime`, error 10339).
+- SPX/SPXW GTH (overnight) option bars exist (`useRTH=0` bars from 19:15 CT).
+- Historical bar timestamps arrive exchange-local with `formatDate=1`; research ingestion will use
+  `formatDate=2` (epoch) exclusively.
+
 ## Left
+
+Milestone 2 (research platform — sequenced in `docs/plans/ibkr-edge-research-roadmap.md`):
+
+- Phase 0: Postgres wiring (`AddPostgres` + Npgsql + migrations), gateway pacing governor (also a
+  milestone-1 debt: the quote fan-out is unpaced), order-id persistence (`ibkr_order_map`),
+  `IbkrOptionMarketDataProvider` window/tradingClass param fix, capability-probe persistence.
+- Phase 1: standing subscription leases + line ledger, SPX surface recorder + node selection +
+  coverage monitoring (calendar-critical — option data is perishable).
+- Phase 2: session calendar, historical client, resumable backfill (SPX/SPY/VIX/ES), gap detection.
+- Phases 3–8: snapshots → features/labels/baselines/study runner → residual models →
+  implied-vs-forecast study → execution simulator → shadow ops.
+
+Milestone 1 remainder:
 
 - Replace in-memory order/event stores with Postgres.
 - Replace in-memory event publisher with RabbitMQ.
@@ -234,8 +270,11 @@ Index options need four things equities do not, all now handled:
 
 ## Notes
 
-- Market data defaults to **delayed** (`ibkr-market-data-type=3`) because it needs no OPRA
-  subscription. Set to `1` for live once the account has market data subscriptions.
+- Market data defaults to **delayed** (`ibkr-market-data-type=3`) so the stack works without
+  subscriptions. The account's live entitlements (Cboe indexes, OPRA, CME) are verified shared to
+  the paper user (2026-07-31 probes) — set `1` for live. Caveat from the official FAQ: if live and
+  paper sessions run simultaneously they must be on the same device, or the paper session
+  receives no data.
 - `SubmitOrderRequest.LimitPrice` is a **whole-order** net (matching `PaperExecutionEngine`); TWS
   wants a **per-combo** net. `IbkrOrderBuilder.PerSpreadPrice` converts. They are identical at one
   spread, so the difference only appears on multi-lot orders.

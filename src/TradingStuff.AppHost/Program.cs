@@ -45,8 +45,8 @@ var ibkrGateway = builder.AddProject(
     .WithEnvironment("IBKR__Port", ibkrPort)
     .WithEnvironment("IBKR__ClientId", ibkrClientId)
     .WithEnvironment("IBKR__MarketDataType", ibkrMarketDataType);
-    // IBKR__AllowLiveTrading is deliberately not set here. It defaults to false, and order routing
-    // is not implemented; enabling live trading must be a conscious, per-environment decision.
+    // IBKR__AllowLiveTrading is deliberately not set here. It defaults to false, so a non-DU
+    // account cannot trade; enabling live trading must be a conscious, per-environment decision.
 
 var marketData = builder.AddProject(
         "marketdataservice",

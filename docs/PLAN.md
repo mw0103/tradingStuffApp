@@ -155,6 +155,26 @@ the deterministic market-data provider.
 Coverage is currently inverted against risk: the broker adapter is heavily tested while the risk
 engine has one of twelve breach codes covered. Correcting that precedes further feature work.
 
+## Milestone 2: IBKR market-research platform
+
+Planned 2026-07-31. Full definition in `docs/plans/ibkr-edge-research-roadmap.md`; data-feasibility
+evidence in `docs/research/ibkr-data-capability-matrix.md`; the pre-registered first study in
+`docs/research/volatility-forecast-residual-study.md`; evidence base in
+`docs/research/literature-evidence-matrix.md`.
+
+Objective: discover, validate, and — equally — credibly reject trading edge in SPX volatility using
+only IBKR data. Two tracks: (A) an immediately backtestable realized-volatility forecast-residual
+study on deep SPX/SPY/VIX/ES underlying history, and (B) prospective recording of a standardized
+SPX option-surface node set, which is time-critical because runtime probes established that IBKR
+option history is only weeks deep and expired options return nothing.
+
+Structure: extend `TradingStuff.IbkrGateway` (pacing governor, historical data, standing
+subscription leases, raw-event recording, order-id persistence — the pacing and persistence gaps
+are also milestone-1 debts); add `TradingStuff.ResearchService` + `TradingStuff.ResearchContracts`;
+wire the already-modeled Postgres properly (`AddPostgres` + Npgsql). No new messaging or analytics
+infrastructure. Research phases 0–8 are sequenced in the roadmap; nothing in milestone 2 places
+live orders, and paper fills are schema-flagged as non-calibration data.
+
 ## Assumptions
 
 - The workspace is greenfield.

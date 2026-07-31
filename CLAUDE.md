@@ -18,7 +18,7 @@ mkdir -p /tmp/dotnet_home
 
 ```bash
 dotnet build TradingStuff.slnx
-dotnet test tests/TradingStuff.Tests/TradingStuff.Tests.csproj -m:1    # 119 tests, all should pass
+dotnet test tests/TradingStuff.Tests/TradingStuff.Tests.csproj -m:1    # 125 tests, all should pass
 aspire start --non-interactive                                        # full distributed app
 ```
 
