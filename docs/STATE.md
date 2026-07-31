@@ -218,13 +218,150 @@ Key runtime-verified facts (read-only wire probes against paper TWS, 2026-07-31)
   order-map restart survival + never-transmitted compensation + broker-id integrity) run via
   `TRADING_TEST_POSTGRES="Host=...;Username=postgres;Password=..." dotnet test --filter Category=RequiresPostgres`.
 
+### Research platform Phase 1 (milestone 2, 2026-07-31) — DONE
+
+The calendar-critical slice: standing subscriptions, the raw recorder, node selection, and
+coverage measurement are live. The Track B clock has started.
+
+- **Migration 003**: `research.option_nodes` (54-row registered grid, 6 DTE buckets × 9 delta
+  nodes, seeded in SQL), `research.node_assignments` (role → conId over time, `assigned_from`/
+  `assigned_to`), `gateway.option_quote_events` + `gateway.underlying_tick_events` (daily
+  RANGE-partitioned, append-only, each with a `DEFAULT` partition safety net), `gateway.recorder_gaps`.
+- **`PartitionMaintainer`** (ResearchService) creates 3 days of partitions ahead on a 6 h sweep.
+  **Verified directly against Postgres 17** that once a row lands in a table's `DEFAULT` partition,
+  Postgres permanently refuses to create the real partition for that date afterward (`updated
+  partition constraint for default partition ... would be violated by some row`) — recovering a
+  stray row needs a manual one-time migration. Mitigated, not automated: fast retry (1 min, not
+  6 h) after a failed sweep, and a `LogCritical` + row-count check every sweep if anything is ever
+  sitting in `..._default` so it cannot go unnoticed.
+- **Gateway `SubscriptionManager`** (`IbkrGateway/Subscriptions/`): standing leases on top of the
+  pacing governor's line ledger — grant/heartbeat/release, `LeasePriority` (CoreRecording/
+  Rotation/AdHoc; `ExecutionReserved` is refused through this API, reserved for the gateway's own
+  transient quotes), eviction after 3 missed heartbeats. `IbkrConnection` gained
+  `SubscriptionsMustReplay`, raised on a fresh `startApi` handshake and on TWS's 1101
+  ("connectivity restored, data lost") — both reset the pacing governor's line ledger first (a
+  fresh `EClientSocket` has zero real TWS lines regardless of what the ledger still thinks) then
+  replay every lease in priority order with a fresh ticker id.
+- **Gateway `ObservationRecorder`** (`IbkrGateway/Recording/`): `RecordingTickSink` (one per
+  standing subscription) accumulates `tickPrice`/`tickSize`/`tickOptionComputation` into full-state
+  rows with a changed-fields bitmask, computes locked/crossed, tags the first tick after a replay
+  so its lease's gap closes automatically. `ITickSink` widened (`tickSize` routed for the first
+  time; `ApplyOptionComputation` now carries IV and underlying price). Two bounded
+  `Channel<T>` (50k, `DropOldest`) feed background batched Npgsql binary `COPY` loops
+  (5000 rows/500 ms). Gap bookkeeping (`OpenGapAsync`/`CloseGapAsync`, deduplicated per scope)
+  records `disconnect`, `line_evicted`, `buffer_overflow`, `write_failure`. A dropped-batch write
+  failure loses the batch (documented — the `write_failures` counter records how much, the gap
+  records that it happened); a saturated channel's `buffer_overflow` gap now **closes** once the
+  backlog drains and a later enqueue observes headroom again — the first version of this only
+  opened it, verified as a real defect and fixed with two deterministic Postgres tests
+  (`ObservationRecorderPostgresTests`) rather than a timing-based one (an earlier attempt at an
+  end-to-end "blast 50k ticks and watch it overflow" test was flaky against a live drain loop and
+  was replaced with direct `OpenGapAsync`/`CloseGapAsync` tests).
+- **`ContractUniverseService`/`NodeSelector`** (ResearchService): bootstrap-only in v1 — strikes
+  picked by a fixed moneyness offset per node role (spot proxy = median strike of a wide chain-window
+  response), never by delta, since there is no delta to target before anything has streamed.
+  **Delta-based drift detection/reassignment is deliberately deferred** — see Left, below.
+  `UpsertAssignmentAsync` closes the prior `node_assignments` row and opens a new one only when the
+  conId actually changes (idempotent reruns are no-ops); `FOR UPDATE` added as cheap insurance
+  against a future concurrent caller even though today's only caller is sequential.
+- **`RecorderOrchestrator`** (ResearchService): every 2 min, bootstraps nodes, ensures leases for
+  **SPX, VIX, SPY** (core underlyings) and every current node assignment, heartbeats everything
+  every 20 s. **ES is deliberately deferred to Phase 2** — front-month resolution needs expiry/roll
+  logic that Phase 2's `EsContractWalker` already owns; duplicating it here for Phase 1 would be
+  exactly the premature abstraction the plan argues against.
+- **`CoverageMonitor`** + `GET /research/coverage`: per-conId and overall coverage ratio (distinct
+  1-minute buckets with data ÷ total minutes) over a window (default trailing 24 h — this measures
+  a fixed UTC window, not yet an actual RTH/GTH session; `SessionCalendarService` in Phase 2 will
+  let this align to real session boundaries), plus overlapping `recorder_gaps` rows.
+  `GET /research/nodes` reports current assignments.
+- **`/research/*` is anonymous** (matching AuditDashboard's existing unauthenticated `/`) — a
+  deliberate posture change from Phase 0's `RequireAuthorization()` on `/research/status` and
+  `/research/capabilities`, applied consistently to the new endpoints too.
+- **React + Vite research UI** (`src/TradingStuff.ResearchService/ClientApp/`), build wired into
+  the csproj (`npm ci && npm run build` before the C# build), output to `wwwroot/` served under
+  `/ui`. First and only page: **`/ui/coverage`** — overall coverage % (color-coded against the 95%
+  threshold), per-conId table sorted worst-first, gaps table (most recent first, open gaps
+  flagged), manual + 30 s auto-refresh, clear loading/error states.
+- Tests: 149 → **182** unit (`RecordingTickSinkTests` — pure, no Postgres — plus pacing-ledger
+  reset coverage), plus 5 → **18** `Category=RequiresPostgres` integration tests.
+
+### Phase 1 adversarial review — 8 confirmed defects fixed, 2 refuted, 12 investigated
+
+A repeat of Phase 0's practice: a multi-dimension review (concurrency/lifecycle, SQL/persistence,
+data-integrity) against the Phase 1 diff, findings independently re-verified by direct code
+reading and, where possible, live-Postgres reproduction rather than trusted at face value — the
+review tool's own finding-to-verdict pairing across concurrently-completing reviewer agents proved
+unreliable for a couple of entries, so every "confirmed" claim below was re-traced by hand before
+being accepted. Fixed, with a regression test for each unless noted:
+
+- **`node_assignments` could silently hold two "current" rows for one node.** `SELECT ... FOR
+  UPDATE` does NOT prevent this under Read Committed: a blocked FOR UPDATE query re-checks its
+  WHERE clause against the row's new committed version once the blocking transaction's lock
+  releases, and a row that no longer matches (`assigned_to` just got set) is silently excluded —
+  the blocked caller then sees "no current row" and inserts its own. **Reproduced directly against
+  live Postgres 17** (two concurrent transactions, exact race). Fixed with a real guarantee:
+  `CREATE UNIQUE INDEX node_assignments_one_current_idx ON research.node_assignments (node_id)
+  WHERE assigned_to IS NULL` (migration 003) plus a catch-and-retry-once in
+  `NodeSelector.UpsertAssignmentAsync`. Test reproduces the race with two concurrent callers and
+  asserts exactly one current row survives.
+- **A second `SubscriptionsMustReplay` trigger arriving mid-pass was silently dropped**, with no
+  follow-up scheduled — any lease that failed to reissue on the in-flight pass had no other retry
+  path for the rest of the session. `SubscriptionManager.ReplayAsync` now coalesces instead of
+  discarding: a losing trigger sets a pending flag the in-flight pass checks before releasing its
+  gate, looping for one more full pass if set.
+- **The OLD `RecordingTickSink`'s registry entry leaked on every 1101-triggered replay** (TWS
+  "connectivity restored, data lost" — the socket never drops, so `registry.FailAll` never runs,
+  unlike a real disconnect). Fixed: the replay pass now explicitly removes the previous ticker's
+  registry entry once the new one is issued.
+- **A lease's `LineLease` could go stale on a failed replay attempt** and later get disposed by
+  `TeardownAsync` — decrementing the pacing ledger for a line that was never actually re-acquired
+  post-reset, letting the governor silently over-admit relative to the true TWS-side count. Fixed:
+  a failed replay attempt now clears the lease's `LineLease` reference.
+- **Reassigning a node to a new conId leaked its old lease forever.**
+  `RecorderOrchestrator._nodeLeasesByConId` was keyed by conId and only ever grew; an old conId
+  simply stopped appearing in `NodeSelector.GetCurrentAssignmentsAsync`'s result and was never
+  revisited, never released, and kept being heartbeated — permanently consuming a research line
+  per reassignment. Fixed: tracked by nodeId instead, with the old lease explicitly released on
+  detected reassignment.
+- **Coverage silently excluded conIds with zero ticks** — a plain `GROUP BY con_id` over the raw
+  event tables cannot produce a row for a conId that never ticked, so a fully-dead subscription
+  (the worst case this report exists to catch) was invisible rather than showing 0%. Fixed:
+  `CoverageMonitor` now unions tick counts with every current `node_assignments` conId, defaulting
+  missing ones to 0 minutes. (Core underlyings aren't in `node_assignments`, so a fully-dead
+  underlying subscription is a smaller residual gap — noted in the class remarks, not yet closed.)
+- **One un-creatable partition date blocked every other date in the same sweep, for both tables,
+  on every retry, forever** — `EnsureUpcomingPartitionsAsync` had no per-call try/catch. Fixed:
+  each date is now isolated; a failure logs and the sweep continues. Regression test poisons one
+  date (a row already in `DEFAULT` for it, per the earlier-verified Postgres behavior) and confirms
+  the other three still get their partitions.
+- **`WriteOptionBatchAsync`/`WriteUnderlyingBatchAsync` shared one gap scope** (`"recorder:write"`)
+  despite running as two independent concurrent loops — one pipeline's success could close a gap
+  that should still reflect the other still failing. Split into `recorder:write:option` /
+  `recorder:write:underlying`. Same change also added **one bounded retry** before dropping a
+  failed batch (up to 5,000 already-dequeued, otherwise-unrecoverable observations) — a single
+  transient blip now recovers instead of being discarded outright.
+- **`PartitionMaintainer`'s "Created partition" log could fire regardless of whether anything was
+  actually created**, undermining the exact operator trust the `DEFAULT`-row Critical alert (added
+  earlier this phase) depends on. Fixed with an explicit existence check before the
+  `CREATE TABLE IF NOT EXISTS`, rather than trusting the DDL statement's return value.
+
+**Refuted after independent verification** (not fixed — investigated and found not to be real):
+open-interest recording trusting whichever of tick 27/28 fires (correct: IBKR sends only one per
+contract, matching that contract's own right — verified against the documented tick semantics);
+and one theorized stale-`LineLease` disposal path that, on closer trace, does not actually
+occur the way first described (the *related*, real stale-reference issue above was found and
+fixed independently while re-verifying this claim by hand).
+
 ## Left
 
 Milestone 2 (research platform — sequenced in `docs/plans/ibkr-edge-research-roadmap.md`):
 
-- Phase 1: standing subscription leases + SPX surface recorder + node selection +
-  coverage monitoring (calendar-critical — option data is perishable).
-- Phase 2: session calendar, historical client, resumable backfill (SPX/SPY/VIX/ES), gap detection.
+- **Node drift detection and reassignment** — Phase 1 shipped bootstrap-only node selection
+  (fixed moneyness offsets). Re-evaluating a node's assigned strike against its own recorded delta
+  once streaming (the roadmap's "|Δ−target| > 0.10 sustained 30 min" rule), with dual-subscribe
+  overlap and a churn cap, is a deliberate, documented follow-up — not implemented yet.
+- Phase 2: session calendar, historical client, resumable backfill (SPX/SPY/VIX/ES incl.
+  `EsContractWalker`, which will also unblock live ES tick recording), gap detection.
 - Phases 3–8: snapshots → features/labels/baselines/study runner → residual models →
   implied-vs-forecast study → execution simulator → shadow ops.
 

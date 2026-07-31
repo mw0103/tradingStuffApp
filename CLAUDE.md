@@ -81,12 +81,13 @@ Milestone 1 is **not** complete: persistence and event transport are unmet, and 
 Keycloak start but nothing connects to them. Prerequisites and gotchas are in `docs/STATE.md`; API
 detail is in the `ibkr` skill.
 
-## Model and effort policy (milestone 2 research phases)
+## Model and effort policy (milestone 2 research phases) — MANDATORY DEFAULT
 
-At session start, check which research phase is active in `docs/STATE.md` (the "Left" list names
-the next phase; the last "Done" entry names the completed one) and pick the model/effort for the
-work at hand from this table. **If the session's active model does not match the policy for the
-phase being worked, say so explicitly before starting** — do not silently proceed on a mismatch.
+This is a default that governs behavior, not a suggestion to surface and move past. **Use the
+recommended model and reasoning effort for the work at hand unless one of the two exceptions below
+applies.** At the start of any research-platform task, check which phase is active in
+`docs/STATE.md` (the "Left" list names the next phase; the last "Done" entry names the completed
+one), then match the work against this table:
 
 | Work | Model | Reasoning effort |
 |---|---|---|
@@ -96,10 +97,28 @@ phase being worked, say so explicitly before starting** — do not silently proc
 | ALL leakage reviews and order-safety reviews, any phase | Opus | high |
 | UI (`ClientApp/`) and documentation work | Haiku | low |
 
-Pinned-model agents exist for delegation regardless of the session model: `implementer` (Sonnet),
-`ui-builder` (Haiku), `leakage-reviewer` (Opus, high effort) — see `.claude/agents/`. Route
-leakage/order-safety review work through `leakage-reviewer` rather than reviewing inline on a
-smaller model.
+**The two exceptions, and only these:**
+1. The user explicitly says not to apply this policy (for this task, or generally).
+2. The user explicitly names a specific model or effort level to use for the task.
+
+Absent either, apply the policy without asking and without waiting for confirmation:
+
+- **Main-loop work**: if the active session model/effort does not match the row for the work about
+  to start, say so in one line, then act on the mismatch rather than merely noting it — prefer
+  delegating the work to the matching pinned agent below over doing it inline on the wrong model.
+  If delegation is impractical (e.g. a one-line fix mid-task, or the user is actively driving the
+  session interactively on a fixed model), state that plainly and proceed on the session's model
+  rather than silently pretending the mismatch doesn't exist.
+- **Delegated work (Agent/Workflow tool calls)**: always pass the `model` (and `effort` inside
+  Workflow's `agent()` calls) matching the table — this is fully within direct control and has no
+  excuse for drifting from policy.
+
+Pinned-model agents exist for exactly this: `implementer` (Sonnet), `ui-builder` (Haiku),
+`leakage-reviewer` (Opus, high effort) — see `.claude/agents/`. Route leakage/order-safety review
+work through `leakage-reviewer` rather than reviewing inline on a smaller model. If a project-level
+agent isn't yet visible to the current session's Agent tool (a known lag right after the agent
+files are added), fall back to `general-purpose` with an explicit `model` override matching the
+table rather than dropping the policy.
 
 ## Trading safety
 

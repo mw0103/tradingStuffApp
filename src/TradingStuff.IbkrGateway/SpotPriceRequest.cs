@@ -53,7 +53,8 @@ internal sealed class SpotPriceRequest : ITickSink
     }
 
     /// <summary>Not applicable to a stock; option computation ticks never arrive for one.</summary>
-    public void ApplyOptionComputation(int field, double delta, double gamma, double vega, double theta)
+    public void ApplyOptionComputation(
+        int field, double impliedVolatility, double delta, double gamma, double vega, double theta, double undPrice)
     {
     }
 

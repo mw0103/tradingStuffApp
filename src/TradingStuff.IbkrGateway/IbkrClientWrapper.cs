@@ -149,6 +149,9 @@ public sealed class IbkrClientWrapper(
     public override void tickPrice(int tickerId, int field, double price, TickAttrib attribs) =>
         registry.Get<ITickSink>(tickerId)?.ApplyPrice(field, price);
 
+    public override void tickSize(int tickerId, int field, decimal size) =>
+        registry.Get<ITickSink>(tickerId)?.ApplySize(field, size);
+
     public override void tickOptionComputation(
         int tickerId,
         int field,
@@ -161,7 +164,8 @@ public sealed class IbkrClientWrapper(
         double vega,
         double theta,
         double undPrice) =>
-        registry.Get<ITickSink>(tickerId)?.ApplyOptionComputation(field, delta, gamma, vega, theta);
+        registry.Get<ITickSink>(tickerId)?.ApplyOptionComputation(
+            field, impliedVolatility, delta, gamma, vega, theta, undPrice);
 
     public override void tickSnapshotEnd(int tickerId) =>
         registry.Get<ITickSink>(tickerId)?.CompletePartial();

@@ -1,0 +1,453 @@
+using System.Collections.Concurrent;
+using System.Diagnostics.Metrics;
+using System.Threading.Channels;
+using Npgsql;
+using NpgsqlTypes;
+using TradingStuff.ResearchContracts;
+
+namespace TradingStuff.IbkrGateway.Recording;
+
+/// <summary>
+/// What <see cref="RecordingTickSink"/> needs from the recorder. Narrow on purpose: it lets the
+/// sink's tick-accumulation logic — the part most worth testing in isolation — be exercised without
+/// any Postgres dependency.
+/// </summary>
+internal interface IObservationSink
+{
+    void EnqueueOption(OptionQuoteObservation observation);
+
+    void EnqueueUnderlying(UnderlyingTickObservation observation);
+
+    void NotifyGapClosed(Guid leaseId);
+}
+
+/// <summary>
+/// Append-only recording of standing-subscription ticks into Postgres, and the permanent record of
+/// when recording had a gap.
+/// </summary>
+/// <remarks>
+/// The one deliberately over-engineered component in this platform (see
+/// docs/plans/ibkr-edge-research-roadmap.md § architecture): live option data is unrecoverable, so
+/// every enqueue call — invoked directly from the EReader pump thread via
+/// <see cref="RecordingTickSink"/> — must be non-blocking, and every failure mode (Postgres down,
+/// buffer saturation) degrades to a recorded gap rather than an exception that could reach the
+/// pump. Draining happens on background tasks via Npgsql binary <c>COPY</c>, batched by size or
+/// time, whichever comes first.
+/// </remarks>
+public sealed class ObservationRecorder : IObservationSink, IAsyncDisposable
+{
+    private const int ChannelCapacity = 50_000;
+    private const int BatchSize = 5_000;
+    private const int RetryDelayMilliseconds = 250;
+    private static readonly TimeSpan FlushInterval = TimeSpan.FromMilliseconds(500);
+
+    private readonly NpgsqlDataSource? _dataSource;
+    private readonly ILogger<ObservationRecorder> _logger;
+    private readonly Channel<OptionQuoteObservation>? _optionChannel;
+    private readonly Channel<UnderlyingTickObservation>? _underlyingChannel;
+    private readonly CancellationTokenSource _lifetime = new();
+    private readonly Task[] _drainTasks;
+
+    // Process-local guard against opening a duplicate gap row for a scope that already has one
+    // open. Gap rows themselves are the durable record; this dictionary only avoids spamming the
+    // table while a condition (e.g. sustained buffer saturation) persists across many ticks.
+    private readonly ConcurrentDictionary<string, long> _openGapIdByScope = new();
+
+    private readonly Counter<long> _eventsPersisted;
+    private readonly Counter<long> _writeFailures;
+    private readonly Counter<long> _bufferOverflows;
+
+    public ObservationRecorder(IConfiguration configuration, IMeterFactory meterFactory, ILogger<ObservationRecorder> logger)
+    {
+        _logger = logger;
+
+        var meter = meterFactory.Create("TradingStuff.IbkrGateway");
+        _eventsPersisted = meter.CreateCounter<long>("gateway.recorder.events_persisted");
+        _writeFailures = meter.CreateCounter<long>("gateway.recorder.write_failures");
+        _bufferOverflows = meter.CreateCounter<long>("gateway.recorder.buffer_overflows");
+        meter.CreateObservableGauge("gateway.recorder.buffer_depth", GetTotalBufferDepth);
+
+        var connectionString = configuration.GetConnectionString("trading");
+
+        if (string.IsNullOrWhiteSpace(connectionString))
+        {
+            _logger.LogWarning(
+                "No 'trading' connection string; the observation recorder is DISABLED. " +
+                "Standing-subscription ticks will not be persisted.");
+            _drainTasks = [];
+            return;
+        }
+
+        _dataSource = NpgsqlDataSource.Create(connectionString);
+
+        var channelOptions = new BoundedChannelOptions(ChannelCapacity)
+        {
+            SingleReader = true,
+            // All ticks originate on the one EReader pump thread — never actually concurrent — but
+            // this is not asserted anywhere else in the codebase, so SingleWriter is left false to
+            // stay correct even if that assumption is ever revisited.
+            SingleWriter = false,
+            FullMode = BoundedChannelFullMode.DropOldest,
+        };
+
+        _optionChannel = Channel.CreateBounded<OptionQuoteObservation>(channelOptions);
+        _underlyingChannel = Channel.CreateBounded<UnderlyingTickObservation>(channelOptions);
+
+        _drainTasks =
+        [
+            Task.Run(() => DrainOptionLoopAsync(_lifetime.Token)),
+            Task.Run(() => DrainUnderlyingLoopAsync(_lifetime.Token)),
+        ];
+    }
+
+    public bool Enabled => _dataSource is not null;
+
+    private long GetTotalBufferDepth() =>
+        (_optionChannel?.Reader.Count ?? 0) + (_underlyingChannel?.Reader.Count ?? 0);
+
+    // ---- enqueue (called from the EReader pump thread — must never block) --------------------
+
+    public void EnqueueOption(OptionQuoteObservation observation)
+    {
+        if (_optionChannel is not { } channel)
+        {
+            return;
+        }
+
+        CheckOverflow(channel.Reader.Count, "recorder:option-buffer");
+        channel.Writer.TryWrite(observation);
+    }
+
+    public void EnqueueUnderlying(UnderlyingTickObservation observation)
+    {
+        if (_underlyingChannel is not { } channel)
+        {
+            return;
+        }
+
+        CheckOverflow(channel.Reader.Count, "recorder:underlying-buffer");
+        channel.Writer.TryWrite(observation);
+    }
+
+    /// <summary>
+    /// Opens (or, once the backlog has drained, closes) the buffer-overflow gap for one channel.
+    /// Unlike the per-lease "disconnect"/"line_evicted" scopes, this one is process-wide and
+    /// routinely recoverable, so it is the only gap scope closed from the enqueue path itself
+    /// rather than from a tick resuming on a specific lease.
+    /// </summary>
+    private void CheckOverflow(int currentDepth, string scope)
+    {
+        if (currentDepth < ChannelCapacity)
+        {
+            if (_openGapIdByScope.ContainsKey(scope))
+            {
+                _ = CloseGapAsync(scope);
+            }
+
+            return;
+        }
+
+        _bufferOverflows.Add(1);
+
+        // Fire-and-forget: this is called from the pump thread and must not await. Errors are
+        // logged inside OpenGapAsync itself.
+        _ = OpenGapAsync(scope, "buffer_overflow", CancellationToken.None);
+    }
+
+    // ---- gap bookkeeping -----------------------------------------------------------------------
+
+    /// <summary>
+    /// Opens a gap for <paramref name="scope"/> if one is not already open. Safe to call
+    /// repeatedly while a condition persists — only the first call in a run actually inserts a row.
+    /// </summary>
+    public async Task OpenGapAsync(string scope, string reason, CancellationToken cancellationToken)
+    {
+        if (_dataSource is null || _openGapIdByScope.ContainsKey(scope))
+        {
+            return;
+        }
+
+        try
+        {
+            await using var command = _dataSource.CreateCommand(
+                "INSERT INTO gateway.recorder_gaps (scope, started_at, reason) VALUES ($1, now(), $2) RETURNING gap_id");
+            command.Parameters.AddWithValue(scope);
+            command.Parameters.AddWithValue(reason);
+
+            var gapId = (long)(await command.ExecuteScalarAsync(cancellationToken))!;
+
+            if (!_openGapIdByScope.TryAdd(scope, gapId))
+            {
+                // Another caller opened one concurrently; close the redundant row rather than leak it.
+                await using var close = _dataSource.CreateCommand(
+                    "UPDATE gateway.recorder_gaps SET ended_at = now() WHERE gap_id = $1");
+                close.Parameters.AddWithValue(gapId);
+                await close.ExecuteNonQueryAsync(cancellationToken);
+                return;
+            }
+
+            _logger.LogWarning("Recording gap opened: scope={Scope} reason={Reason} gapId={GapId}.", scope, reason, gapId);
+        }
+        catch (Exception ex) when (ex is NpgsqlException or InvalidOperationException or TimeoutException)
+        {
+            _logger.LogError(ex, "Could not record a gap for scope {Scope} ({Reason}).", scope, reason);
+        }
+    }
+
+    /// <summary>Closes the open gap for <paramref name="scope"/>, if there is one.</summary>
+    public async Task CloseGapAsync(string scope)
+    {
+        if (_dataSource is null || !_openGapIdByScope.TryRemove(scope, out var gapId))
+        {
+            return;
+        }
+
+        try
+        {
+            await using var command = _dataSource.CreateCommand(
+                "UPDATE gateway.recorder_gaps SET ended_at = now() WHERE gap_id = $1");
+            command.Parameters.AddWithValue(gapId);
+            await command.ExecuteNonQueryAsync();
+
+            _logger.LogInformation("Recording gap closed: scope={Scope} gapId={GapId}.", scope, gapId);
+        }
+        catch (Exception ex) when (ex is NpgsqlException or InvalidOperationException or TimeoutException)
+        {
+            _logger.LogError(ex, "Could not close the gap for scope {Scope} (gapId {GapId}).", scope, gapId);
+
+            // Put it back so a later close attempt (or the next OpenGapAsync no-op check) can retry;
+            // otherwise the in-memory guard forgets a gap the database still has open.
+            _openGapIdByScope.TryAdd(scope, gapId);
+        }
+    }
+
+    /// <summary>Convenience for <see cref="RecordingTickSink"/>: closes a lease's own gap scope.</summary>
+    public void NotifyGapClosed(Guid leaseId) => _ = CloseGapAsync(LeaseScope(leaseId));
+
+    public static string LeaseScope(Guid leaseId) => $"lease:{leaseId:N}";
+
+    // ---- draining --------------------------------------------------------------------------
+
+    private async Task DrainOptionLoopAsync(CancellationToken cancellationToken)
+    {
+        var batch = new List<OptionQuoteObservation>(BatchSize);
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            await FillBatchAsync(_optionChannel!.Reader, batch, cancellationToken);
+
+            if (batch.Count == 0)
+            {
+                continue;
+            }
+
+            await WriteOptionBatchAsync(batch, cancellationToken);
+            batch.Clear();
+        }
+    }
+
+    private async Task DrainUnderlyingLoopAsync(CancellationToken cancellationToken)
+    {
+        var batch = new List<UnderlyingTickObservation>(BatchSize);
+
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            await FillBatchAsync(_underlyingChannel!.Reader, batch, cancellationToken);
+
+            if (batch.Count == 0)
+            {
+                continue;
+            }
+
+            await WriteUnderlyingBatchAsync(batch, cancellationToken);
+            batch.Clear();
+        }
+    }
+
+    /// <summary>Fills <paramref name="batch"/> up to <see cref="BatchSize"/> or until <see cref="FlushInterval"/> elapses.</summary>
+    private static async Task FillBatchAsync<T>(ChannelReader<T> reader, List<T> batch, CancellationToken cancellationToken)
+    {
+        using var flushCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        flushCts.CancelAfter(FlushInterval);
+
+        try
+        {
+            while (batch.Count < BatchSize)
+            {
+                if (!await reader.WaitToReadAsync(flushCts.Token))
+                {
+                    return; // channel completed
+                }
+
+                while (batch.Count < BatchSize && reader.TryRead(out var item))
+                {
+                    batch.Add(item);
+                }
+            }
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            // Flush interval elapsed with a partial (possibly empty) batch — that is the point.
+        }
+    }
+
+    private async Task WriteOptionBatchAsync(List<OptionQuoteObservation> batch, CancellationToken cancellationToken)
+    {
+        // A distinct scope per table: WriteOptionBatchAsync and WriteUnderlyingBatchAsync are two
+        // independent, concurrently-running loops. A shared "recorder:write" scope meant one
+        // pipeline's success (CloseGapAsync) could close a gap that should still reflect the OTHER
+        // pipeline still failing.
+        const string scope = "recorder:write:option";
+        const string columns =
+            "con_id, lease_id, observed_at, changed_fields, bid, ask, bid_size, ask_size, last, last_size, " +
+            "volume, open_interest, greeks_variant, iv, delta, gamma, vega, theta, und_price, locked, crossed, " +
+            "origin, normalization_version";
+
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                await using var connection = await _dataSource!.OpenConnectionAsync(cancellationToken);
+                await using var writer = await connection.BeginBinaryImportAsync(
+                    $"COPY gateway.option_quote_events ({columns}) FROM STDIN (FORMAT BINARY)", cancellationToken);
+
+                foreach (var observation in batch)
+                {
+                    await writer.StartRowAsync(cancellationToken);
+                    await writer.WriteAsync(observation.Envelope.ConId, NpgsqlDbType.Integer, cancellationToken);
+                    await writer.WriteAsync(observation.Envelope.LeaseId, NpgsqlDbType.Uuid, cancellationToken);
+                    await writer.WriteAsync(observation.Envelope.ObservedAt, NpgsqlDbType.TimestampTz, cancellationToken);
+                    await writer.WriteAsync((int)observation.Changed, NpgsqlDbType.Integer, cancellationToken);
+                    await WriteNullableDecimalAsync(writer, observation.Bid, cancellationToken);
+                    await WriteNullableDecimalAsync(writer, observation.Ask, cancellationToken);
+                    await WriteNullableDecimalAsync(writer, observation.BidSize, cancellationToken);
+                    await WriteNullableDecimalAsync(writer, observation.AskSize, cancellationToken);
+                    await WriteNullableDecimalAsync(writer, observation.Last, cancellationToken);
+                    await WriteNullableDecimalAsync(writer, observation.LastSize, cancellationToken);
+                    await WriteNullableDecimalAsync(writer, observation.Volume, cancellationToken);
+                    await WriteNullableDecimalAsync(writer, observation.OpenInterest, cancellationToken);
+                    await writer.WriteAsync((short)observation.GreeksVariant, NpgsqlDbType.Smallint, cancellationToken);
+                    await WriteNullableDecimalAsync(writer, observation.Iv, cancellationToken);
+                    await WriteNullableDecimalAsync(writer, observation.Delta, cancellationToken);
+                    await WriteNullableDecimalAsync(writer, observation.Gamma, cancellationToken);
+                    await WriteNullableDecimalAsync(writer, observation.Vega, cancellationToken);
+                    await WriteNullableDecimalAsync(writer, observation.Theta, cancellationToken);
+                    await WriteNullableDecimalAsync(writer, observation.UnderlyingPrice, cancellationToken);
+                    await writer.WriteAsync(observation.Locked, NpgsqlDbType.Boolean, cancellationToken);
+                    await writer.WriteAsync(observation.Crossed, NpgsqlDbType.Boolean, cancellationToken);
+                    await writer.WriteAsync((short)observation.Envelope.Origin, NpgsqlDbType.Smallint, cancellationToken);
+                    await writer.WriteAsync(observation.Envelope.NormalizationVersion, NpgsqlDbType.Smallint, cancellationToken);
+                }
+
+                await writer.CompleteAsync(cancellationToken);
+                _eventsPersisted.Add(batch.Count);
+                await CloseGapAsync(scope);
+                return;
+            }
+            catch (Exception ex) when (ex is NpgsqlException or InvalidOperationException or TimeoutException)
+            {
+                // One bounded retry: this runs entirely on the background drain task, never the
+                // pump thread, so the delay is safe. A single transient blip (one bad connection
+                // attempt during a brief pool hiccup) recovers instead of permanently discarding up
+                // to 5,000 already-dequeued, otherwise-unrecoverable observations.
+                if (attempt == 0)
+                {
+                    _logger.LogWarning(
+                        ex, "Transient failure persisting {Count} option observation(s); retrying once.", batch.Count);
+                    await Task.Delay(TimeSpan.FromMilliseconds(RetryDelayMilliseconds), CancellationToken.None);
+                    continue;
+                }
+
+                _writeFailures.Add(batch.Count);
+                _logger.LogError(ex, "Failed to persist {Count} option observation(s) after retry; batch dropped.", batch.Count);
+                await OpenGapAsync(scope, "write_failure", CancellationToken.None);
+                return;
+            }
+        }
+    }
+
+    private async Task WriteUnderlyingBatchAsync(List<UnderlyingTickObservation> batch, CancellationToken cancellationToken)
+    {
+        const string scope = "recorder:write:underlying";
+        const string columns =
+            "con_id, lease_id, observed_at, changed_fields, bid, ask, bid_size, ask_size, last, last_size, " +
+            "volume, locked, crossed, origin, normalization_version";
+
+        for (var attempt = 0; ; attempt++)
+        {
+            try
+            {
+                await using var connection = await _dataSource!.OpenConnectionAsync(cancellationToken);
+                await using var writer = await connection.BeginBinaryImportAsync(
+                    $"COPY gateway.underlying_tick_events ({columns}) FROM STDIN (FORMAT BINARY)", cancellationToken);
+
+                foreach (var observation in batch)
+                {
+                    await writer.StartRowAsync(cancellationToken);
+                    await writer.WriteAsync(observation.Envelope.ConId, NpgsqlDbType.Integer, cancellationToken);
+                    await writer.WriteAsync(observation.Envelope.LeaseId, NpgsqlDbType.Uuid, cancellationToken);
+                    await writer.WriteAsync(observation.Envelope.ObservedAt, NpgsqlDbType.TimestampTz, cancellationToken);
+                    await writer.WriteAsync((int)observation.Changed, NpgsqlDbType.Integer, cancellationToken);
+                    await WriteNullableDecimalAsync(writer, observation.Bid, cancellationToken);
+                    await WriteNullableDecimalAsync(writer, observation.Ask, cancellationToken);
+                    await WriteNullableDecimalAsync(writer, observation.BidSize, cancellationToken);
+                    await WriteNullableDecimalAsync(writer, observation.AskSize, cancellationToken);
+                    await WriteNullableDecimalAsync(writer, observation.Last, cancellationToken);
+                    await WriteNullableDecimalAsync(writer, observation.LastSize, cancellationToken);
+                    await WriteNullableDecimalAsync(writer, observation.Volume, cancellationToken);
+                    await writer.WriteAsync(observation.Locked, NpgsqlDbType.Boolean, cancellationToken);
+                    await writer.WriteAsync(observation.Crossed, NpgsqlDbType.Boolean, cancellationToken);
+                    await writer.WriteAsync((short)observation.Envelope.Origin, NpgsqlDbType.Smallint, cancellationToken);
+                    await writer.WriteAsync(observation.Envelope.NormalizationVersion, NpgsqlDbType.Smallint, cancellationToken);
+                }
+
+                await writer.CompleteAsync(cancellationToken);
+                _eventsPersisted.Add(batch.Count);
+                await CloseGapAsync(scope);
+                return;
+            }
+            catch (Exception ex) when (ex is NpgsqlException or InvalidOperationException or TimeoutException)
+            {
+                if (attempt == 0)
+                {
+                    _logger.LogWarning(
+                        ex, "Transient failure persisting {Count} underlying tick observation(s); retrying once.", batch.Count);
+                    await Task.Delay(TimeSpan.FromMilliseconds(RetryDelayMilliseconds), CancellationToken.None);
+                    continue;
+                }
+
+                _writeFailures.Add(batch.Count);
+                _logger.LogError(ex, "Failed to persist {Count} underlying tick observation(s) after retry; batch dropped.", batch.Count);
+                await OpenGapAsync(scope, "write_failure", CancellationToken.None);
+                return;
+            }
+        }
+    }
+
+    private static Task WriteNullableDecimalAsync(NpgsqlBinaryImporter writer, decimal? value, CancellationToken cancellationToken) =>
+        value is { } present
+            ? writer.WriteAsync(present, NpgsqlDbType.Numeric, cancellationToken)
+            : writer.WriteNullAsync(cancellationToken);
+
+    public async ValueTask DisposeAsync()
+    {
+        await _lifetime.CancelAsync();
+        _optionChannel?.Writer.TryComplete();
+        _underlyingChannel?.Writer.TryComplete();
+
+        try
+        {
+            await Task.WhenAll(_drainTasks);
+        }
+        catch (OperationCanceledException)
+        {
+        }
+
+        _lifetime.Dispose();
+
+        if (_dataSource is not null)
+        {
+            await _dataSource.DisposeAsync();
+        }
+    }
+}

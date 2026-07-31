@@ -8,7 +8,24 @@ internal interface ITickSink : IPendingRequest
 {
     void ApplyPrice(int field, double price);
 
-    void ApplyOptionComputation(int field, double delta, double gamma, double vega, double theta);
+    /// <summary>
+    /// The full <c>tickOptionComputation</c> payload. <paramref name="impliedVolatility"/> and
+    /// <paramref name="undPrice"/> exist for sinks that record them (the recorder does; the
+    /// one-shot execution-quote path does not and ignores both).
+    /// </summary>
+    void ApplyOptionComputation(
+        int field, double impliedVolatility, double delta, double gamma, double vega, double theta, double undPrice);
+
+    /// <summary>
+    /// Bid/ask/last size, and — for a leased option subscription with generic ticks 100/101 — this
+    /// contract's own volume (field 29 or 30) and open interest (field 27 or 28). Default no-op:
+    /// only the recorder's standing-subscription sinks care about sizes; the one-shot
+    /// <see cref="QuoteRequest"/>/<see cref="SpotPriceRequest"/> paths do not carry size fields at
+    /// all and would otherwise need an empty override each.
+    /// </summary>
+    void ApplySize(int field, decimal size)
+    {
+    }
 
     /// <summary>Settle with whatever has arrived so far.</summary>
     void CompletePartial();
@@ -100,8 +117,10 @@ internal sealed class QuoteRequest : ITickSink
         TryCompleteIfReady();
     }
 
-    public void ApplyOptionComputation(int field, double delta, double gamma, double vega, double theta)
+    public void ApplyOptionComputation(
+        int field, double impliedVolatility, double delta, double gamma, double vega, double theta, double undPrice)
     {
+        // impliedVolatility/undPrice are not part of QuoteSnapshot; this path ignores both.
         // Only the model computation is a usable Greeks set; the bid/ask/last computations are
         // derived from one side of the book and disagree with each other.
         if (field is not (TickType.MODEL_OPTION or TickType.DELAYED_MODEL_OPTION))

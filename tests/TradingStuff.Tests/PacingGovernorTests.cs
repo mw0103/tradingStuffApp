@@ -299,6 +299,51 @@ public sealed class PacingGovernorTests
     }
 
     [Fact]
+    public async Task Resetting_the_ledger_zeroes_both_counts_for_a_reconnect()
+    {
+        var (governor, _) = Create(new IbkrPacingOptions { LineCap = 5, ExecutionReservedLines = 1 });
+
+        await governor.AcquireLineAsync(LineClass.Execution, CancellationToken.None).WaitAsync(RealWait);
+        await governor.AcquireLineAsync(LineClass.Research, CancellationToken.None).WaitAsync(RealWait);
+        await governor.AcquireLineAsync(LineClass.Research, CancellationToken.None).WaitAsync(RealWait);
+
+        Assert.Equal(3, governor.GetLineBudget().ExecutionInUse + governor.GetLineBudget().ResearchInUse);
+
+        governor.ResetLineLedgerForReconnect();
+
+        var budget = governor.GetLineBudget();
+        Assert.Equal(0, budget.ExecutionInUse);
+        Assert.Equal(0, budget.ResearchInUse);
+
+        // The full cap is genuinely available again after the reset.
+        for (var i = 0; i < 5; i++)
+        {
+            await governor.AcquireLineAsync(LineClass.Execution, CancellationToken.None).WaitAsync(RealWait);
+        }
+    }
+
+    [Fact]
+    public async Task Disposing_a_pre_reset_lease_does_not_drive_the_ledger_negative()
+    {
+        var (governor, _) = Create(new IbkrPacingOptions { LineCap = 2, ExecutionReservedLines = 0 });
+
+        var stale = await governor.AcquireLineAsync(LineClass.Execution, CancellationToken.None).WaitAsync(RealWait);
+
+        governor.ResetLineLedgerForReconnect();
+
+        // The "old" lease is a zombie from before the reset; disposing it must clamp at zero rather
+        // than go negative, which would silently inflate the effective cap for everyone else.
+        stale.Dispose();
+
+        Assert.Equal(0, governor.GetLineBudget().ExecutionInUse);
+
+        for (var i = 0; i < 2; i++)
+        {
+            await governor.AcquireLineAsync(LineClass.Execution, CancellationToken.None).WaitAsync(RealWait);
+        }
+    }
+
+    [Fact]
     public async Task Double_dispose_releases_a_line_only_once()
     {
         var (governor, _) = Create(new IbkrPacingOptions { LineCap = 2, ExecutionReservedLines = 0 });

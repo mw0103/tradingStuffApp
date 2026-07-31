@@ -1,6 +1,9 @@
 using Npgsql;
 using TradingStuff.ResearchContracts;
+using TradingStuff.ResearchService.Gateway;
 using TradingStuff.ResearchService.Persistence;
+using TradingStuff.ResearchService.Recording;
+using TradingStuff.ResearchService.Universe;
 using TradingStuff.ServiceDefaults;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -9,11 +12,54 @@ builder.AddServiceDefaults();
 
 builder.Services.AddSingleton<MigrationRunner>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<MigrationRunner>());
+builder.Services.AddSingleton<PartitionMaintainer>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<PartitionMaintainer>());
+
+// Talks to the gateway over HTTP, never a project reference — the gateway is a separate process
+// and the sole TWS socket owner. Retries disabled: a retried lease grant would double-lease a
+// conId's market-data line rather than merely repeating a safe read.
+builder.Services.AddHttpClient<IbkrGatewayClient>((sp, http) =>
+    {
+        var configuration = sp.GetRequiredService<IConfiguration>();
+        ServiceClientConfiguration.ConfigureInternalClient(
+            http, configuration, "IbkrGateway:BaseUrl", "http://localhost:5100");
+    })
+    .DisableAutomaticRetries(TimeSpan.FromSeconds(30));
+
+builder.Services.AddSingleton<NodeSelector>();
+builder.Services.AddSingleton<CoverageMonitor>();
+builder.Services.AddSingleton<RecorderOrchestrator>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<RecorderOrchestrator>());
 
 var app = builder.Build();
 
 app.UseAuthentication();
 app.UseAuthorization();
+
+// Serve the React SPA from wwwroot under /ui
+app.UseStaticFiles(new StaticFileOptions
+{
+    RequestPath = "/ui",
+    FileProvider = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(
+        Path.Combine(app.Environment.ContentRootPath, "wwwroot"))
+});
+
+// Fallback to index.html for client-side routing, scoped to /ui so the API routes work
+app.MapFallbackToFile("/ui/{**slug}", "index.html", new StaticFileOptions
+{
+    RequestPath = "/ui",
+    FileProvider = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(
+        Path.Combine(app.Environment.ContentRootPath, "wwwroot"))
+});
+
+// Redirect /ui or /ui/ to /ui/coverage
+app.MapGet("/ui", () => Results.Redirect("/ui/coverage", permanent: false));
+
+// Everything under /research/* is a read-only diagnostic surface for this local-first operator UI
+// (coverage, capability registry, migration/node status) and is deliberately anonymous, matching
+// AuditDashboard's existing `/` — the same posture the roadmap specifies for the React research UI.
+// Nothing under this prefix mutates state; if that ever changes, that endpoint must add
+// .RequireAuthorization() individually rather than this comment being quietly wrong.
 
 app.MapGet("/research/status", (MigrationRunner migrations) =>
     {
@@ -23,8 +69,7 @@ app.MapGet("/research/status", (MigrationRunner migrations) =>
         {
             migrations = new { state.Status, state.Applied, state.Error },
         });
-    })
-    .RequireAuthorization();
+    });
 
 // The runtime-verified IBKR capability registry — most recent probe per key first.
 app.MapGet("/research/capabilities", async (
@@ -82,8 +127,22 @@ app.MapGet("/research/capabilities", async (
                 detail: ex.Message,
                 statusCode: StatusCodes.Status503ServiceUnavailable);
         }
-    })
-    .RequireAuthorization();
+    });
+
+app.MapGet("/research/coverage", async (
+        DateTimeOffset? from,
+        DateTimeOffset? to,
+        CoverageMonitor coverage,
+        CancellationToken cancellationToken) =>
+    {
+        var end = to ?? DateTimeOffset.UtcNow;
+        var start = from ?? end.AddHours(-24);
+
+        return Results.Ok(await coverage.GetCoverageAsync(start, end, cancellationToken));
+    });
+
+app.MapGet("/research/nodes", async (NodeSelector nodeSelector, CancellationToken cancellationToken) =>
+    Results.Ok(await nodeSelector.GetCurrentAssignmentsAsync(cancellationToken)));
 
 app.MapDefaultEndpoints();
 

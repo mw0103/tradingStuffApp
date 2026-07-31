@@ -408,6 +408,29 @@ public sealed class IbkrPacingGovernor
         }
     }
 
+    /// <summary>
+    /// Zeroes the line ledger because the underlying socket's own subscription state was just
+    /// invalidated — a fresh <c>EClientSocket</c> after a reconnect holds zero real TWS lines
+    /// regardless of what this ledger thought a moment ago, and TWS's 1101 notice ("connectivity
+    /// restored, data lost") says the same for a socket that never dropped. Call ONLY from the
+    /// reconnect/replay path; any <see cref="LineLease"/> issued before the reset still decrements
+    /// on <see cref="Dispose"/>, which the existing clamp-at-zero in <see cref="ReleaseLine"/>
+    /// already tolerates safely.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately does not attempt to re-grant queued waiters against the freed capacity —
+    /// leaving them queued is safe (they will simply wait slightly longer) and reconnect is rare
+    /// enough that the added complexity is not worth it for a first cut.
+    /// </remarks>
+    public void ResetLineLedgerForReconnect()
+    {
+        lock (_gate)
+        {
+            _executionLines = 0;
+            _researchLines = 0;
+        }
+    }
+
     private bool TryAcquireLineLocked(LineClass lineClass)
     {
         var total = _executionLines + _researchLines;

@@ -3,6 +3,9 @@ using TradingStuff.Contracts;
 using TradingStuff.IbkrGateway;
 using TradingStuff.IbkrGateway.Pacing;
 using TradingStuff.IbkrGateway.Persistence;
+using TradingStuff.IbkrGateway.Recording;
+using TradingStuff.IbkrGateway.Subscriptions;
+using TradingStuff.ResearchContracts;
 using TradingStuff.ServiceDefaults;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -28,6 +31,13 @@ builder.Services.AddSingleton<IbkrOrderTracker>();
 builder.Services.AddSingleton<IbkrOrderClient>();
 builder.Services.AddSingleton<IbkrAccountClient>();
 
+// Recording plane: raw ticks land here append-only; standing subscriptions are leased through
+// SubscriptionManager rather than fire-and-forget, so a heartbeat failure or a reconnect has a
+// single place that knows what should be subscribed.
+builder.Services.AddSingleton<ObservationRecorder>();
+builder.Services.AddSingleton<SubscriptionManager>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<SubscriptionManager>());
+
 // Reports unhealthy while the socket is down, so Aspire shows the real state instead of "running".
 builder.Services.AddHealthChecks()
     .AddCheck<IbkrConnectionHealthCheck>("ibkr-connection");
@@ -41,6 +51,56 @@ app.MapGet("/ibkr/status", (IbkrConnection connection) => Results.Ok(connection.
     .RequireAuthorization();
 
 app.MapGet("/ibkr/pacing", (IbkrPacingGovernor governor) => Results.Ok(governor.GetLineBudget()))
+    .RequireAuthorization();
+
+// ---- standing subscriptions ------------------------------------------------------------------
+// Leased, not fire-and-forget: a caller acquires a lease, heartbeats it, and either releases it
+// explicitly or lets it expire (evicted after 3 missed heartbeats). Every lease survives a
+// reconnect via SubscriptionManager's replay — callers never need to notice a disconnect happened.
+
+app.MapPost("/ibkr/subscriptions", async (
+        SubscriptionLeaseRequest request,
+        SubscriptionManager subscriptions,
+        CancellationToken cancellationToken) =>
+    {
+        try
+        {
+            return Results.Ok(await subscriptions.GrantAsync(request, cancellationToken));
+        }
+        catch (ArgumentException ex)
+        {
+            return Results.BadRequest(new { error = ex.Message });
+        }
+        catch (TimeoutException ex)
+        {
+            // No market-data line available (or the pacing budget is exhausted).
+            return Results.Problem(
+                title: "Could not grant the subscription lease.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status429TooManyRequests);
+        }
+        catch (IbkrConnectionException ex)
+        {
+            return Results.Problem(
+                title: "Not connected to TWS.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+    })
+    .RequireAuthorization();
+
+app.MapGet("/ibkr/subscriptions", (SubscriptionManager subscriptions) => Results.Ok(subscriptions.ActiveLeases()))
+    .RequireAuthorization();
+
+app.MapPost("/ibkr/subscriptions/{leaseId:guid}/heartbeat", (Guid leaseId, SubscriptionManager subscriptions) =>
+        subscriptions.Heartbeat(leaseId) ? Results.NoContent() : Results.NotFound())
+    .RequireAuthorization();
+
+app.MapDelete("/ibkr/subscriptions/{leaseId:guid}", async (
+        Guid leaseId,
+        SubscriptionManager subscriptions,
+        CancellationToken cancellationToken) =>
+        await subscriptions.ReleaseAsync(leaseId, cancellationToken) ? Results.NoContent() : Results.NotFound())
     .RequireAuthorization();
 
 app.MapPost("/ibkr/contracts/resolve", async (
@@ -70,6 +130,36 @@ app.MapPost("/ibkr/contracts/resolve", async (
         }
 
         return Results.Ok(new ResolveContractsResponse(resolved));
+    })
+    .RequireAuthorization();
+
+// Underlying resolution as its own endpoint: NodeSelector and RecorderOrchestrator need an
+// underlying's conId (to lease a core-underlying tick subscription) without going through the
+// option-chain path, which resolves it only as an internal step.
+app.MapGet("/ibkr/underlyings/{symbol}/resolve", async (
+        string symbol,
+        IbkrMarketDataClient client,
+        CancellationToken cancellationToken) =>
+    {
+        try
+        {
+            return Results.Ok(await client.ResolveUnderlyingAsync(symbol, cancellationToken));
+        }
+        catch (IbkrRequestException ex)
+        {
+            return Results.Problem(
+                title: "IBKR could not resolve the underlying.",
+                detail: ex.Message,
+                statusCode: ex.IsPermanent ? StatusCodes.Status400BadRequest : StatusCodes.Status502BadGateway,
+                extensions: new Dictionary<string, object?> { ["ibkrErrorCode"] = ex.ErrorCode });
+        }
+        catch (IbkrConnectionException ex)
+        {
+            return Results.Problem(
+                title: "Not connected to TWS.",
+                detail: ex.Message,
+                statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
     })
     .RequireAuthorization();
 

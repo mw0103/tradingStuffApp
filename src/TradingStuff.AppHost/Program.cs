@@ -107,9 +107,13 @@ builder.AddProject(
         "researchservice",
         "../TradingStuff.ResearchService/TradingStuff.ResearchService.csproj")
     .WithExternalHttpEndpoints()
+    .WithReference(ibkrGateway)
     .WithEnvironment("Authentication__DevelopmentToken", devInternalToken)
+    .WithEnvironment("IbkrGateway__BaseUrl", ibkrGateway.GetEndpoint("http"))
     .WithReference(tradingDb)
     .WaitFor(postgres);
+    // No WaitFor(ibkrGateway), for the same reason marketdataservice skips it: the gateway reports
+    // unhealthy whenever TWS is down, and the recorder must still start, sit idle, and retry.
 
 builder.AddProject(
         "auditdashboard",

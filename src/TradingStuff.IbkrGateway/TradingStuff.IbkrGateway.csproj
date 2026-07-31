@@ -2,6 +2,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\TradingStuff.Contracts\TradingStuff.Contracts.csproj" />
+    <ProjectReference Include="..\TradingStuff.ResearchContracts\TradingStuff.ResearchContracts.csproj" />
     <ProjectReference Include="..\TradingStuff.ServiceDefaults\TradingStuff.ServiceDefaults.csproj" />
     <ProjectReference Include="..\..\third_party\IBApi\IBApi.csproj" />
   </ItemGroup>

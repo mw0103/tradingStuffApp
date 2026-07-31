@@ -25,4 +25,12 @@
     <InternalsVisibleTo Include="TradingStuff.Tests" />
   </ItemGroup>
 
+  <!-- Build the React ClientApp before the main build target -->
+  <Target Name="BuildClientApp" BeforeTargets="Build">
+    <!-- Ensure directories exist -->
+    <MakeDir Directories="$(IntermediateOutputPath)staticwebassets" />
+    <Exec Command="npm ci" WorkingDirectory="ClientApp" />
+    <Exec Command="npm run build" WorkingDirectory="ClientApp" />
+  </Target>
+
 </Project>
