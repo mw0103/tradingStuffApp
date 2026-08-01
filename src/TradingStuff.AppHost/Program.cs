@@ -138,6 +138,11 @@ builder.AddProject(
     .WithReference(ibkrGateway)
     .WithEnvironment("Authentication__DevelopmentToken", devInternalToken)
     .WithEnvironment("IbkrGateway__BaseUrl", ibkrGateway.GetEndpoint("http"))
+    // The historical drain. Defaults to false in BackfillOptions and was never set here, so the
+    // coordinator has never once run and research.bars has stayed empty — which is why no study
+    // can be executed. It is safe to leave on: every slice is idempotent (the request row IS the
+    // checkpoint), the pacing governor owns the TWS limits, and a rerun adds zero rows.
+    .WithEnvironment("Backfill__Enabled", "true")
     .WithReference(tradingDb)
     .WaitFor(postgres);
     // No WaitFor(ibkrGateway), for the same reason marketdataservice skips it: the gateway reports

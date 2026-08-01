@@ -5,6 +5,7 @@ using TradingStuff.ResearchService.Gateway;
 using TradingStuff.ResearchService.Persistence;
 using TradingStuff.ResearchService.Recording;
 using TradingStuff.ResearchService.Sessions;
+using TradingStuff.ResearchService.Studies.VolResidual;
 using TradingStuff.ResearchService.Universe;
 using TradingStuff.ServiceDefaults;
 
@@ -118,6 +119,13 @@ builder.Services.AddSingleton<GapDetector>();
 // contract is rebuilt from research.instruments plus the row's own con_id.
 builder.Services.AddSingleton<EsContractWalker>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<EsContractWalker>());
+
+// The volatility-forecast-residual study's DEVELOPMENT run (docs/research/volatility-forecast-residual-study.md
+// is the pre-registration; this is explicitly not the registered scripted run). Read-only over
+// research.bars, like CoverageMonitor/GapDetector above — no hosted loop, computed on request.
+builder.Services.AddSingleton<VolResidualBarLoader>();
+builder.Services.AddSingleton<VolResidualStudyRunner>();
+builder.Services.AddSingleton<VolResidualStudyStore>();
 
 var app = builder.Build();
 
@@ -410,6 +418,8 @@ app.MapGet("/research/backfill/gaps", async (
                 statusCode: StatusCodes.Status503ServiceUnavailable);
         }
     });
+
+app.MapVolResidualStudyEndpoints();
 
 app.MapDefaultEndpoints();
 

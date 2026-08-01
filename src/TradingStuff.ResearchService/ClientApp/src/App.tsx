@@ -1,14 +1,17 @@
 import { useState, useEffect } from 'react';
 import Coverage from './components/Coverage';
 import Backfill from './components/Backfill';
+import Study from './components/Study';
 
 function App() {
-  const [currentPage, setCurrentPage] = useState<'coverage' | 'backfill'>('coverage');
+  const [currentPage, setCurrentPage] = useState<'coverage' | 'backfill' | 'study'>('coverage');
 
   useEffect(() => {
     // Determine which page to show based on pathname
     const pathname = window.location.pathname;
-    if (pathname.includes('/backfill')) {
+    if (pathname.includes('/study')) {
+      setCurrentPage('study');
+    } else if (pathname.includes('/backfill')) {
       setCurrentPage('backfill');
     } else {
       setCurrentPage('coverage');
@@ -17,7 +20,9 @@ function App() {
     // Listen for navigation events to switch pages
     const handlePopState = () => {
       const newPathname = window.location.pathname;
-      if (newPathname.includes('/backfill')) {
+      if (newPathname.includes('/study')) {
+        setCurrentPage('study');
+      } else if (newPathname.includes('/backfill')) {
         setCurrentPage('backfill');
       } else {
         setCurrentPage('coverage');
@@ -28,8 +33,13 @@ function App() {
     return () => window.removeEventListener('popstate', handlePopState);
   }, []);
 
-  const navigateTo = (page: 'coverage' | 'backfill') => {
-    const newPath = page === 'coverage' ? '/ui/coverage' : '/ui/backfill';
+  const navigateTo = (page: 'coverage' | 'backfill' | 'study') => {
+    const newPath =
+      page === 'coverage'
+        ? '/ui/coverage'
+        : page === 'backfill'
+          ? '/ui/backfill'
+          : '/ui/study';
     window.history.pushState(null, '', newPath);
     setCurrentPage(page);
   };
@@ -50,11 +60,18 @@ function App() {
           >
             Backfill
           </button>
+          <button
+            className={`nav-link ${currentPage === 'study' ? 'active' : ''}`}
+            onClick={() => navigateTo('study')}
+          >
+            Study
+          </button>
         </div>
       </nav>
       <main>
         {currentPage === 'coverage' && <Coverage />}
         {currentPage === 'backfill' && <Backfill />}
+        {currentPage === 'study' && <Study />}
       </main>
     </>
   );
