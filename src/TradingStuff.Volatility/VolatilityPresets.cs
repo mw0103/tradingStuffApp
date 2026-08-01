@@ -75,6 +75,45 @@ namespace TradingStuff.Volatility
         }
 
         /// <summary>
+        /// The pre-registered target of the volatility-forecast-residual study: SPX regular
+        /// session realized variance, with the overnight gap excluded.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// Distinct from <see cref="Spx"/> on purpose, and the difference is not cosmetic.
+        /// <see cref="Spx"/> folds the close-to-open move in because an option prices calendar
+        /// time, which is what a variance risk premium has to be measured against. The study's
+        /// v1 label is session RV only - see
+        /// <c>docs/research/volatility-forecast-residual-study.md</c>, which also defines a
+        /// close-to-close variant and defers it.
+        /// </para>
+        /// <para>
+        /// Keeping both rather than changing the default means the premium pipeline is not
+        /// silently re-based by a change made for the forecasting study, and a reader can see
+        /// which convention a series was built under from the call site.
+        /// </para>
+        /// </remarks>
+        public static void SpxStudyTarget(out SessionQualityPolicy policy, out RealizedVolatilityOptions options)
+        {
+            Spx(out policy, out options);
+            options.OvernightPolicy = OvernightPolicy.Exclude;
+        }
+
+        /// <summary>
+        /// Builds the study's SPX session-RV label series. Registered variant; see
+        /// <see cref="SpxStudyTarget"/>.
+        /// </summary>
+        public static List<RealizedVolatilityDay> BuildSpxStudyTarget(
+            ISessionClock clock, IEnumerable<IntradayBar> bars)
+        {
+            SessionQualityPolicy policy;
+            RealizedVolatilityOptions options;
+            SpxStudyTarget(out policy, out options);
+
+            return new RealizedVolatilitySeriesBuilder(clock, SpxCalendar, policy, options).Build("SPX", bars);
+        }
+
+        /// <summary>
         /// Builds a SPY series with a supplied distribution history applied.
         /// </summary>
         public static List<RealizedVolatilityDay> BuildSpy(
