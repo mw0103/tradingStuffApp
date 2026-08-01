@@ -29,7 +29,9 @@ namespace TradingStuff.Tests;
 /// <para>
 /// A fixed, past week (2024-01-08 Monday through 2024-01-12 Friday — no US holiday in range) is used
 /// throughout so nothing here depends on the real wall clock at test-run time. Cboe index RTH that
-/// week is 08:30-15:15 CT = 14:30-21:15 UTC (CST, no DST in January): 405 minutes/day, no half days.
+/// week is 08:30-15:00 CT = 14:30-21:00 UTC (CST, no DST in January): 390 minutes/day, no half days.
+/// (The SPX INDEX closes with the cash market at 15:00 CT; the 15:15 CT close these fixtures used to
+/// assume belongs to the SPX OPTIONS. Corrected 2026-08-01 — see ExchangeSessionScheduleTests.)
 /// </para>
 /// </remarks>
 [Trait("Category", "RequiresPostgres")]
@@ -43,7 +45,7 @@ public sealed class GapDetectorPostgresTests
     private static readonly DateOnly MondayDate = new(2024, 1, 8);
     private static readonly DateTimeOffset Monday = new(2024, 1, 8, 0, 0, 0, TimeSpan.Zero);
     private static readonly DateTimeOffset RthOpenMonday = new(2024, 1, 8, 14, 30, 0, TimeSpan.Zero);
-    private static readonly DateTimeOffset RthCloseMonday = new(2024, 1, 8, 21, 15, 0, TimeSpan.Zero);
+    private static readonly DateTimeOffset RthCloseMonday = new(2024, 1, 8, 21, 0, 0, TimeSpan.Zero);
     private static readonly DateTimeOffset WeekEnd = new(2024, 1, 13, 0, 0, 0, TimeSpan.Zero); // Saturday midnight, exclusive
 
     private static string? ServerConnectionString => Environment.GetEnvironmentVariable("TRADING_TEST_POSTGRES");
@@ -108,7 +110,7 @@ public sealed class GapDetectorPostgresTests
             ("end", new DateTimeOffset(tradingDate.AddDays(1).ToDateTime(TimeOnly.MinValue), TimeSpan.Zero)),
             ("state", state), ("attempts", attempts), ("bars", (object?)barsReturned ?? DBNull.Value));
 
-    /// <summary>Lands one real 1-minute bar per minute of the trading date's full RTH session (405 bars).</summary>
+    /// <summary>Lands one real 1-minute bar per minute of the trading date's full RTH session (390 bars).</summary>
     private static Task InsertFullRthBarsAsync(string connectionString, DateOnly tradingDate) =>
         ExecuteAsync(
             connectionString,
@@ -156,9 +158,9 @@ public sealed class GapDetectorPostgresTests
         var counts = await store.GetLandedBarCountsAsync(SpxConId, "TRADES", "1 min", true, froms, tos, CancellationToken.None);
 
         Assert.Equal(3, counts.Length);
-        Assert.Equal(405, counts[0]);
+        Assert.Equal(390, counts[0]);
         Assert.Equal(0, counts[1]);
-        Assert.Equal(405, counts[2]);
+        Assert.Equal(390, counts[2]);
 
         // The fixture really does separate the two query shapes: grouping from research.bars emits a
         // row only for windows that HAVE bars, so it answers this same question with two rows and no
@@ -220,7 +222,7 @@ public sealed class GapDetectorPostgresTests
         var store = StoreFor(connectionString);
         var job = await store.EnsureJobAsync(SpxHistorical(), SpxConId, CancellationToken.None);
 
-        await InsertDailySliceAsync(connectionString, job!.JobId, new DateOnly(2024, 1, 8), "succeeded", barsReturned: 405);
+        await InsertDailySliceAsync(connectionString, job!.JobId, new DateOnly(2024, 1, 8), "succeeded", barsReturned: 390);
         await ExecuteAsync(
             connectionString,
             "INSERT INTO research.backfill_requests (job_id, con_id, end_time_utc, duration, what_to_show, bar_size, use_rth) " +
@@ -286,7 +288,7 @@ public sealed class GapDetectorPostgresTests
 
         foreach (var date in new[] { monday, tuesday, thursday, friday })
         {
-            await InsertDailySliceAsync(connectionString, job!.JobId, date, "succeeded", barsReturned: 405);
+            await InsertDailySliceAsync(connectionString, job!.JobId, date, "succeeded", barsReturned: 390);
             await InsertFullRthBarsAsync(connectionString, date);
         }
 
@@ -296,7 +298,7 @@ public sealed class GapDetectorPostgresTests
         // an implementation that only checks "does the job have ANY gap" could satisfy that from the
         // day's own absence, but this asserts the gap is EXACTLY Wednesday's session and labelled
         // succeeded_but_absent, which only a correct join can produce.
-        await InsertDailySliceAsync(connectionString, job!.JobId, wednesday, "succeeded", barsReturned: 405);
+        await InsertDailySliceAsync(connectionString, job!.JobId, wednesday, "succeeded", barsReturned: 390);
 
         var report = await DetectorFor(connectionString).GetReportAsync(job.JobId, Monday, WeekEnd, CancellationToken.None);
 
@@ -816,7 +818,7 @@ public sealed class GapDetectorPostgresTests
             ("con", vixConId), ("instrument", vixInstrumentId),
             ("from", RthWindowFrom(MondayDate)), ("to", RthWindowTo(MondayDate)));
 
-        await InsertDailySliceAsync(connectionString, job!.JobId, MondayDate, "succeeded", barsReturned: 405);
+        await InsertDailySliceAsync(connectionString, job!.JobId, MondayDate, "succeeded", barsReturned: 390);
 
         var report = await DetectorFor(connectionString).GetReportAsync(
             job.JobId, RthWindowFrom(MondayDate), RthWindowTo(MondayDate), CancellationToken.None);
@@ -826,9 +828,276 @@ public sealed class GapDetectorPostgresTests
         Assert.Equal(GapCheckStatus.Checked, jobReport.CheckStatus);
         Assert.Empty(jobReport.Gaps);
 
-        // The genuine absence — VIX's real overnight window has no calendar and is therefore not
-        // audited — is stated rather than silently passing.
-        Assert.Contains(jobReport.Unaudited, range => range.Reason.StartsWith(GapAuditReasons.NoSessionDefinition));
+        // VIX's overnight window used to have no calendar and was reported as unaudited here. It
+        // now has one (CBOE_VIX_GTH, 02:15-08:15 CT, established from the venue schedule on
+        // 2026-08-01), so nothing about VIX is unmodelled and this report has no such range to make.
+        Assert.DoesNotContain(
+            jobReport.Unaudited, range => range.Reason.StartsWith(GapAuditReasons.NoSessionDefinition));
+    }
+
+    // ---- the series answer must not be narrowable, and must not contradict the jobs ---------------
+
+    /// <summary>
+    /// Seeds one SPX series whose two jobs leave a real seam: a historical job claiming 60 days whose
+    /// window is rejected outright (it exceeds <c>MaxWindowDays</c>) beside a top-up sibling that
+    /// audits only its own recent lookback.
+    /// </summary>
+    /// <remarks>
+    /// The top-up's lookback is five days rather than the default two so at least one RTH session
+    /// always falls inside it — a two-day window run on a Sunday produces no expectation unit, and the
+    /// resulting <c>no-expectation-units</c> report would make the series unreconciled for a reason
+    /// that has nothing to do with what is being tested.
+    /// </remarks>
+    private static async Task<(GapDetector Detector, long HistoricalJobId, long TopUpJobId)> SeedSeamSeriesAsync(
+        string connectionString)
+    {
+        var store = StoreFor(connectionString);
+        var now = DateTimeOffset.UtcNow;
+
+        var historical = await store.EnsureJobAsync(
+            new BackfillJobDefinition(
+                "spx-1min-trades-seam-hist", BackfillJobKinds.Historical, SpxInstrumentId, "SPX", "TRADES", "1 min",
+                UseRth: true, now.AddDays(-60), now, Priority: 100),
+            SpxConId, CancellationToken.None);
+
+        var topUp = await store.EnsureJobAsync(
+            new BackfillJobDefinition(
+                "spx-1min-trades-seam-topup", BackfillJobKinds.TopUp, SpxInstrumentId, "SPX", "TRADES", "1 min",
+                UseRth: true, now.AddDays(-60), now.AddYears(5), Priority: 1000),
+            SpxConId, CancellationToken.None);
+
+        var detector = new GapDetector(
+            StoreFor(connectionString),
+            new SessionClock(),
+            Options.Create(new GapOptions { TopUpDefaultLookbackDays = 5, MaxWindowDays = 10 }),
+            Options.Create(new BackfillOptions { MaxAttempts = MaxAttempts }),
+            NullLogger<GapDetector>.Instance);
+
+        return (detector, historical!.JobId, topUp!.JobId);
+    }
+
+    [Fact]
+    public async Task A_query_filtered_to_one_job_still_reconciles_the_whole_series_that_job_belongs_to()
+    {
+        // The reported defect. `jobId=` filtered the job set BEFORE reconciliation, so the only check
+        // in this report computed across jobs — the only one that can see a seam — was computed from
+        // one member of a two-member series and still published as a series-wide `Reconciled=true`.
+        // The absent sibling's claim never entered `claimed`, so subtracting audited from claimed had
+        // nothing left to subtract: the narrower the caller's question, the healthier the answer.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var (detector, historicalJobId, topUpJobId) = await SeedSeamSeriesAsync(connectionString);
+
+        var report = await detector.GetReportAsync(topUpJobId, null, null, CancellationToken.None);
+
+        // The filter still narrows what is DISPLAYED...
+        var jobReport = Assert.Single(report.Jobs);
+        Assert.Equal(topUpJobId, jobReport.JobId);
+        Assert.Equal(GapCheckStatus.Checked, jobReport.CheckStatus);
+
+        // ...and does not narrow what is CHECKED.
+        var series = Assert.Single(report.Series);
+
+        Assert.Equal(["spx-1min-trades-seam-hist", "spx-1min-trades-seam-topup"], series.JobNames);
+        Assert.False(series.Reconciled);
+        Assert.All(series.Unaudited, range => Assert.Equal(GapAuditReasons.NoJobAuditedIt, range.Reason));
+
+        // ~55 of the 60 claimed days: everything except the top-up's five-day tail.
+        Assert.True(
+            series.Unaudited.Sum(r => (r.To - r.From).TotalDays) > 40,
+            "The historical sibling's unaudited claim must be part of the series answer.");
+
+        // The sibling is named in the series even though it is not in Jobs: a caller cannot read
+        // `Reconciled` as a statement about the one job it asked about.
+        Assert.DoesNotContain(report.Jobs, j => j.JobId == historicalJobId);
+    }
+
+    [Fact]
+    public async Task The_series_answer_is_the_same_whichever_of_its_jobs_the_caller_filtered_to()
+    {
+        // The invariant behind the fix, stated directly: SeriesReconciliation answers a question about
+        // a series, so the answer cannot depend on which member of it the caller happened to name.
+        // Anything that reintroduces per-caller scoping breaks this without needing to know how.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var (detector, historicalJobId, topUpJobId) = await SeedSeamSeriesAsync(connectionString);
+
+        var unfiltered = Assert.Single((await detector.GetReportAsync(null, null, null, CancellationToken.None)).Series);
+        var viaTopUp = Assert.Single((await detector.GetReportAsync(topUpJobId, null, null, CancellationToken.None)).Series);
+        var viaHistorical =
+            Assert.Single((await detector.GetReportAsync(historicalJobId, null, null, CancellationToken.None)).Series);
+
+        // Not record equality: every call recomputes its windows against a fresh `now`, so the span
+        // instants drift by milliseconds between calls. The claims that matter do not.
+        foreach (var scoped in new[] { viaTopUp, viaHistorical })
+        {
+            Assert.Equal(unfiltered.Reconciled, scoped.Reconciled);
+            Assert.Equal(unfiltered.JobNames, scoped.JobNames);
+            Assert.Equal(unfiltered.Unaudited.Count, scoped.Unaudited.Count);
+        }
+    }
+
+    [Fact]
+    public async Task A_series_whose_jobs_all_declare_their_window_unmodelled_is_not_reported_as_reconciled()
+    {
+        // The second reported defect, reproduced on shipped configuration rather than an invented
+        // fixture: InstrumentCalendars maps SPY to the NYSE regular session and records SPY's real
+        // 04:00-20:00 ET trading window as UNMODELLED, so a useRth=false SPY job reports its whole
+        // window unaudited. (This used to be driven by VIX, whose overnight leg was unmodelled until
+        // it got its own calendar on 2026-08-01. SPY is the remaining shipped instrument with a
+        // genuinely unmodelled window — measured, not assumed: 960 useRth=false 1-minute bars a day
+        // against a 390-minute modelled session.)
+        // Reconcile nevertheless added the entire [From, To) span of any `checked` report to the
+        // audited set — `checked` only means "some expectation unit was evaluated", never "every
+        // instant in this span had one" — so both jobs said "I audited none of this" and the field
+        // documented as the authoritative cross-job answer said the series had no unaudited remainder.
+        // Every pre- and post-market bar that never landed read as covered.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var store = StoreFor(connectionString);
+
+        const int spyConId = 756733;
+        const short spyInstrumentId = 5;
+        var now = DateTimeOffset.UtcNow;
+
+        await store.EnsureJobAsync(
+            new BackfillJobDefinition(
+                "spy-1min-trades-pair", BackfillJobKinds.Historical, spyInstrumentId, "SPY", "TRADES", "1 min",
+                UseRth: false, now.AddDays(-10), now, Priority: 70),
+            spyConId, CancellationToken.None);
+
+        await store.EnsureJobAsync(
+            new BackfillJobDefinition(
+                "spy-1min-trades-pair-topup", BackfillJobKinds.TopUp, spyInstrumentId, "SPY", "TRADES", "1 min",
+                UseRth: false, now.AddDays(-10), now.AddYears(5), Priority: 1000),
+            spyConId, CancellationToken.None);
+
+        var detector = DetectorFor(connectionString, topUpLookbackDays: 10);
+        var before = DateTimeOffset.UtcNow;
+        var report = await detector.GetReportAsync(null, null, null, CancellationToken.None);
+
+        // Both jobs really are `checked` — this is not the weaker no-expectation-units path — and both
+        // state the unmodelled window on themselves.
+        Assert.Equal(2, report.Jobs.Count);
+        Assert.All(report.Jobs, job =>
+        {
+            Assert.Equal(GapCheckStatus.Checked, job.CheckStatus);
+            Assert.True(job.UnitsChecked > 0);
+            Assert.Contains(job.Unaudited, range => range.Reason.StartsWith(GapAuditReasons.NoSessionDefinition));
+            Assert.DoesNotContain(job.Unaudited, range => range.Reason == GapAuditReasons.CallerNarrowedWindow);
+        });
+
+        var series = Assert.Single(report.Series);
+
+        Assert.False(series.Reconciled);
+        Assert.NotEmpty(series.Unaudited);
+
+        AssertJobsAndSeriesAgree(report, before.AddMinutes(-new GapOptions().InProgressGraceMinutes));
+    }
+
+    [Fact]
+    public async Task A_pair_of_jobs_that_between_them_audit_their_whole_claim_still_reconciles()
+    {
+        // The control for the two fixes above. Subtracting each job's self-declared unaudited ranges
+        // from its contribution to the audited set must not make EVERY series unreconciled — SPX has
+        // no unmodelled window, so its historical/top-up pair reconciles with no remainder, which is
+        // what was verified live when GapReport.Series was added. Without this, the safest possible
+        // implementation ("nothing is ever audited") passes every other test in this file.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var store = StoreFor(connectionString);
+        var now = DateTimeOffset.UtcNow;
+
+        await store.EnsureJobAsync(
+            new BackfillJobDefinition(
+                "spx-1min-trades-covered", BackfillJobKinds.Historical, SpxInstrumentId, "SPX", "TRADES", "1 min",
+                UseRth: true, now.AddDays(-5), now, Priority: 100),
+            SpxConId, CancellationToken.None);
+
+        await store.EnsureJobAsync(
+            new BackfillJobDefinition(
+                "spx-1min-trades-covered-topup", BackfillJobKinds.TopUp, SpxInstrumentId, "SPX", "TRADES", "1 min",
+                UseRth: true, now.AddDays(-5), now.AddYears(5), Priority: 1000),
+            SpxConId, CancellationToken.None);
+
+        var detector = DetectorFor(connectionString, topUpLookbackDays: 5);
+        var report = await detector.GetReportAsync(null, null, null, CancellationToken.None);
+
+        Assert.All(report.Jobs, job => Assert.Equal(GapCheckStatus.Checked, job.CheckStatus));
+
+        var series = Assert.Single(report.Series);
+
+        Assert.Empty(series.Unaudited);
+        Assert.True(series.Reconciled, "An SPX pair covering its own claim must still reconcile.");
+
+        // ...and the same holds when the caller filters to one of the two.
+        var filtered = await detector.GetReportAsync(report.Jobs[0].JobId, null, null, CancellationToken.None);
+        Assert.True(Assert.Single(filtered.Series).Reconciled);
+    }
+
+    /// <summary>
+    /// Asserts the two halves of one response cannot contradict each other: a span that EVERY member
+    /// job of a series reports as unaudited must appear in that series' own unaudited set.
+    /// </summary>
+    /// <param name="auditCeiling">
+    /// A lower bound on the in-progress ceiling the series clamps its claims to — captured before the
+    /// call, so it is never LATER than the real one. Spans above it are excluded: the series
+    /// deliberately does not claim the in-progress tail, and every job states that tail itself.
+    /// </param>
+    /// <remarks>
+    /// Deliberately not a re-implementation of <c>Reconcile</c>: it never computes what the series
+    /// SHOULD say, only that the series cannot contradict what its own jobs already said. A mirror of
+    /// the production arithmetic would pass again the moment the same mistake were made twice.
+    /// </remarks>
+    private static void AssertJobsAndSeriesAgree(GapReport report, DateTimeOffset auditCeiling)
+    {
+        foreach (var series in report.Series)
+        {
+            var members = report.Jobs.Where(job => series.JobNames.Contains(job.JobName)).ToArray();
+
+            if (members.Length != series.JobNames.Count)
+            {
+                continue; // A filtered query does not display every member; nothing to cross-check.
+            }
+
+            var shared = SpansOf(members[0]);
+
+            foreach (var member in members.Skip(1))
+            {
+                shared = Intersect(shared, SpansOf(member));
+            }
+
+            shared = GapArithmetic.Subtract(shared, [new GapArithmetic.Span(auditCeiling, DateTimeOffset.MaxValue)]);
+
+            Assert.Empty(GapArithmetic.Subtract(
+                shared, series.Unaudited.Select(u => new GapArithmetic.Span(u.From, u.To))));
+        }
+
+        static IReadOnlyList<GapArithmetic.Span> SpansOf(JobGapReport job) =>
+            GapArithmetic.Union(job.Unaudited.Select(u => new GapArithmetic.Span(u.From, u.To)));
+
+        // a ∩ b, expressed with the shipped subtraction so the test carries no range algebra of its own.
+        static IReadOnlyList<GapArithmetic.Span> Intersect(
+            IReadOnlyList<GapArithmetic.Span> a, IReadOnlyList<GapArithmetic.Span> b) =>
+            GapArithmetic.Subtract(
+                a,
+                GapArithmetic.Subtract([new GapArithmetic.Span(DateTimeOffset.MinValue, DateTimeOffset.MaxValue)], b));
     }
 
     // ---- window helpers: the RTH session bounds for a given trading date in the fixed test week ----

@@ -64,6 +64,21 @@ public sealed class BackfillOptions
     public int TransientBackoffSeconds { get; set; } = 15;
 
     /// <summary>
+    /// How long to wait when the slice's own bookkeeping — landing its bars, writing its outcome,
+    /// releasing its claim — throws instead of returning.
+    /// </summary>
+    /// <remarks>
+    /// This is the Postgres-side twin of <see cref="TransientBackoffSeconds"/>, and it exists for the
+    /// same measured reason. A store failure arrives AFTER the request has been claimed and the bars
+    /// have been fetched, so without a loop-level backoff the next pass simply claims a different
+    /// slice and destroys that one too: a five-minute Postgres blip walks ~20 slices, each losing a
+    /// fetched payload and an attempt it can never get back. Longer than the transient backoff
+    /// because a database that cannot be written to does not recover in fifteen seconds, and the
+    /// coordinator has nothing useful to do until it does.
+    /// </remarks>
+    public int PersistenceBackoffSeconds { get; set; } = 60;
+
+    /// <summary>
     /// How many 15-minute buckets behind the current one a top-up run re-plans, so a missed run is
     /// caught up rather than skipped. 16 buckets is four hours — long enough to cover a restart, a
     /// deploy, or a pacing storm, short enough that a longer outage is left to the daily forward
@@ -275,6 +290,11 @@ public sealed class BackfillCoordinator(
             // Either the gateway has not resolved it yet, or this is a contract-walked job whose
             // slices come from elsewhere (package 2e's ES walker). Either way there is nothing for
             // this planner to derive, and its request rows — if any — still drain normally.
+            //
+            // Note what this early return also skips: the PlanForward call below. Forward planning
+            // for a walked job is per-contract — the band in front of the frozen target_to belongs to
+            // whichever contract is still listing — so EsContractWalker.PlanContractWindow owns it,
+            // and adding it here would attribute the band to a conId this job does not have.
             logger.LogDebug("Job {Job} has no conId; nothing to plan for it.", job.Name);
             return;
         }
@@ -391,8 +411,79 @@ public sealed class BackfillCoordinator(
 
     // ---- execution ----------------------------------------------------------------------------
 
+    /// <summary>
+    /// Runs one claimed slice to a written outcome, and guarantees it reaches one.
+    /// </summary>
     /// <returns>How long to idle before the next pass.</returns>
-    private async Task<TimeSpan> ExecuteSliceAsync(ClaimedSlice slice, CancellationToken cancellationToken)
+    /// <remarks>
+    /// <b>Every path out of this method either writes an outcome or releases the claim.</b> That is
+    /// what the wrapper below buys, and it was missing: <see cref="IbkrGatewayClient"/> classifies the
+    /// failures of its own HTTP send, but the store calls that follow — landing bars, marking the
+    /// outcome, releasing the claim — sat outside any try at all. A pool exhaustion or a
+    /// <c>57P01</c> during a Postgres restart therefore threw straight past this method to the drain
+    /// loop's outermost catch, which writes nothing: the fetched bars were dropped with no log, the
+    /// row stayed <c>inflight</c> for the rest of its five-minute lease, and the reaper eventually
+    /// turned it into <c>failed</c> with its attempt already spent. The loop, meanwhile, idled its
+    /// ordinary poll interval and claimed the NEXT slice, so the blip did that to one slice after
+    /// another for as long as it lasted.
+    /// </remarks>
+    internal async Task<TimeSpan> ExecuteSliceAsync(ClaimedSlice slice, CancellationToken cancellationToken)
+    {
+        // Captured so the failure path can say how much fetched data was thrown away — the figure
+        // that turns "the pass failed" into "we lost 390 bars we had already paid a paced request
+        // for". Null until the gateway has answered.
+        HistoricalBarsResult? fetched = null;
+
+        try
+        {
+            return await ExecuteClaimedSliceAsync(slice, result => fetched = result, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return await AbandonClaimAsync(slice, fetched, ex, cancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// Gives a claimed slice back without spending its attempt, after this coordinator's own
+    /// bookkeeping failed.
+    /// </summary>
+    /// <remarks>
+    /// The attempt is refunded on exactly the reasoning <see cref="GatewayOutcome.Unreachable"/>
+    /// already uses: <c>attempts</c> has no reset path, and this failure is a statement about this
+    /// process's database connection, not about the slice. If the release ALSO fails — the likely
+    /// case, since the store is what just broke — the row is left to
+    /// <see cref="BackfillStore.ReclaimExpiredAsync"/>, which is the designed backstop for exactly
+    /// this and costs the attempt rather than the slice.
+    /// </remarks>
+    private async Task<TimeSpan> AbandonClaimAsync(
+        ClaimedSlice slice, HistoricalBarsResult? fetched, Exception failure, CancellationToken cancellationToken)
+    {
+        logger.LogError(
+            failure,
+            "Bookkeeping for slice {RequestId} (job {JobId}, ending {End:O}) failed after the request was already " +
+            "claimed; {Bars} fetched bar(s) were discarded. Releasing the claim and backing off {Seconds}s so the " +
+            "next pass does not do the same to another slice.",
+            slice.RequestId, slice.JobId, slice.EndTimeUtc, fetched?.Bars.Count ?? 0, _options.PersistenceBackoffSeconds);
+
+        try
+        {
+            await store.ReleaseAsync(slice.RequestId, OwnerId, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogError(
+                ex,
+                "Could not even release the claim on slice {RequestId}; it stays inflight until its lease expires " +
+                "and ReclaimExpiredAsync takes it back.",
+                slice.RequestId);
+        }
+
+        return TimeSpan.FromSeconds(_options.PersistenceBackoffSeconds);
+    }
+
+    private async Task<TimeSpan> ExecuteClaimedSliceAsync(
+        ClaimedSlice slice, Action<HistoricalBarsResult> onFetched, CancellationToken cancellationToken)
     {
         if (!_jobsById.TryGetValue(slice.JobId, out var job))
         {
@@ -429,6 +520,7 @@ public sealed class BackfillCoordinator(
             slice.UseRth);
 
         var result = await gateway.GetHistoricalBarsAsync(request, cancellationToken);
+        onFetched(result);
 
         switch (result.Outcome)
         {

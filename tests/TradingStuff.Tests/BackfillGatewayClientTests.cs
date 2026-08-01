@@ -129,6 +129,85 @@ public sealed class BackfillGatewayClientTests
         Assert.Equal(GatewayOutcome.Unreachable, result.Outcome);
     }
 
+    private sealed class RespondingHandler(Func<HttpResponseMessage> factory) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken) =>
+            Task.FromResult(factory());
+    }
+
+    private static IbkrGatewayClient ClientResponding(System.Net.HttpStatusCode status, string body, string mediaType) =>
+        new(
+            new HttpClient(new RespondingHandler(() => new HttpResponseMessage(status)
+            {
+                Content = new StringContent(body, System.Text.Encoding.UTF8, mediaType),
+            }))
+            { BaseAddress = new Uri("http://localhost:5100") },
+            NullLogger<IbkrGatewayClient>.Instance);
+
+    // ---- the second region: reading the body of a response that DID arrive -------------------------
+    //
+    // The send's catch cannot see any of this — it has already completed successfully. A failure here
+    // escaped the client entirely and surfaced at the coordinator's outermost catch, which writes no
+    // outcome: the same stranded-claim shape the BrokenCircuitException fix was written for, and which
+    // that fix's own remark wrongly claimed to have closed as a class.
+    //
+    // Worth recording what these tests ruled OUT while being written: a connection that dies
+    // mid-stream is NOT one of them. HttpClient buffers the response content during the send (the
+    // default completion option is ResponseContentRead), so a reset mid-body surfaces from the send
+    // itself and the existing transport classifier already catches it. What genuinely reaches the
+    // body read is a response that arrived intact and cannot be deserialised.
+
+    [Fact]
+    public async Task A_200_carrying_the_wrong_content_type_is_classified_rather_than_thrown()
+    {
+        // A proxy or a misrouted request answering 200 with an HTML page. ReadFromJsonAsync raises
+        // NotSupportedException for an unsupported media type — not a JsonException, so even a
+        // JsonException-only guard would not have caught it.
+        var client = ClientResponding(System.Net.HttpStatusCode.OK, "<html>Service Unavailable</html>", "text/html");
+
+        var result = await client.GetHistoricalBarsAsync(Request, CancellationToken.None);
+
+        // Transient, not Unreachable: a 200 means the request reached TWS and spent a paced slot, so
+        // refunding the slice's attempt would let a genuinely-failing request retry without limit.
+        Assert.Equal(GatewayOutcome.Transient, result.Outcome);
+        Assert.Contains("body could not be read", result.Detail);
+    }
+
+    [Fact]
+    public async Task A_200_carrying_malformed_json_is_classified_rather_than_thrown()
+    {
+        var client = ClientResponding(System.Net.HttpStatusCode.OK, """{"bars":[{"open":1""", "application/json");
+
+        var result = await client.GetHistoricalBarsAsync(Request, CancellationToken.None);
+
+        Assert.Equal(GatewayOutcome.Transient, result.Outcome);
+        Assert.Contains("body could not be read", result.Detail);
+    }
+
+    [Fact]
+    public async Task The_head_timestamp_probe_survives_an_unreadable_body_too()
+    {
+        // Same region, same guard. An escape here strands nothing (the walker holds no claim), but it
+        // does abort the whole ES scan mid-family, which is why it is classified rather than thrown.
+        var client = ClientResponding(System.Net.HttpStatusCode.OK, "<html>nope</html>", "text/html");
+
+        Assert.Equal(
+            GatewayOutcome.Transient,
+            (await client.GetHeadTimestampAsync(Request.Contract, "TRADES", useRth: false, CancellationToken.None)).Outcome);
+    }
+
+    [Fact]
+    public async Task An_error_response_with_an_unparseable_body_still_classifies_on_its_status_code()
+    {
+        // The detail text is a nicety; the status code is the classification. Losing the first must
+        // never lose the second — 400 is Permanent whatever the body turns out to be.
+        var client = ClientResponding(System.Net.HttpStatusCode.BadRequest, "<html>Bad Request</html>", "text/html");
+
+        Assert.Equal(
+            GatewayOutcome.Permanent,
+            (await client.GetHistoricalBarsAsync(Request, CancellationToken.None)).Outcome);
+    }
+
     [Fact]
     public async Task Caller_cancellation_is_never_laundered_into_a_retryable_outcome()
     {

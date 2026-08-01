@@ -235,7 +235,33 @@ public sealed class OrderIdStore : IDisposable
     }
 
     /// <summary>Best-effort status refresh; failures are logged, never thrown.</summary>
-    public async Task TryUpdateStatusAsync(int ibkrOrderId, string status, long permId, CancellationToken cancellationToken)
+    /// <param name="permId">
+    /// The broker's permanent order id, or 0 if TWS has not reported one on any callback.
+    /// </param>
+    /// <param name="orderIsTerminal">
+    /// Whether the order has reached a final outcome. It is what turns a missing <paramref name="permId"/>
+    /// from "not yet" into a conclusion — see <c>perm_id_state</c> in migration 014.
+    /// </param>
+    /// <remarks>
+    /// <para>
+    /// perm_id only ever moves from absent to present. The previous <c>NULLIF($3, 0)</c> wrote the
+    /// column unconditionally, so any later update carrying no permId — a cancel of an order whose
+    /// state this process no longer holds, most obviously — erased an identifier already on record.
+    /// It is the one field here that cannot be recovered from anywhere else afterwards.
+    /// </para>
+    /// <para>
+    /// <c>perm_id_state</c> then records WHY it is absent when it is, because null alone cannot
+    /// distinguish an order TWS refused before assigning one (verified live: errors 110 and 201
+    /// produce an <c>error</c> callback and no other) from an order whose permId went missing on the
+    /// way here. A reconciliation tool has to treat those two differently.
+    /// </para>
+    /// </remarks>
+    public async Task TryUpdateStatusAsync(
+        int ibkrOrderId,
+        string status,
+        long permId,
+        bool orderIsTerminal,
+        CancellationToken cancellationToken)
     {
         if (_dataSource is null)
         {
@@ -245,12 +271,20 @@ public sealed class OrderIdStore : IDisposable
         try
         {
             await using var command = _dataSource.CreateCommand(
-                "UPDATE gateway.ibkr_order_map " +
-                "SET last_status = $2, perm_id = NULLIF($3, 0::bigint), updated_at = now() " +
+                "UPDATE gateway.ibkr_order_map SET " +
+                "  last_status = $2, " +
+                "  perm_id = COALESCE(NULLIF($3, 0::bigint), perm_id), " +
+                "  perm_id_state = CASE " +
+                "      WHEN $3 <> 0::bigint THEN 'assigned' " +
+                "      WHEN perm_id IS NOT NULL THEN 'assigned' " +
+                "      WHEN $4 THEN 'never_reported' " +
+                "      ELSE perm_id_state END, " +
+                "  updated_at = now() " +
                 "WHERE ibkr_order_id = $1");
             command.Parameters.AddWithValue(ibkrOrderId);
             command.Parameters.AddWithValue(status);
             command.Parameters.AddWithValue(permId);
+            command.Parameters.AddWithValue(orderIsTerminal);
 
             await command.ExecuteNonQueryAsync(cancellationToken);
         }

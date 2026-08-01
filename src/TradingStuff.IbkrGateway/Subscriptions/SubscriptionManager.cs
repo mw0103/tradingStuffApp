@@ -167,20 +167,57 @@ public sealed class SubscriptionManager : BackgroundService
         if (Volatile.Read(ref _replayEpoch) != epochAtIssue)
         {
             // The epoch is bumped by the trigger, i.e. at or before any pass takes its snapshot, so
-            // this test is conservative in the safe direction: a grant may ask for one redundant
-            // pass it did not strictly need, but a grant that a pass missed can never fail to ask.
+            // this test is conservative in the safe direction: a grant may re-issue itself once when
+            // it did not strictly need to, but a grant that a pass missed can never fail to.
+            //
+            // The other direction needs no test at all. From here on this lease is in _leases, so
+            // any trigger that arrives later snapshots it like every other lease — there is no
+            // window after this point in which a lease can be missed.
             _logger.LogInformation(
-                "Lease {LeaseId} was granted across a replay trigger; requesting a pass so it is re-issued " +
-                "against the current socket.",
+                "Lease {LeaseId} was granted across a replay trigger; re-issuing it against the current socket.",
                 leaseId);
 
-            // Not awaited: the grant itself has succeeded either way, and the caller must not be
-            // held behind a full ~54-lease replay. RunCoalescedReplayAsync either runs the pass or
-            // hands the obligation to the pass already in flight.
-            _ = RunCoalescedReplayAsync(CancellationToken.None);
+            // THIS lease only, not a replay pass. A pass covers every lease its snapshot contained,
+            // and the only lease a pass can have missed is one that joined _leases after that
+            // snapshot — which is exactly this one, and can only ever be this one. Re-issuing ~54
+            // others to reach it was never needed, and it was actively harmful: a pass fired from
+            // here runs with a ledger nobody zeroed, so every lease it touched displaced a live
+            // line. The narrow version has nothing to double-charge.
+            //
+            // Not awaited: the grant has succeeded either way and the caller must not be held behind
+            // a subscribe that can park for 30s inside the line budget.
+            _ = ReissueAfterMissedReplayAsync(active);
         }
 
         return active.ToRecord();
+    }
+
+    /// <summary>
+    /// Re-issues one lease that a replay pass could not have seen. Failures are logged, not thrown:
+    /// this runs detached from the grant that started it.
+    /// </summary>
+    /// <remarks>
+    /// A failure here leaves the lease holding whatever the grant issued against the superseded
+    /// socket state — the same exposure as a lease whose reissue fails inside
+    /// <see cref="RunReplayPassAsync"/>, and with the same recovery, since by now the lease IS in
+    /// <see cref="_leases"/> and every subsequent pass covers it.
+    /// </remarks>
+    private async Task ReissueAfterMissedReplayAsync(ActiveLease active)
+    {
+        try
+        {
+            await IssueAsync(active, markFirstTickAsReplay: true, CancellationToken.None);
+
+            _logger.LogInformation(
+                "Re-issued lease {LeaseId} for conId {ConId} after it was granted across a replay trigger.",
+                active.LeaseId, active.ConId);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(
+                ex, "Could not re-issue lease {LeaseId} for conId {ConId}; will retry on the next trigger.",
+                active.LeaseId, active.ConId);
+        }
     }
 
     /// <summary>Renews a lease. Returns false when the lease id is unknown (already released or evicted).</summary>
@@ -473,11 +510,18 @@ public sealed class SubscriptionManager : BackgroundService
             }
             catch (Exception ex)
             {
+                // The lease KEEPS whatever it was already holding. This used to drop the line
+                // reference, on the reasoning that a pre-reset lease no longer corresponds to a real
+                // line and a later termination would wrongly decrement the ledger for it. That is
+                // now handled where it belongs — LineLease carries its ledger epoch and
+                // ReleaseLine ignores a superseded one — and dropping it here was the same defect as
+                // the dropped displacement, through the failure door: a pass fired with no reset
+                // behind it (the grant path, until it stopped firing passes) reached this catch
+                // holding a CURRENT-epoch line, and forgetting it stranded a line the lease was
+                // still genuinely holding.
                 _logger.LogWarning(
                     ex, "Could not replay lease {LeaseId} for conId {ConId}; will retry on the next trigger.",
                     active.LeaseId, active.ConId);
-
-                active.ForgetLineLease();
             }
         }
     }
@@ -521,7 +565,7 @@ public sealed class SubscriptionManager : BackgroundService
             throw;
         }
 
-        if (!active.TryPublishIssued(ticker, lineLease, out var replacedTicker))
+        if (!active.TryPublishIssued(ticker, lineLease, out var replacedTicker, out var replacedLineLease))
         {
             _logger.LogInformation(
                 "Lease {LeaseId} was terminated while its subscription was being issued; releasing ticker {TickerId}.",
@@ -532,15 +576,31 @@ public sealed class SubscriptionManager : BackgroundService
             return;
         }
 
-        // The displaced ticker's registration is only cleaned up here, on a SUCCESSFUL reissue —
-        // not by registry.FailAll, which only fires on the socket dropping outright
-        // (connectionClosed / error 1100). TWS's 1101 notice ("connectivity restored, data lost")
-        // replays without the socket ever dropping, so without this the dead sink's registry entry
-        // would leak forever. It comes back FROM the publish rather than being read around it: a
-        // ticker read outside that lock can be one a concurrent termination has already cancelled.
+        // A successful reissue DISPLACES whatever the previous one left live, and displacement has
+        // to unwind exactly what a termination would: the registry entry AND the subscription. Only
+        // the registry half used to happen here, which left the displaced reqMktData streaming at
+        // TWS and its line charged against the ledger forever.
+        //
+        // The registration is cleaned up here and nowhere else — not by registry.FailAll, which
+        // only fires on the socket dropping outright (connectionClosed / error 1100). TWS's 1101
+        // notice ("connectivity restored, data lost") replays without the socket ever dropping, so
+        // without this the dead sink's registry entry would leak forever. Both halves come back
+        // FROM the publish rather than being read around it: state read outside that lock can
+        // belong to a concurrent termination that has already cancelled it.
         if (replacedTicker != 0 && replacedTicker != ticker)
         {
             _transport.RemoveSink(replacedTicker);
+        }
+
+        if (replacedLineLease is not null)
+        {
+            // Best-effort by design, and unconditional on purpose. After a genuine 1101 or a
+            // reconnect TWS no longer knows this ticker and answers error 300 ("Can't find EId"),
+            // which CancelMktDataAsync swallows; after a grant-path reissue the subscription is
+            // very much alive and this is the only thing that stops it. Guessing which world we are
+            // in is what the dropped lease was doing, and guessing wrong the second way costs a
+            // market-data line with no way to get it back short of a restart.
+            await _transport.UnsubscribeAsync(replacedTicker, replacedLineLease);
         }
     }
 
@@ -661,23 +721,35 @@ public sealed class SubscriptionManager : BackgroundService
         /// which case the caller owns unwinding what it just acquired — nothing else knows it exists.
         /// </summary>
         /// <remarks>
-        /// The displaced <see cref="LineLease"/> is deliberately dropped rather than disposed: a
-        /// republish only happens on a replay, and by then the pacing governor's ledger has already
-        /// been zeroed (<see cref="IbkrPacingGovernor.ResetLineLedgerForReconnect"/>), so the old
-        /// lease object no longer corresponds to a line anything holds. Disposing it would decrement
-        /// the ledger for a line that was never counted.
+        /// The displaced <see cref="LineLease"/> comes back too, and the caller must unwind it. An
+        /// earlier version dropped it on the reasoning that a republish only happens on a replay,
+        /// and that by then <see cref="IbkrPacingGovernor.ResetLineLedgerForReconnect"/> has zeroed
+        /// the ledger so the old lease corresponds to nothing. The premise did not hold — the grant
+        /// path re-issues with no reset anywhere near it (see <see cref="GrantAsync"/>) — and the
+        /// leak it produced consumed the whole 80-line research budget in a single pass.
+        /// <para>
+        /// Returning it is not just the fix but the better shape, because it no longer needs the
+        /// premise: a <see cref="LineLease"/> carries the ledger epoch it was issued against, so
+        /// disposing a pre-reset one is already a no-op inside
+        /// <see cref="IbkrPacingGovernor.ReleaseLine"/>. Both cases are now the same call — release
+        /// what was displaced — and a future third re-issue path cannot get it wrong by inheriting
+        /// an assumption about who reset the ledger first.
+        /// </para>
         /// </remarks>
-        public bool TryPublishIssued(int tickerId, LineLease lineLease, out int replacedTickerId)
+        public bool TryPublishIssued(
+            int tickerId, LineLease lineLease, out int replacedTickerId, out LineLease? replacedLineLease)
         {
             lock (_gate)
             {
                 if (_terminated)
                 {
                     replacedTickerId = 0;
+                    replacedLineLease = null;
                     return false;
                 }
 
                 replacedTickerId = _tickerId;
+                replacedLineLease = _lineLease;
                 _tickerId = tickerId;
                 _lineLease = lineLease;
                 return true;
@@ -768,23 +840,6 @@ public sealed class SubscriptionManager : BackgroundService
         {
             await previous.ConfigureAwait(ConfigureAwaitOptions.ForceYielding);
             await work().ConfigureAwait(false);
-        }
-
-        /// <summary>Drops the line reference after a failed replay, without releasing it.</summary>
-        /// <remarks>
-        /// The lease's <see cref="LineLease"/> predates the reconnect's
-        /// <see cref="IbkrPacingGovernor.ResetLineLedgerForReconnect"/> and no longer corresponds to
-        /// anything real. Left in place, a later termination would dispose it anyway, decrementing
-        /// the pacing ledger for a line that is not actually held — silently under-reporting real
-        /// usage and letting the governor over-admit. Clearing it here means termination finds
-        /// nothing to (wrongly) release.
-        /// </remarks>
-        public void ForgetLineLease()
-        {
-            lock (_gate)
-            {
-                _lineLease = null;
-            }
         }
 
         public SubscriptionLease ToRecord()

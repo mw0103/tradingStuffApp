@@ -717,6 +717,51 @@ public sealed class BackfillStore(IConfiguration configuration, ILogger<Backfill
             : null;
     }
 
+    /// <summary>
+    /// The most recent head-timestamp probe for a key, including one that concluded there is no data.
+    /// </summary>
+    /// <remarks>
+    /// A separate reader from <see cref="GetCachedHeadTimestampAsync"/> rather than a widened one, so
+    /// the coordinator and the gap detector keep the two-state answer they were written against while
+    /// <see cref="EsContractWalker"/> gets the three-state one it needs. The distinction it adds is
+    /// <c>Head is null</c> on a row that EXISTS: TWS was asked and said there is no history here,
+    /// which is a conclusion about the contract. No row at all means nobody has asked yet, which is
+    /// not — and collapsing those two is what kept a listed-but-untraded ES quarter permanently in
+    /// the "could not plan it this pass" bucket, re-probed every scan and holding its job open forever.
+    /// </remarks>
+    public async Task<(DateTimeOffset? Head, DateTimeOffset ProbedAt)?> GetCachedHeadProbeAsync(
+        string probeKey, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+
+        await using var command = new NpgsqlCommand(
+            "SELECT result ->> 'headTimestampUtc', ran_at FROM research.capability_probes " +
+            "WHERE probe_key = $1 AND succeeded ORDER BY ran_at DESC LIMIT 1",
+            connection);
+        command.Parameters.AddWithValue(probeKey);
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+
+        if (!await reader.ReadAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        var probedAt = reader.GetFieldValue<DateTimeOffset>(1);
+
+        if (reader.IsDBNull(0))
+        {
+            return (null, probedAt);
+        }
+
+        // An unparseable stored value is treated as "never probed", not as "no data": the second
+        // would silently retire a contract on a formatting bug.
+        return DateTimeOffset.TryParse(
+            reader.GetString(0), null, System.Globalization.DateTimeStyles.RoundtripKind, out var head)
+            ? (head.ToUniversalTime(), probedAt)
+            : null;
+    }
+
     public async Task RecordHeadTimestampAsync(
         string probeKey, int conId, DateTimeOffset head, string notes, CancellationToken cancellationToken)
     {
@@ -730,6 +775,33 @@ public sealed class BackfillStore(IConfiguration configuration, ILogger<Backfill
         command.Parameters.AddWithValue(probeKey);
         command.Parameters.AddWithValue(conId);
         command.Parameters.AddWithValue(head.ToUniversalTime().ToString("O"));
+        command.Parameters.AddWithValue(notes);
+
+        await command.ExecuteNonQueryAsync(cancellationToken);
+    }
+
+    /// <summary>
+    /// Records that a head-timestamp probe ran and TWS answered that there is no history for this
+    /// contract.
+    /// </summary>
+    /// <remarks>
+    /// <c>succeeded</c> is true because the PROBE succeeded — an answer was obtained — and the head
+    /// is stored as an explicit JSON null so <see cref="GetCachedHeadProbeAsync"/> can tell "asked,
+    /// and there is nothing" from "never asked". A failed probe (paced, disconnected) writes no row
+    /// at all, which is what keeps it retried on the next scan.
+    /// </remarks>
+    public async Task RecordNoHeadTimestampAsync(
+        string probeKey, int conId, string notes, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+
+        await using var command = new NpgsqlCommand(
+            "INSERT INTO research.capability_probes (probe_key, con_id, ran_at, succeeded, result, notes) " +
+            "VALUES ($1, $2, now(), true, jsonb_build_object('headTimestampUtc', NULL, 'noData', true), $3)",
+            connection);
+
+        command.Parameters.AddWithValue(probeKey);
+        command.Parameters.AddWithValue(conId);
         command.Parameters.AddWithValue(notes);
 
         await command.ExecuteNonQueryAsync(cancellationToken);
@@ -961,6 +1033,40 @@ public sealed class BackfillStore(IConfiguration configuration, ILogger<Backfill
         }
 
         return conIds;
+    }
+
+    /// <summary>
+    /// The newest <c>end_time_utc</c> this job has a request row for, or NULL when it has none.
+    /// </summary>
+    /// <remarks>
+    /// Where <see cref="EsContractWalker"/>'s forward-coverage claim is measured, and it is measured
+    /// on <c>research.backfill_requests</c> deliberately: the claim is "nothing after the job's frozen
+    /// <c>target_to</c> went unrequested", which is a statement about request rows, not about landed
+    /// bars — bars are also absent for a Sunday, and a check that could not tell those apart would
+    /// cry wolf every weekend.
+    /// <para>
+    /// NULL is returned rather than an epoch sentinel so the caller has to decide what "this job has
+    /// requested nothing at all" means. It means a shortfall. An aggregate over an empty set is the
+    /// canonical shape of absence rendering as health, which is exactly the failure this query exists
+    /// to catch, so it must not be papered over here.
+    /// </para>
+    /// </remarks>
+    public async Task<DateTimeOffset?> GetNewestPlannedEndAsync(long jobId, CancellationToken cancellationToken)
+    {
+        await using var connection = await OpenAsync(cancellationToken);
+
+        await using var command = new NpgsqlCommand(
+            "SELECT max(end_time_utc) FROM research.backfill_requests WHERE job_id = $1", connection);
+        command.Parameters.AddWithValue(jobId);
+
+        // Read through the reader rather than ExecuteScalar so the value arrives as a DateTimeOffset
+        // by the same conversion every other timestamptz in this class uses, instead of a boxed
+        // DateTime whose Kind this method would have to assume.
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+
+        return await reader.ReadAsync(cancellationToken) && !reader.IsDBNull(0)
+            ? reader.GetFieldValue<DateTimeOffset>(0).ToUniversalTime()
+            : null;
     }
 
     // ---- gap detection --------------------------------------------------------------------------

@@ -1022,4 +1022,153 @@ public sealed class BackfillCoordinatorPostgresTests
 
         return (long)(await command.ExecuteScalarAsync())!;
     }
+
+    // ---- a store failure after the bars are in hand ------------------------------------------------
+
+    /// <summary>
+    /// A gateway that answers every bars request with a full 200 payload, so the failure under test
+    /// is unambiguously on the persistence side of the call.
+    /// </summary>
+    private sealed class BarsHandler(int barCount) : HttpMessageHandler
+    {
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            var first = new DateTimeOffset(2024, 1, 10, 14, 30, 0, TimeSpan.Zero);
+            var bars = string.Join(",", Enumerable.Range(0, barCount).Select(i =>
+                $$"""{"timestamp":"{{first.AddMinutes(i):O}}","tradingDate":null,"open":1,"high":2,"low":0.5,"close":1.5,"volume":10,"count":3,"wap":1.2}"""));
+
+            return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    $$"""{"bars":[{{bars}}],"hasData":true}""", System.Text.Encoding.UTF8, "application/json"),
+            });
+        }
+    }
+
+    private static BackfillCoordinator CoordinatorFor(
+        string connectionString, HttpMessageHandler handler, BackfillOptions? options = null) =>
+        new(
+            StoreFor(connectionString),
+            new IbkrGatewayClient(
+                new HttpClient(handler) { BaseAddress = new Uri("http://localhost:5100") },
+                NullLogger<IbkrGatewayClient>.Instance),
+            Microsoft.Extensions.Options.Options.Create(options ?? new BackfillOptions
+            {
+                Enabled = true,
+                MaxAttempts = MaxAttempts,
+                IdlePollSeconds = 15,
+                PersistenceBackoffSeconds = 90,
+            }),
+            NullLogger<BackfillCoordinator>.Instance);
+
+    /// <summary>
+    /// Makes every INSERT into <c>research.bars</c> fail the way a Postgres restart does, without
+    /// touching any other statement — so claiming works, the fetch works, and only the landing breaks.
+    /// </summary>
+    /// <remarks>
+    /// A trigger rather than a mocked store on purpose: the failure has to arrive from inside
+    /// <see cref="BackfillStore.LandBarsAsync"/>'s real transaction, at the real call site, or the
+    /// test is only exercising a stub's idea of where an exception comes from. <c>57P01</c> is
+    /// <c>admin_shutdown</c> — literally what a restarting server sends its open connections.
+    /// </remarks>
+    private static Task PoisonBarInsertsAsync(string connectionString) => ExecuteAsync(
+        connectionString,
+        """
+        CREATE FUNCTION research.reject_bar() RETURNS trigger AS $$
+        BEGIN
+            RAISE EXCEPTION 'terminating connection due to administrator command' USING ERRCODE = '57P01';
+        END;
+        $$ LANGUAGE plpgsql;
+
+        CREATE TRIGGER reject_bars BEFORE INSERT ON research.bars
+            FOR EACH ROW EXECUTE FUNCTION research.reject_bar();
+        """);
+
+    [Fact]
+    public async Task A_store_failure_after_the_bars_are_fetched_releases_the_claim_instead_of_stranding_it()
+    {
+        // The classifier fix that closed BrokenCircuitException guarded the HTTP SEND, and its own
+        // remark generalised to "anything this method fails to recognise is still a classified
+        // outcome instead of a stranded claim". That was never true of the store calls that follow.
+        // A pool exhaustion or a 57P01 during a Postgres restart threw past ExecuteSliceAsync to the
+        // drain loop's outermost catch, which writes no outcome: 390 fetched bars discarded with no
+        // log, the row inflight for the rest of its five-minute lease, then reclaimed as 'failed'
+        // with the attempt already spent. And because idleFor was never adjusted, the next pass
+        // claimed a DIFFERENT slice 15 s later and did it again — one five-minute blip strands ~20
+        // distinct slices, five of them retire it for good.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var store = StoreFor(connectionString);
+        var job = await store.EnsureJobAsync(HistoricalDefinition(), SpxConId, CancellationToken.None);
+
+        await store.InsertSlicesAsync(
+            BackfillPlanner.PlanHistorical(job!, SpxConId, null, CadenceOf(job!)), CancellationToken.None);
+        await PoisonBarInsertsAsync(connectionString);
+
+        var coordinator = CoordinatorFor(connectionString, new BarsHandler(390));
+        var claimed = (await store.ClaimAsync(coordinator.OwnerId, Lease, MaxAttempts, 1, CancellationToken.None)).Single();
+
+        Assert.Equal(1, claimed.Attempts);
+
+        // It must not throw: throwing IS the defect, because the only handler above this is the loop's
+        // catch-and-carry-on, which leaves the claim behind.
+        var idle = await coordinator.ExecuteSliceAsync(claimed, CancellationToken.None);
+
+        // The loop backs off rather than immediately claiming the next slice into the same failure.
+        Assert.Equal(TimeSpan.FromSeconds(90), idle);
+
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand(
+            "SELECT state, attempts, claimed_by, lease_expires_at FROM research.backfill_requests WHERE request_id = $1",
+            connection);
+        command.Parameters.AddWithValue(claimed.RequestId);
+
+        await using var reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync());
+
+        // Claimable again immediately, with its attempt refunded: the failure was this process's
+        // database connection, not anything about the slice, and `attempts` has no reset path.
+        Assert.Equal("pending", reader.GetString(0));
+        Assert.Equal(0, reader.GetInt32(1));
+        Assert.True(reader.IsDBNull(2));
+        Assert.True(reader.IsDBNull(3));
+
+        Assert.Equal(0L, await CountBarsAsync(connectionString));
+    }
+
+    [Fact]
+    public async Task A_store_failure_does_not_walk_the_queue_burning_one_slice_after_another()
+    {
+        // The compounding half, which is what turned a blip into a permanent hole. Each pass reached
+        // a different slice, so the damage was proportional to the outage rather than to the failure.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var store = StoreFor(connectionString);
+        var job = await store.EnsureJobAsync(HistoricalDefinition(), SpxConId, CancellationToken.None);
+
+        await store.InsertSlicesAsync(
+            BackfillPlanner.PlanHistorical(job!, SpxConId, null, CadenceOf(job!)), CancellationToken.None);
+        await PoisonBarInsertsAsync(connectionString);
+
+        var coordinator = CoordinatorFor(connectionString, new BarsHandler(10));
+
+        for (var pass = 0; pass < 5; pass++)
+        {
+            var claimed = await store.ClaimAsync(coordinator.OwnerId, Lease, MaxAttempts, 1, CancellationToken.None);
+            await coordinator.ExecuteSliceAsync(claimed.Single(), CancellationToken.None);
+        }
+
+        // Five consecutive failures, and not one slice has spent an attempt or been left inflight.
+        Assert.Equal(0L, await CountRequestsAsync(connectionString, "attempts > 0"));
+        Assert.Equal(0L, await CountRequestsAsync(connectionString, "state <> 'pending'"));
+    }
 }

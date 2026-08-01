@@ -215,7 +215,12 @@ public sealed class IbkrOrderClient(
         var state = settled ?? tracker.Get(ibkrOrderId)
             ?? throw new InvalidOperationException($"Order {ibkrOrderId} vanished from the tracker.");
 
-        await orderIdStore.TryUpdateStatusAsync(ibkrOrderId, state.RawStatus, state.PermId, cancellationToken);
+        await orderIdStore.TryUpdateStatusAsync(
+            ibkrOrderId,
+            state.RawStatus,
+            state.PermId,
+            IbkrOrderBuilder.IsTerminal(state.Status),
+            cancellationToken);
 
         return state;
     }
@@ -263,7 +268,12 @@ public sealed class IbkrOrderClient(
 
         if (current is not null)
         {
-            await orderIdStore.TryUpdateStatusAsync(ibkrOrderId, current.RawStatus, current.PermId, cancellationToken);
+            await orderIdStore.TryUpdateStatusAsync(
+                ibkrOrderId,
+                current.RawStatus,
+                current.PermId,
+                IbkrOrderBuilder.IsTerminal(current.Status),
+                cancellationToken);
         }
 
         return current;

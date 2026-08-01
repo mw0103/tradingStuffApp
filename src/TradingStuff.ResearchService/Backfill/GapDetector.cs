@@ -183,6 +183,7 @@ public sealed record JobGapReport(
 /// (contract, whatToShow, barSize, useRth) series.
 /// </summary>
 /// <remarks>
+/// <para>
 /// <b>This is the only check in the report computed across jobs rather than within one, and it is the
 /// only one that can see a seam.</b> A series is normally covered by a pair — a historical job
 /// walking backward and a top-up job holding the recent tail — and each was measured against its own
@@ -191,7 +192,17 @@ public sealed record JobGapReport(
 /// the un-audited band grew by one day per day of operation while both jobs kept reporting
 /// <c>checked</c> with zero gaps. Three entirely missing SPX sessions inside that band produced a
 /// clean bill of health from both, and no query existed that could surface them.
+/// </para>
+/// <para>
+/// <b>Computed over the whole series, never over the caller's selection.</b> A <c>jobId</c> filter
+/// narrows what <see cref="GapReport.Jobs"/> displays and nothing else: reconciling over the filtered
+/// subset let the narrowest possible question return the healthiest possible answer, because an
+/// unselected sibling's claim never entered the subtraction and so had nothing left to leave over.
+/// <paramref name="JobNames"/> therefore names every member of the series and may name a job that is
+/// not in <see cref="GapReport.Jobs"/> — that is the point, not an inconsistency.
+/// </para>
 /// </remarks>
+/// <param name="JobNames">Every job in the series, whether or not it is displayed in <see cref="GapReport.Jobs"/>.</param>
 /// <param name="Reconciled">True when <paramref name="Unaudited"/> is empty: every claimed instant was examined.</param>
 public sealed record SeriesReconciliation(
     int? ConId,
@@ -203,10 +214,14 @@ public sealed record SeriesReconciliation(
     IReadOnlyList<UnauditedRange> Unaudited);
 
 /// <summary>What <c>GET /research/backfill/gaps</c> answers with.</summary>
+/// <param name="Jobs">
+/// One entry per job the caller asked about — narrowed by <c>jobId</c> when one was given.
+/// </param>
 /// <param name="Series">
 /// The cross-job reconciliation, one entry per data series. A caller asking "is this backfill
 /// actually complete" must read this as well as <paramref name="Jobs"/>: a per-job report can only
-/// ever be silent about a range no job looked at.
+/// ever be silent about a range no job looked at. <b>Not narrowed by <c>jobId</c></b> — see
+/// <see cref="SeriesReconciliation"/> — so it can name jobs absent from <paramref name="Jobs"/>.
 /// </param>
 public sealed record GapReport(IReadOnlyList<JobGapReport> Jobs, IReadOnlyList<SeriesReconciliation> Series);
 
@@ -266,10 +281,30 @@ public sealed class GapDetector(
             ? jobs.Where(j => j.JobId == id).ToArray()
             : jobs.ToArray();
 
-        var reports = new List<JobGapReport>(selected.Length);
+        // A jobId filter narrows what is DISPLAYED; it must not narrow what is CHECKED.
+        // SeriesReconciliation is the only cross-job statement this report makes, and computing it
+        // from the filtered subset made it a series-wide claim derived from one member of the series:
+        // an unselected sibling's claim never entered `claimed`, so subtracting audited from claimed
+        // had nothing to subtract and a series with a known missing session reported Reconciled=true.
+        // Every job sharing a selected job's series key is therefore analyzed as well — the set is
+        // bounded and small (a historical job and its top-up, in practice) — and the selection is
+        // applied to the returned Jobs list at the end instead.
+        BackfillJobStatus[] analyzed;
+
+        if (jobId is null)
+        {
+            analyzed = selected;
+        }
+        else
+        {
+            var seriesKeys = selected.Select(SeriesKey).ToHashSet();
+            analyzed = [.. jobs.Where(j => seriesKeys.Contains(SeriesKey(j)))];
+        }
+
+        var reports = new List<JobGapReport>(analyzed.Length);
         var now = DateTimeOffset.UtcNow;
 
-        foreach (var job in selected)
+        foreach (var job in analyzed)
         {
             var nominal = NominalWindow(job, headUtc: null, now);
 
@@ -293,8 +328,23 @@ public sealed class GapDetector(
             }
         }
 
-        return new GapReport(reports, Reconcile(selected, reports, now.AddMinutes(-_options.InProgressGraceMinutes)));
+        var series = Reconcile(analyzed, reports, now, now.AddMinutes(-_options.InProgressGraceMinutes));
+        var selectedIds = selected.Select(j => j.JobId).ToHashSet();
+
+        return new GapReport([.. reports.Where(r => selectedIds.Contains(r.JobId))], series);
     }
+
+    /// <summary>
+    /// What makes two jobs jointly responsible for the same rows of <c>research.bars</c>, and
+    /// therefore for the same span of history.
+    /// </summary>
+    /// <remarks>
+    /// The one definition of a series, used both to widen a filtered query to the whole series and to
+    /// group the reconciliation. Two copies of it would drift, and a widening that disagreed with the
+    /// grouping would silently reintroduce a partially-reconciled series under a different name.
+    /// </remarks>
+    private static (int? ConId, string WhatToShow, string BarSize, bool UseRth) SeriesKey(BackfillJobStatus job) =>
+        (job.ConId, job.WhatToShow, job.BarSize, job.UseRth);
 
     /// <summary>
     /// The span a job CLAIMS to cover, independent of what any particular run audits.
@@ -325,8 +375,18 @@ public sealed class GapDetector(
     /// hidden by the clamp — every job reports it as an <see cref="GapAuditReasons.InProgress"/>
     /// unaudited range of its own.
     /// </param>
-    private static IReadOnlyList<SeriesReconciliation> Reconcile(
-        IReadOnlyList<BackfillJobStatus> jobs, IReadOnlyList<JobGapReport> reports, DateTimeOffset auditCeiling)
+    /// <remarks>
+    /// <b>Every span this produces is derived from the job reports' own words, and only ever in the
+    /// direction that reports LESS coverage.</b> Both halves of that matter, and both were breaches:
+    /// a job whose report is missing from <paramref name="reports"/> still contributes its claim (and
+    /// no coverage), and a job's contribution to the audited set is the span it evaluated MINUS the
+    /// spans it declared unaudited itself. So a series cannot say "reconciled" over anything one of
+    /// its own jobs said it did not look at, and cannot be talked into a healthier answer by being
+    /// handed a smaller set of reports.
+    /// </remarks>
+    private IReadOnlyList<SeriesReconciliation> Reconcile(
+        IReadOnlyList<BackfillJobStatus> jobs, IReadOnlyList<JobGapReport> reports,
+        DateTimeOffset now, DateTimeOffset auditCeiling)
     {
         var byId = reports.ToDictionary(r => r.JobId);
 
@@ -337,7 +397,7 @@ public sealed class GapDetector(
                 // range only if they write the same (contract, whatToShow, barSize, useRth) rows of
                 // research.bars. Reconciling across instruments would let SPY's audited window
                 // "cover" an SPX hole, which is worse than not reconciling at all.
-                .GroupBy(j => (j.ConId, j.WhatToShow, j.BarSize, j.UseRth))
+                .GroupBy(SeriesKey)
                 .Select(group =>
                 {
                     var claimed = new List<GapArithmetic.Span>();
@@ -345,22 +405,39 @@ public sealed class GapDetector(
 
                     foreach (var job in group)
                     {
-                        if (!byId.TryGetValue(job.JobId, out var report))
-                        {
-                            continue;
-                        }
+                        var report = byId.GetValueOrDefault(job.JobId);
 
-                        if (report is { NominalFrom: { } nf, NominalTo: { } nt })
-                        {
-                            claimed.Add(new GapArithmetic.Span(nf, nt < auditCeiling ? nt : auditCeiling));
-                        }
+                        // A member with no report in hand claims its window and audits nothing.
+                        // Unreachable today — the loop above reports every analyzed job, including
+                        // one whose analysis threw — but the previous `continue` is written out
+                        // rather than left implicit because dropping a member is the one move that
+                        // can only ever make a series look HEALTHIER: the claim it withholds is
+                        // exactly the claim the subtraction would have had left over. That is how
+                        // the jobId filter turned a series with a known missing session into
+                        // Reconciled=true, one level up, and a future caller handing this a subset
+                        // of reports must not be able to do it again. The head clamp is deliberately
+                        // not applied to the fallback: an unclamped lower bound is a WIDER claim,
+                        // and wider is the safe direction here.
+                        claimed.Add(report is { NominalFrom: { } nf, NominalTo: { } nt }
+                            ? new GapArithmetic.Span(nf, nt < auditCeiling ? nt : auditCeiling)
+                            : Clamp(NominalWindow(job, headUtc: null, now)));
 
                         // Only a run that actually evaluated expectation units contributes coverage.
                         // A window-rejected or zero-unit report examined nothing inside its bounds,
                         // and counting it would be the report laundering its own silence.
+                        //
+                        // `checked` is not a statement about every instant in [From, To) either — it
+                        // only means at least one expectation unit was evaluated somewhere inside it
+                        // — so the coverage a job contributes is its window MINUS the ranges it
+                        // reported as unaudited on itself. Without that subtraction a VIX job could
+                        // report its ENTIRE window unmodelled-and-unaudited and simultaneously
+                        // reconcile its series to zero remainder, and both halves of that response
+                        // shipped in the same JSON object.
                         if (report is { CheckStatus: GapCheckStatus.Checked, From: { } f, To: { } t })
                         {
-                            audited.Add(new GapArithmetic.Span(f, t));
+                            audited.AddRange(GapArithmetic.Subtract(
+                                [new GapArithmetic.Span(f, t)],
+                                report.Unaudited.Select(u => new GapArithmetic.Span(u.From, u.To))));
                         }
                     }
 
@@ -376,6 +453,9 @@ public sealed class GapDetector(
                         [.. unaudited.Select(s => new UnauditedRange(s.From, s.To, GapAuditReasons.NoJobAuditedIt))]);
                 })
         ];
+
+        GapArithmetic.Span Clamp(GapArithmetic.Span span) =>
+            span with { To = span.To < auditCeiling ? span.To : auditCeiling };
     }
 
     private async Task<JobGapReport> BuildJobReportAsync(

@@ -55,15 +55,47 @@ public sealed class EsContractWalkerPostgresTests
     private static BackfillStore StoreFor(string connectionString) =>
         new(ConfigurationFor(connectionString), NullLogger<BackfillStore>.Instance);
 
-    // Never called in these tests (every head timestamp is pre-cached), so a bare HttpClient with no
-    // base address is fine — SeedAsync's cache hit short-circuits before any request would be sent.
+    // Never called in most of these tests (every head timestamp is pre-cached), so a bare HttpClient
+    // with no base address is fine — SeedAsync's cache hit short-circuits before any request would be
+    // sent, and a probe that does slip through fails at the transport, which is exactly the
+    // "unresolved this pass" verdict those tests want.
     private static IbkrGatewayClient UnusedGateway() => new(new HttpClient(), NullLogger<IbkrGatewayClient>.Instance);
 
-    private static EsContractWalker WalkerFor(string connectionString) => new(
+    /// <summary>
+    /// A gateway that answers every head-timestamp probe with the gateway's own 400 — how a contract
+    /// TWS has no history for actually surfaces (<see cref="GatewayOutcome.Permanent"/>). Counts its
+    /// calls, because "was this contract probed again?" is half of what the caching fix claims.
+    /// </summary>
+    private sealed class HeadProbeHandler : HttpMessageHandler
+    {
+        public int Calls { get; private set; }
+
+        protected override Task<HttpResponseMessage> SendAsync(HttpRequestMessage request, CancellationToken cancellationToken)
+        {
+            Calls++;
+
+            return Task.FromResult(new HttpResponseMessage(System.Net.HttpStatusCode.BadRequest)
+            {
+                Content = new StringContent(
+                    """{"detail":"No head time stamp","ibkrErrorCode":162}""", System.Text.Encoding.UTF8, "application/json"),
+            });
+        }
+    }
+
+    private static EsContractWalker WalkerFor(string connectionString, IbkrGatewayClient? gateway = null) => new(
         StoreFor(connectionString),
-        UnusedGateway(),
+        gateway ?? UnusedGateway(),
         Options.Create(new BackfillOptions { Enabled = true, MaxAttempts = 5, HeadTimestampMaxAgeDays = 30 }),
         NullLogger<EsContractWalker>.Instance);
+
+    /// <summary>
+    /// The scan instant these tests use unless they are specifically about the calendar advancing:
+    /// today's UTC midnight, which is exactly the <c>target_to</c> a job created today gets. Passing
+    /// a floored instant rather than <c>UtcNow</c> keeps every assertion about slice counts exact,
+    /// and keeps a suite that happens to straddle midnight from planning an extra day.
+    /// </summary>
+    private static DateTimeOffset Today() =>
+        BackfillPlanner.FloorToBucket(DateTimeOffset.UtcNow, TimeSpan.FromDays(1));
 
     private static async Task<long> CountRequestsAsync(string connectionString, string? where = null)
     {
@@ -135,7 +167,7 @@ public sealed class EsContractWalkerPostgresTests
             conId: null, CancellationToken.None);
         Assert.NotNull(job);
 
-        var first = await walker.SeedAsync(job!, contracts, CancellationToken.None);
+        var first = await walker.SeedAsync(job!, contracts, Today(), CancellationToken.None);
         Assert.True(first.SlicesInserted > 0);
 
         var afterFirst = await CountRequestsAsync(connectionString);
@@ -149,7 +181,7 @@ public sealed class EsContractWalkerPostgresTests
                 UseRth: false, new DateTimeOffset(2008, 1, 1, 0, 0, 0, TimeSpan.Zero), TargetTo: null, Priority: 60),
             conId: null, CancellationToken.None);
 
-        var second = await WalkerFor(connectionString).SeedAsync(rediscoveredJob!, contracts, CancellationToken.None);
+        var second = await WalkerFor(connectionString).SeedAsync(rediscoveredJob!, contracts, Today(), CancellationToken.None);
 
         Assert.Equal(0, second.SlicesInserted);
         Assert.Equal(afterFirst, await CountRequestsAsync(connectionString));
@@ -175,7 +207,7 @@ public sealed class EsContractWalkerPostgresTests
                 UseRth: false, new DateTimeOffset(2008, 1, 1, 0, 0, 0, TimeSpan.Zero), TargetTo: null, Priority: 60),
             conId: null, CancellationToken.None);
 
-        await WalkerFor(connectionString).SeedAsync(job!, [ExpiredContract, FrontMonthContract], CancellationToken.None);
+        await WalkerFor(connectionString).SeedAsync(job!, [ExpiredContract, FrontMonthContract], Today(), CancellationToken.None);
 
         var expiredRows = await CountRequestsAsync(connectionString, $"con_id = {ExpiredContract.ConId}");
         var frontRows = await CountRequestsAsync(connectionString, $"con_id = {FrontMonthContract.ConId}");
@@ -217,7 +249,7 @@ public sealed class EsContractWalkerPostgresTests
 
         Assert.Equal("pending", await JobStatusAsync(connectionString, job!.JobId));
 
-        await WalkerFor(connectionString).SeedAsync(job, [ExpiredContract], CancellationToken.None);
+        await WalkerFor(connectionString).SeedAsync(job, [ExpiredContract], Today(), CancellationToken.None);
 
         Assert.Equal("running", await JobStatusAsync(connectionString, job.JobId));
     }
@@ -246,7 +278,7 @@ public sealed class EsContractWalkerPostgresTests
             conId: null, CancellationToken.None);
 
         var result = await WalkerFor(connectionString).SeedAsync(
-            job!, [ExpiredContract, FrontMonthContract], CancellationToken.None);
+            job!, [ExpiredContract, FrontMonthContract], Today(), CancellationToken.None);
 
         Assert.True(result.SlicesInserted > 0);
         Assert.Equal(0L, await CountRequestsAsync(connectionString, $"con_id = {FrontMonthContract.ConId}"));
@@ -280,7 +312,7 @@ public sealed class EsContractWalkerPostgresTests
         var job = await store.EnsureJobAsync(EsDefinition(), conId: null, CancellationToken.None);
 
         var result = await WalkerFor(connectionString).SeedAsync(
-            job!, [ExpiredContract, FrontMonthContract], CancellationToken.None);
+            job!, [ExpiredContract, FrontMonthContract], Today(), CancellationToken.None);
 
         Assert.Equal(1, result.UnplannedContractCount);
         Assert.False(result.PlanningComplete);
@@ -291,7 +323,7 @@ public sealed class EsContractWalkerPostgresTests
 
         // A second scan in the same condition must still refuse to call it finished.
         var second = await WalkerFor(connectionString).SeedAsync(
-            job, [ExpiredContract, FrontMonthContract], CancellationToken.None);
+            job, [ExpiredContract, FrontMonthContract], Today(), CancellationToken.None);
 
         Assert.False(second.PlanningComplete);
         Assert.Equal("running", await JobStatusAsync(connectionString, job.JobId));
@@ -299,13 +331,13 @@ public sealed class EsContractWalkerPostgresTests
         // ...and once the missing contract's head resolves, the job completes on its own.
         await SeedHeadAsync(store, FrontMonthContract.ConId, new DateTimeOffset(2023, 8, 20, 0, 0, 0, TimeSpan.Zero));
         var third = await WalkerFor(connectionString).SeedAsync(
-            job, [ExpiredContract, FrontMonthContract], CancellationToken.None);
+            job, [ExpiredContract, FrontMonthContract], Today(), CancellationToken.None);
 
         Assert.True(third.PlanningComplete);
         Assert.Equal("running", await JobStatusAsync(connectionString, job.JobId)); // its new slices are pending
 
         await ExecuteAsync(connectionString, "UPDATE research.backfill_requests SET state = 'succeeded', bars_landed = 1");
-        await WalkerFor(connectionString).SeedAsync(job, [ExpiredContract, FrontMonthContract], CancellationToken.None);
+        await WalkerFor(connectionString).SeedAsync(job, [ExpiredContract, FrontMonthContract], Today(), CancellationToken.None);
 
         Assert.Equal("complete", await JobStatusAsync(connectionString, job.JobId));
     }
@@ -330,13 +362,13 @@ public sealed class EsContractWalkerPostgresTests
         var job = await store.EnsureJobAsync(EsDefinition(), conId: null, CancellationToken.None);
 
         var full = await WalkerFor(connectionString).SeedAsync(
-            job!, [ExpiredContract, FrontMonthContract], CancellationToken.None);
+            job!, [ExpiredContract, FrontMonthContract], Today(), CancellationToken.None);
         Assert.True(full.PlanningComplete);
 
         await ExecuteAsync(connectionString, "UPDATE research.backfill_requests SET state = 'succeeded', bars_landed = 1");
 
         // The next scan's enumeration comes back short of one contract this walker already knows.
-        var partial = await WalkerFor(connectionString).SeedAsync(job!, [ExpiredContract], CancellationToken.None);
+        var partial = await WalkerFor(connectionString).SeedAsync(job!, [ExpiredContract], Today(), CancellationToken.None);
 
         Assert.Equal(1, partial.ForgottenContractCount);
         Assert.False(partial.PlanningComplete);
@@ -362,16 +394,248 @@ public sealed class EsContractWalkerPostgresTests
                 UseRth: false, new DateTimeOffset(2008, 1, 1, 0, 0, 0, TimeSpan.Zero), TargetTo: null, Priority: 60),
             conId: null, CancellationToken.None);
 
-        await WalkerFor(connectionString).SeedAsync(job!, [ExpiredContract], CancellationToken.None);
+        await WalkerFor(connectionString).SeedAsync(job!, [ExpiredContract], Today(), CancellationToken.None);
         var afterFirstScan = await CountRequestsAsync(connectionString);
 
         // A later scan discovers a newly-listed quarter. Only its rows should be new.
         await SeedHeadAsync(store, FrontMonthContract.ConId, new DateTimeOffset(2023, 8, 20, 0, 0, 0, TimeSpan.Zero));
         var second = await WalkerFor(connectionString).SeedAsync(
-            job!, [ExpiredContract, FrontMonthContract], CancellationToken.None);
+            job!, [ExpiredContract, FrontMonthContract], Today(), CancellationToken.None);
 
         Assert.True(second.SlicesInserted > 0);
         Assert.Equal(afterFirstScan + second.SlicesInserted, await CountRequestsAsync(connectionString));
         Assert.Equal(second.SlicesInserted, await CountRequestsAsync(connectionString, $"con_id = {FrontMonthContract.ConId}"));
+    }
+
+    // ---- the band in front of the frozen anchor ----------------------------------------------------
+
+    /// <summary>
+    /// An ES job as it looks after running for a while: its <c>target_to</c> was frozen on the day the
+    /// row was created and has not moved since, which is the whole premise of the defect below.
+    /// </summary>
+    private static BackfillJobDefinition AgedEsDefinition(DateTimeOffset anchor) => new(
+        EsContractWalker.JobName, BackfillJobKinds.Historical, InstrumentId: 6, "ES", "TRADES", "1 min",
+        UseRth: false, anchor.AddDays(-3), anchor, Priority: 60);
+
+    private static async Task<DateTimeOffset?> NewestRequestAsync(string connectionString)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+
+        await using var command = new NpgsqlCommand(
+            "SELECT max(end_time_utc) FROM research.backfill_requests", connection);
+
+        await using var reader = await command.ExecuteReaderAsync();
+
+        return await reader.ReadAsync() && !reader.IsDBNull(0) ? reader.GetFieldValue<DateTimeOffset>(0) : null;
+    }
+
+    [Fact]
+    public async Task The_newest_planned_slice_advances_past_the_frozen_anchor_as_days_pass()
+    {
+        // THE defect, end to end and measured on the table the claim is about. The ES job's
+        // target_to is fixed at its creation day; every contract was clamped to it; PlanForward — the
+        // fix that closed this band for SPX/SPY/VIX — has exactly one call site, in a planner that
+        // returns early for a NULL-conId job, which is precisely this one. So the newest ES slice
+        // ever planned ended on creation day, no top-up job covers ES, and the band nothing requested
+        // widened by a day for every day the platform ran. Every planned slice succeeded throughout,
+        // so the job reported complete at 100%.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var store = StoreFor(connectionString);
+
+        var today = Today();
+        var anchor = today.AddDays(-400);
+        var stillListing = new EsContractCandidate(495512563, DateOnly.FromDateTime(today.AddDays(60).UtcDateTime));
+
+        await SeedHeadAsync(store, stillListing.ConId, anchor.AddDays(-2));
+
+        var job = await store.EnsureJobAsync(AgedEsDefinition(anchor), conId: null, CancellationToken.None);
+        Assert.Equal(anchor, job!.TargetTo.ToUniversalTime());
+
+        var first = await WalkerFor(connectionString).SeedAsync(job, [stillListing], today, CancellationToken.None);
+
+        // The detector first, then the arithmetic: with the band unplanned these two are what fire,
+        // and asserting them ahead of the values keeps the negative control legible about WHICH half
+        // of the fix a regression broke.
+        Assert.True(first.ForwardCoverageComplete);
+        Assert.True(first.PlanningComplete);
+
+        Assert.Equal(today, first.NewestPlannedEndUtc);
+        Assert.Equal(today, await NewestRequestAsync(connectionString));
+        Assert.Equal(400L, await CountRequestsAsync(connectionString, $"end_time_utc > '{anchor:O}'"));
+
+        // Same day, second scan: the forward band is anchored on a floored UTC midnight, so a rerun
+        // still costs zero rows. Asserted on backfill_requests, never on bars, for the reason this
+        // file's remarks give.
+        var rerun = await WalkerFor(connectionString).SeedAsync(job, [stillListing], today.AddHours(17), CancellationToken.None);
+
+        Assert.Equal(0, rerun.SlicesInserted);
+        Assert.True(rerun.PlanningComplete);
+
+        // ...and the next day adds exactly one day.
+        var tomorrow = await WalkerFor(connectionString).SeedAsync(
+            job, [stillListing], today.AddDays(1).AddHours(6), CancellationToken.None);
+
+        Assert.Equal(1, tomorrow.SlicesInserted);
+        Assert.Equal(today.AddDays(1), tomorrow.NewestPlannedEndUtc);
+    }
+
+    [Fact]
+    public async Task A_job_whose_rows_stop_at_the_anchor_is_never_reported_complete()
+    {
+        // The invisibility half, pinned separately from the fix. Even with every planned slice
+        // settled — the state that reads as 100% and 'complete' on GET /research/backfill — a job
+        // whose newest request row does not reach the present must stay open and say so. This is the
+        // negative claim ("nothing after the anchor went unrequested"), measured on
+        // research.backfill_requests via BackfillStore.GetNewestPlannedEndAsync, and it is the only
+        // alarm there is: GapDetector refuses a NULL-conId job outright and reports one unchanging
+        // 'no-job-audited-it' span for it whether the job is healthy or a year behind.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var store = StoreFor(connectionString);
+
+        var today = Today();
+        var anchor = today.AddDays(-400);
+        var stillListing = new EsContractCandidate(495512563, DateOnly.FromDateTime(today.AddDays(60).UtcDateTime));
+
+        await SeedHeadAsync(store, stillListing.ConId, anchor.AddDays(-2));
+
+        var job = await store.EnsureJobAsync(AgedEsDefinition(anchor), conId: null, CancellationToken.None);
+        await WalkerFor(connectionString).SeedAsync(job!, [stillListing], today, CancellationToken.None);
+
+        // Reproduce the shipped state exactly: nothing was ever requested past the frozen anchor.
+        await ExecuteAsync(
+            connectionString,
+            $"DELETE FROM research.backfill_requests WHERE end_time_utc > '{anchor:O}'");
+        await ExecuteAsync(
+            connectionString, "UPDATE research.backfill_requests SET state = 'succeeded', bars_landed = 390");
+
+        Assert.True(await store.IsJobSettledAsync(job!.JobId, 5, CancellationToken.None));
+
+        // The measurement, on the table the claim is about.
+        Assert.Equal(anchor, await store.GetNewestPlannedEndAsync(job.JobId, CancellationToken.None));
+
+        // A forward shortfall is what makes the walker pass planningComplete: false, and that is what
+        // holds a fully-settled job open...
+        await store.RefreshJobStatusAsync(job.JobId, 5, planningComplete: false, CancellationToken.None);
+        Assert.Equal("running", await JobStatusAsync(connectionString, job.JobId));
+
+        // ...whereas without it these exact rows report the job finished, which is the state that
+        // shipped: 100% complete over a job that had stopped asking for anything a year earlier.
+        await store.RefreshJobStatusAsync(job.JobId, 5, planningComplete: true, CancellationToken.None);
+        Assert.Equal("complete", await JobStatusAsync(connectionString, job.JobId));
+
+        // And the walker, run against that state, both notices and repairs it in the same pass.
+        var repaired = await WalkerFor(connectionString).SeedAsync(job, [stillListing], today, CancellationToken.None);
+
+        Assert.Equal(400, repaired.SlicesInserted);
+        Assert.Equal(today, repaired.NewestPlannedEndUtc);
+    }
+
+    // ---- a definitive "no data" is not the same as "could not ask" ---------------------------------
+
+    [Fact]
+    public async Task A_contract_TWS_says_has_no_data_neither_holds_the_job_open_nor_is_re_probed()
+    {
+        // ResolveContractHeadAsync used to return null for BOTH a paced/disconnected probe and a
+        // definitive "there is no history here", and the caller counted every null as "could not plan
+        // it this pass". CME lists ES quarters years before they trade, so the steady state always
+        // includes a few of the second kind — which meant the count was never zero, the job could
+        // never reach 'complete', and the warning that count drives looked identical whether four
+        // contracts were listed-but-untraded (normal) or twenty-five had been paced away (the
+        // catastrophe it exists for). The verdict was also never cached, so each one cost a paced
+        // request every six hours forever.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var store = StoreFor(connectionString);
+
+        var handler = new HeadProbeHandler();
+        var gateway = new IbkrGatewayClient(
+            new HttpClient(handler) { BaseAddress = new Uri("http://localhost:5100") },
+            NullLogger<IbkrGatewayClient>.Instance);
+
+        var notYetTrading = new EsContractCandidate(
+            495512999, DateOnly.FromDateTime(Today().AddDays(700).UtcDateTime));
+
+        await SeedHeadAsync(store, ExpiredContract.ConId, new DateTimeOffset(2020, 6, 1, 0, 0, 0, TimeSpan.Zero));
+
+        var job = await store.EnsureJobAsync(EsDefinition(), conId: null, CancellationToken.None);
+
+        var first = await WalkerFor(connectionString, gateway).SeedAsync(
+            job!, [ExpiredContract, notYetTrading], Today(), CancellationToken.None);
+
+        Assert.Equal(1, handler.Calls);
+        Assert.Equal(1, first.NoDataContractCount);
+        Assert.Equal(0, first.UnplannedContractCount);
+        Assert.True(first.PlanningComplete);
+        Assert.Equal(0L, await CountRequestsAsync(connectionString, $"con_id = {notYetTrading.ConId}"));
+
+        // The job can therefore actually finish, which it could not before.
+        await ExecuteAsync(connectionString, "UPDATE research.backfill_requests SET state = 'succeeded', bars_landed = 1");
+        await WalkerFor(connectionString, gateway).SeedAsync(
+            job!, [ExpiredContract, notYetTrading], Today(), CancellationToken.None);
+
+        Assert.Equal("complete", await JobStatusAsync(connectionString, job!.JobId));
+
+        // ...and the second scan did not spend another paced request re-asking the same question.
+        Assert.Equal(1, handler.Calls);
+    }
+
+    [Fact]
+    public async Task A_probe_that_could_not_be_made_still_holds_the_job_open()
+    {
+        // The other half of the same distinction, and the one that must NOT regress: an unreachable
+        // gateway establishes nothing, so the contract goes back in the "ask again next scan" bucket
+        // rather than being written off as having no data. Nothing is cached, either — caching a
+        // verdict nobody reached would retire a contract on a network blip.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var store = StoreFor(connectionString);
+
+        await SeedHeadAsync(store, ExpiredContract.ConId, new DateTimeOffset(2020, 6, 1, 0, 0, 0, TimeSpan.Zero));
+
+        var job = await store.EnsureJobAsync(EsDefinition(), conId: null, CancellationToken.None);
+
+        // UnusedGateway has no base address, so the probe fails at the transport — Transient, which
+        // is 'unresolved', not 'no data'.
+        var result = await WalkerFor(connectionString).SeedAsync(
+            job!, [ExpiredContract, FrontMonthContract], Today(), CancellationToken.None);
+
+        Assert.Equal(1, result.UnplannedContractCount);
+        Assert.Equal(0, result.NoDataContractCount);
+        Assert.False(result.PlanningComplete);
+
+        Assert.Equal(
+            0L,
+            await CountProbesAsync(connectionString, $"head_timestamp:{EsContractWalker.JobName}:{FrontMonthContract.ConId}"));
+    }
+
+    private static async Task<long> CountProbesAsync(string connectionString, string probeKey)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+
+        await using var command = new NpgsqlCommand(
+            "SELECT count(*) FROM research.capability_probes WHERE probe_key = $1", connection);
+        command.Parameters.AddWithValue(probeKey);
+
+        return (long)(await command.ExecuteScalarAsync())!;
     }
 }

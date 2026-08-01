@@ -249,6 +249,12 @@ public sealed class IbkrClientWrapper(
             order.LmtPrice,
             orderState.Status ?? string.Empty,
             order.Account ?? string.Empty));
+
+        // The same callback also carries the order's permId, and for an order this process placed it
+        // is the earliest sighting of it — openOrder arrives ahead of the first orderStatus (verified
+        // live on the paper account). Routed to the tracked order as well as to the sweep, so the
+        // identifier reconciliation keys on is in hand before anything can go wrong.
+        orderTracker.ApplyOpenOrder(orderId, order.PermId);
     }
 
     public override void openOrderEnd() => orderTracker.CompleteOpenOrdersSweep();

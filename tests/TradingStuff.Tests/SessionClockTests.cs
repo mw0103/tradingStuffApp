@@ -18,8 +18,11 @@ namespace TradingStuff.Tests;
 /// <item>
 /// <c>docs/research/ibkr-data-capability-matrix.md</c> — probe-recorded, from a live 2026-07-31 TWS
 /// session: SPX <c>useRTH=0</c> bars start at 19:15 US/Central on the prior calendar day, and the
-/// SPX/SPXW GTH session runs 20:15-09:15 ET. Both halves of that (CT open, ET open) are asserted, so
-/// a wrong timezone cannot satisfy them simultaneously.
+/// SPX/SPXW GTH session runs 20:15-09:25 ET. Both halves of that (CT open, ET open) are asserted, so
+/// a wrong timezone cannot satisfy them simultaneously. The close was re-measured on 2026-08-01 —
+/// TWS reports <c>tradingHours</c> <c>1915-0825</c> CT for an SPXW contract and its last overnight
+/// 1-minute bar is stamped 08:24 CT — which moved it ten minutes later; see
+/// <see cref="ExchangeSessionScheduleTests"/>.
 /// </item>
 /// <item>
 /// Published exchange facts: NYSE 09:30-16:00 ET with a 13:00 ET half-day close; Cboe index options
@@ -209,7 +212,7 @@ public sealed class SessionClockTests
         var gth = Single(CboeGth, Date(2026, 7, 31), "GTH");
 
         Assert.Equal(Utc(2026, 7, 31, 0, 15), gth.OpenUtc);
-        Assert.Equal(Utc(2026, 7, 31, 13, 15), gth.CloseUtc);
+        Assert.Equal(Utc(2026, 7, 31, 13, 25), gth.CloseUtc);
         Assert.Equal(Date(2026, 7, 31), gth.TradingDate);
 
         var eastern = TimeZoneInfo.FindSystemTimeZoneById("America/New_York");
@@ -217,7 +220,7 @@ public sealed class SessionClockTests
             new DateTime(2026, 7, 30, 20, 15, 0),
             TimeZoneInfo.ConvertTimeFromUtc(gth.OpenUtc.UtcDateTime, eastern));
         Assert.Equal(
-            new DateTime(2026, 7, 31, 9, 15, 0),
+            new DateTime(2026, 7, 31, 9, 25, 0),
             TimeZoneInfo.ConvertTimeFromUtc(gth.CloseUtc.UtcDateTime, eastern));
 
         // The open is on the previous CALENDAR day in exchange-local terms; bucketing by local date
@@ -232,10 +235,10 @@ public sealed class SessionClockTests
     public void A_sunday_evening_gth_observation_belongs_to_mondays_trading_date()
     {
         // 2026-01-04 is a Sunday; 2026-01-05 the Monday. Cboe GTH for Monday opens Sunday 19:15 CST
-        // (UTC-6) = 2026-01-05 01:15Z and closes Monday 08:15 CST = 14:15Z.
+        // (UTC-6) = 2026-01-05 01:15Z and closes Monday 08:25 CST = 14:25Z.
         var gth = Single(CboeGth, Date(2026, 1, 5), "GTH");
         Assert.Equal(Utc(2026, 1, 5, 1, 15), gth.OpenUtc);
-        Assert.Equal(Utc(2026, 1, 5, 14, 15), gth.CloseUtc);
+        Assert.Equal(Utc(2026, 1, 5, 14, 25), gth.CloseUtc);
 
         // An instant at 19:30 CST Sunday: exchange-local date SUNDAY, trading date MONDAY.
         var sundayEvening = Utc(2026, 1, 5, 1, 30);
@@ -427,7 +430,7 @@ public sealed class SessionClockTests
         var gth = Single(CboeGth, Date(2025, 11, 28), "GTH");
         Assert.False(gth.IsHalfDay);
         Assert.Equal(Utc(2025, 11, 28, 1, 15), gth.OpenUtc);   // 2025-11-27 19:15 CST
-        Assert.Equal(Utc(2025, 11, 28, 14, 15), gth.CloseUtc); // 08:15 CST
+        Assert.Equal(Utc(2025, 11, 28, 14, 25), gth.CloseUtc); // 08:25 CST
     }
 
     [Fact]

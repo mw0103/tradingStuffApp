@@ -396,10 +396,18 @@ Roadmap Phase 2 (`docs/plans/ibkr-edge-research-roadmap.md`): the historical pla
   disagreement the ratio is `null` with status `sessions-out-of-sync`. This is the class (c)
   absent-row discipline applied to a denominator: a query over the table cannot emit a row for a
   *missing* session, and the missing row shrinks the denominator, so absence renders as health in
-  the one direction nobody checks. The clock is a pure function of the checked-in calendar data and
-  never reads the table, so it is a genuinely independent witness. A weekend now reports
-  `no-session-in-window` with no ratio rather than a fabricated 0 % — migration 006's lesson, that a
-  permanently-red gate is a gate nobody reads, applied a second time.
+  the one direction nobody checks. A weekend now reports `no-session-in-window` with no ratio rather
+  than a fabricated 0 % — migration 006's lesson, that a permanently-red gate is a gate nobody reads,
+  applied a second time.
+  **CORRECTION (2026-08-01):** this entry originally called the clock "a genuinely independent
+  witness". That was wrong and is retracted. `SessionGenerator` is registered as a singleton, and
+  both `ISessionClock` and `SessionCalendarService` resolve the same instance *including its
+  memoisation cache* — so the two sides of the comparison are one function call over one cached
+  result. It detects write drift (a stale table, a partial sync, a hand-edited row) and cannot detect
+  a wrong calendar. The Phase 1+2 review found the instantiation: for `CME_ES` on Thanksgiving 2025
+  both sides were empty, `Matches` returned true, and coverage reported `measured` over a window that
+  omitted 1,140 real minutes. The reconciliation passed *because* both sides inherited the same
+  defect. The claim is now stated accurately in `CoverageMonitor`'s own remarks.
 - **`GET /research/sessions`** — generated vs persisted rows side by side with an `in-sync` /
   `missing` / `mismatched` / `phantom` state per row, so the calendar everything downstream is
   validated against can itself be checked.
@@ -754,6 +762,114 @@ its slot; reusing the same request id is what works) in place against anyone re-
 the plausible-but-wrong cancel-then-reissue approach. Still open, unchanged: the ExecutionService
 cancel path and the multi-lot BAG semantics pin both need a live order round trip, which no test in
 this run exercises.
+
+### Phase 1+2 adversarial review — 4 criticals, all reproduced (2026-08-01)
+
+Five Opus/high lenses over the ~9,100 lines of Phase 1 and 2 code, deliberately **not** organised per
+component — both earlier passes were, and repeating that would mostly re-find what was already fixed.
+The lenses were: cross-subsystem seams, **this week's fix diffs reviewed as new code**, split-path
+lifetimes (class a), negative claims (class c), and the session calendar as ground truth (class b).
+Ten fix agents, all Opus/high per the class overrides.
+
+Every critical was **reproduced**, not argued — two by executing against the real classes, two
+against live TWS data. Where two lenses disagreed, the one that ran the code was right: the seams
+lens read the lease lifetime carefully and judged it sound; the lifetime lens ran it and found a
+line-budget leak.
+
+**CRITICAL — the 54-node grid collapsed onto ~4 contracts per DTE bucket.** `ChainWindow = 20` is a
+half-width in *strikes* (41 strikes ≈ ±100 points at SPX 7440) while node targets are *moneyness*
+(±2.5 % … −15 %, i.e. ±186 to −1,116 points). Every non-ATM target fell outside the requested window
+and an unbounded `OrderBy(|strike − target|).FirstOrDefault()` clamped them all to the window edge:
+three call roles onto one strike, four put roles onto another. 54 roles → ~24 distinct conIds, with
+~30 of the 80 research lines spent double-subscribing contracts already recorded. Coverage reported
+all 54 healthy, because each role *was* pointing at a live, well-recorded contract — the wrong one.
+**The volatility smile the platform exists to record was never being recorded.**
+
+Fixing it uncovered a third layer neither lens found: `reqSecDefOptParams` returns the strike **union
+across every expiration** in the trading class, so simply widening the window would have produced
+*phantom* contracts. Proven live — `SPXW 2026-08-06 P 6620` is a union member and returns error 200
+(no security definition) while 6625 resolves; per-expiration ladders that day were 238 / 502 / 70
+strikes. The chain is now sourced from one `reqContractDetails` per expiration (the real ladder, with
+conIds, which it caches — a selector pass costs **6 paced requests instead of 60**), and a node's
+target must be *bracketed* by listed strikes on both sides. An edge clamp can never satisfy bracketing
+at any window width or increment, so the collapse cannot silently recur even if every constant is
+later mistuned. **Verified live: 45 assigned nodes, 45 distinct conIds, max strike deviation 0.0075 %.**
+
+**CRITICAL — coverage was structurally blind to it.** The expected set was built *from*
+`node_assignments`, not from the 54-row `option_nodes` registry, so a role that was never assigned
+produced no row and its absence *raised* the unweighted mean. Reproduced: 53 of 54 roles recording
+nothing reported **100 %**, against 1.85 % for the identical outage with the assignments present.
+The two defects are one failure from both ends — selection silently broke the surface, and the one
+report that would catch it could not see the gap. Now enumerated from the registry via LEFT JOIN,
+with the mean's denominator being the registry itself, so removing an assignment can never raise the
+number. **Verified live: 54 perNode rows, 9 unassigned ones present and visible.**
+
+**CRITICAL — `CME_ES` emitted no session at all on holidays Globex actually trades.** A `US_MARKET`
+holiday made the whole date non-trading, so Thanksgiving 2025 (1,140 real ES bars), July 4 2025
+(1,140), MLK 2026 (1,140) and Good Friday 2026 (915) produced nothing — and `TradingDateOf`
+attributed every one of those bars to the *next* trading date. Coverage excluded them from numerator
+and denominator alike, reporting 100 % over a day it never measured. Fixed with a `partialSessionSets`
+concept: 39 entries, 30 measured from `reqHistoricalData(whatToShow="SCHEDULE")` against live TWS and
+9 explicitly projected as `unverified`. Two findings worth keeping: **Good Friday is not a rule**
+(CME was shut in 2024/2025, open to 08:15 CT in 2023/2026 — the years it is the first Friday of a
+month, i.e. employment-report day), and **2025-01-09 was wrongly a closure** — Globex traded to
+08:30 CT. Christmas and New Year are genuine closures, and Dec 31 is a full 16:00 session.
+
+**CRITICAL — a lease granted across a reconnect leaked the entire research line budget.**
+`GrantAsync`'s epoch check fired a full replay pass with no ledger reset, while `TryPublishIssued`
+dropped the displaced `LineLease` on the documented assumption that "a republish only happens on a
+replay, and by then the ledger has already been zeroed". Reproduced at production scale: 57 leases
+in, 80 research lines consumed, and 57 still held after releasing all 58. **This was introduced by a
+Phase 2 fix**, and the same false premise was written a second time in `ForgetLineLease` — now
+deleted. Live-verified 3/3 after the fix: every subscribe paired to an unsubscribe by exact ticker id.
+
+**Also fixed:** SPX index measured against the SPX *option* session (405 vs the real 390 minutes, so
+100 % of SPX RTH sessions reported a permanent 15-bar shortfall); Cboe index GTH closing ten minutes
+early (780 → 790); `PlanForward` added to only one of two planners, leaving ES stopping at its frozen
+anchor — *the exact defect its own commit claimed to fix*; `GapReport.Series` computed from the
+`jobId`-filtered subset, so a single-job query declared a whole series reconciled; a `Checked` job
+laundering its own unaudited window into the audited set; the recorder discarding up to 55,000
+buffered observations on every graceful shutdown; a `buffer_overflow` gap that only a later enqueue
+could close; an unreachable gateway at heartbeat time faulting `RecorderOrchestrator` and stopping the
+whole host under the default `StopHost`; migration 010's checksum baseline *blessing* an
+already-diverged database rather than detecting it; `MigrationHealthCheck` written, tested, and
+registered nowhere; and `ApplyError` losing permId on every rejected or cancelled order.
+
+**`CBOE_VIX_GTH` is now written**, reversing a standing decision recorded above. The original refusal
+("one day's observed bars are not a published schedule") was right on the evidence then available;
+`contractDetails` reporting `0215-0815` + `0830-1600` is the venue's schedule as the provider
+distributes it, which is a different class of evidence. `CBOE_VIX_RTH` carries four dated rows
+tracking three real schedule changes, cross-checked against a bar-count change landing on exactly the
+right weekend. VIX no longer carries an `Unmodelled` window, so the permanently-red series flag is gone.
+
+**`selector_version` 1 → 2 is a data-provenance boundary.** Every `node_assignments` row written
+before 2026-08-01 came from the collapsing selector and describes a grid that was not what it claimed.
+Phase 4's study identity must treat version-1 tenures as suspect rather than as history.
+
+**Verification discipline — six false-green tests caught, three by agents in their own work.** A gap
+suite with no positive `Reconciled == true` control (a fix auditing nothing would have passed
+everything); a partition-isolation test that stopped isolating once the horizon migration pre-created
+its poisoned date; a `WaitUntilAsync` whose return value was discarded, so it passed with zero rows
+persisted; an `openOrder` test that called the tracker directly and passed with the callback wiring
+deleted; a migration test asserting a phrase its own fixture filename supplied; and a test whose first
+attempt passed at the wrong place because `HttpClient` buffers response content. None would have been
+caught by reading. **Reintroduce-the-defect is now the project standard and belongs in CLAUDE.md.**
+
+**Integrated state:** 783 unit / 143 `RequiresPostgres` / 10 `RequiresTws`, all green together.
+Migrations 001–014 apply clean with zero unverified baselines. Order-safety invariants re-verified
+after ten concurrent agents: one `placeOrder` call site, no test reaches it, `AllowLiveTrading` false
+everywhere, DU-prefix check intact.
+
+**Known, not fixed.** `RecorderOrchestrator` races migrations on a cold start (queries
+`option_nodes` before 003 applies) — it now logs and continues rather than faulting the host, and the
+next pass recovers, but it is the same class `PartitionMaintainer` fixed structurally via the schema
+horizon. SPY has **570 minutes a day of real extended-hours data** (04:00–19:59 ET) outside every
+modelled session, latent only because both shipped SPY jobs are `useRth=true`; an `NYSE_EXTENDED`
+calendar is the complete fix. The 90DTE bucket is refused as `duplicate-con-id` until an SPX
+expiration enters its window (~5 days) — correct behaviour, but it means 9 roles record nothing
+meanwhile. ES `liquidHours` is 45 minutes longer than the modelled RTH row (under-states, safe
+direction). No CME partial entries before 2022-11-24, because IBKR reports earlier holidays as full
+sessions, which is demonstrably wrong for Thanksgiving 2021 and unresolvable from available bars.
 
 ## Left
 

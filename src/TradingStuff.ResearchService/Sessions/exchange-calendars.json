@@ -1,6 +1,6 @@
 {
-  "generatorVersion": 1,
-  "revision": "2026-07-31",
+  "generatorVersion": 2,
+  "revision": "2026-08-01",
   "knownGoodThrough": "2026-12-31",
   "notes": [
     "AUDITABLE SOURCE OF TRUTH for every exchange session this platform generates. Downstream code",
@@ -13,14 +13,46 @@
     "(nth-weekday, fixed-date-with-weekend-observance, Good Friday from the Gregorian Easter",
     "computation). EVERYTHING an exchange decided rather than derived is data: unscheduled closures",
     "(9/11, Hurricane Sandy, national days of mourning), unscheduled early closes, the year a holiday",
-    "entered the calendar (MLK 1998, Juneteenth 2022), and every early-close wall-clock time. A purely",
-    "rule-based generator invents sessions on days the market was shut; that is the specific defect",
-    "this split exists to prevent.",
+    "entered the calendar (MLK 1998, Juneteenth 2022), every early-close wall-clock time, and — added",
+    "2026-08-01 — every date a venue trades a SHORTENED session on a day the holiday rules say it is",
+    "shut (`partialSessionSets`). A purely rule-based generator invents sessions on days the market",
+    "was shut AND deletes sessions on days it was open; this split exists to prevent both.",
     "",
     "CONFIDENCE. Every unscheduled entry carries a `confidence`. 'high' = widely documented and",
-    "cross-checkable; 'medium' = documented but the venue-by-venue detail is inferred; 'unverified' =",
-    "believed correct but NOT confirmed against a published exchange calendar — grep for it and check",
-    "it before trusting any study whose window includes that date.",
+    "cross-checkable, or measured directly off the wire; 'medium' = documented but the venue-by-venue",
+    "detail is inferred; 'unverified' = believed correct but NOT confirmed against a published exchange",
+    "calendar — grep for it and check it before trusting any study whose window includes that date.",
+    "",
+    "PARTIAL SESSIONS. A `partialSessionSets` entry names a date the venue's holiday rules (or its",
+    "closure set) say it is SHUT, but on which it in fact traded a shortened session ending at `close`.",
+    "Only the session labels in `sessions` are generated for that date; every other session template on",
+    "the calendar is suppressed. This is the only mechanism that can turn a rule-derived holiday back",
+    "into a trading date, and it is per-date DATA on purpose: CME equity index trades a shortened",
+    "session on most US holidays, is fully shut on Christmas and New Year, and on Good Friday does one",
+    "or the other depending on whether the monthly employment report falls that day — no rule expresses",
+    "that. A partial-session entry on a date that is NOT otherwise closed is rejected at load time, so a",
+    "mis-projected future holiday date fails loudly instead of inventing a session.",
+    "",
+    "TRADING-DATE ATTRIBUTION for a partial session: it belongs to the trading date it ENDS on, i.e.",
+    "the holiday itself. IBKR's own schedule feed rolls these fragments forward onto the NEXT trading",
+    "date's refDate (it did so for 2026-07-03 and did not for 2025-01-20 — its convention changed",
+    "during 2025). This platform cannot follow that: two sessions would then share one (calendar,",
+    "trading date, label), which research.sessions forbids, and an ES bar at 09:00 CT on Thanksgiving",
+    "would be attributed to the Friday. The date a session ends on is the date it belongs to.",
+    "",
+    "SESSION TEMPLATES MAY BE DATED. A session row can carry `effectiveFrom`/`effectiveTo` when a venue",
+    "genuinely changed a session's hours (the VIX index day leg has done so three times). Rows sharing",
+    "a label must tile the calendar's whole lifetime with no gap and no overlap — enforced at load time",
+    "— so exactly one row applies to every trading date and the (calendar, trading date, label) key",
+    "stays unique.",
+    "",
+    "HOW THE 2026-08-01 ENTRIES WERE ESTABLISHED. Everything marked 'high' below with a",
+    "`source: tws-schedule` note came from IBKR's own published trading schedule, read off a live",
+    "paper TWS socket (server version 223) with `reqHistoricalData(whatToShow=\"SCHEDULE\")`, which",
+    "returns one (start, end, refDate) triple per session in the contract's own time zone. That is the",
+    "venue schedule as the data provider distributes it, not an inference from where bars happen to",
+    "stop; where a claim could be cross-checked against actual 1-minute bar spans it was, and the two",
+    "agreed. Requests were read-only.",
     "",
     "BUMP generatorVersion ON ANY CHANGE to this file. SessionGenerator.GeneratorVersion must match it",
     "(a unit test enforces this), and research.sessions.generator_version records it per row, so a",
@@ -113,8 +145,18 @@
       { "date": "2001-09-14", "reason": "September 11 attacks (day 4 of 4)", "confidence": "medium" },
       { "date": "2004-06-11", "reason": "National day of mourning — Ronald Reagan", "confidence": "medium" },
       { "date": "2007-01-02", "reason": "National day of mourning — Gerald Ford", "confidence": "medium" },
-      { "date": "2018-12-05", "reason": "National day of mourning — George H. W. Bush", "confidence": "unverified" },
-      { "date": "2025-01-09", "reason": "National day of mourning — Jimmy Carter", "confidence": "unverified" }
+      {
+        "date": "2025-01-09",
+        "reason": "National day of mourning — Jimmy Carter",
+        "confidence": "high",
+        "note": "OVERRIDDEN by partialSessionSets.CME_EQUITY_INDEX, which records that Globex equity index traded 17:00 CT the prior evening to 08:30 CT rather than closing. The two coexist the same way a holiday rule coexists with a partial session: the closure records that the day was a market-wide closure for this venue, the partial entry records the shortened session it traded anyway. Removing this row instead would defeat the load-time guard that refuses a partial session on a day the venue was otherwise open — the guard that makes the hand-projected 2027 holiday dates safe to ship."
+      },
+      {
+        "date": "2018-12-05",
+        "reason": "National day of mourning — George H. W. Bush",
+        "confidence": "unverified",
+        "note": "PROBABLY WRONG, and left in deliberately. Its 2025 analogue is now measured: on the Jimmy Carter day of mourning (2025-01-09) CME equity index did NOT close — it traded 17:00 CT the prior evening through 08:30 CT and is recorded in partialSessionSets, not here. So this 2018 entry is more likely a shortened session too. Nothing was observed for 2018 (IBKR's published schedule for ES only reaches 2021, and only distinguishes shortened sessions from 2022-11-24 — see the CME_EQUITY_INDEX notes), and an omitted session under-states a denominator rather than manufacturing one, so it stays a closure until somebody can measure it."
+      }
     ]
   },
 
@@ -130,6 +172,68 @@
     "CME_UNSCHEDULED": []
   },
 
+  "partialSessionSets": {
+    "CME_EQUITY_INDEX": [
+      { "date": "2022-11-24", "close": "12:00", "sessions": ["GTH"], "reason": "Thanksgiving Day — Globex equity index trades 17:00 CT the prior evening to 12:00 CT", "confidence": "high", "note": "source: tws-schedule" },
+      { "date": "2023-01-16", "close": "12:00", "sessions": ["GTH"], "reason": "Martin Luther King Jr. Day — shortened Globex session", "confidence": "high", "note": "source: tws-schedule" },
+      { "date": "2023-02-20", "close": "12:00", "sessions": ["GTH"], "reason": "Washington's Birthday — shortened Globex session", "confidence": "high", "note": "source: tws-schedule" },
+      {
+        "date": "2023-04-07",
+        "close": "08:15",
+        "sessions": ["GTH"],
+        "reason": "Good Friday — CME equity index holds a shortened session when the monthly employment report falls on Good Friday",
+        "confidence": "high",
+        "note": "source: tws-schedule. Good Friday is NOT a rule here: CME was fully shut on 2024-03-29 and 2025-04-18 (no entry for either) and open to 08:15 CT on 2023-04-07 and 2026-04-03. Both open years are the ones where Good Friday is the first Friday of a month, i.e. an employment-report release day. Enter each year from CME's published calendar; do not project it."
+      },
+      { "date": "2023-05-29", "close": "12:00", "sessions": ["GTH"], "reason": "Memorial Day — shortened Globex session", "confidence": "high", "note": "source: tws-schedule" },
+      { "date": "2023-06-19", "close": "12:00", "sessions": ["GTH"], "reason": "Juneteenth — shortened Globex session", "confidence": "high", "note": "source: tws-schedule" },
+      { "date": "2023-07-04", "close": "12:00", "sessions": ["GTH"], "reason": "Independence Day — shortened Globex session", "confidence": "high", "note": "source: tws-schedule" },
+      { "date": "2023-09-04", "close": "12:00", "sessions": ["GTH"], "reason": "Labor Day — shortened Globex session", "confidence": "high", "note": "source: tws-schedule" },
+      { "date": "2023-11-23", "close": "12:00", "sessions": ["GTH"], "reason": "Thanksgiving Day — shortened Globex session", "confidence": "high", "note": "source: tws-schedule" },
+
+      { "date": "2024-01-15", "close": "12:00", "sessions": ["GTH"], "reason": "Martin Luther King Jr. Day — shortened Globex session", "confidence": "high", "note": "source: tws-schedule" },
+      { "date": "2024-02-19", "close": "12:00", "sessions": ["GTH"], "reason": "Washington's Birthday — shortened Globex session", "confidence": "high", "note": "source: tws-schedule" },
+      { "date": "2024-05-27", "close": "12:00", "sessions": ["GTH"], "reason": "Memorial Day — shortened Globex session", "confidence": "high", "note": "source: tws-schedule" },
+      { "date": "2024-06-19", "close": "12:00", "sessions": ["GTH"], "reason": "Juneteenth — shortened Globex session", "confidence": "high", "note": "source: tws-schedule" },
+      { "date": "2024-07-04", "close": "12:00", "sessions": ["GTH"], "reason": "Independence Day — shortened Globex session", "confidence": "high", "note": "source: tws-schedule" },
+      { "date": "2024-09-02", "close": "12:00", "sessions": ["GTH"], "reason": "Labor Day — shortened Globex session", "confidence": "high", "note": "source: tws-schedule" },
+      { "date": "2024-11-28", "close": "12:00", "sessions": ["GTH"], "reason": "Thanksgiving Day — shortened Globex session", "confidence": "high", "note": "source: tws-schedule" },
+
+      {
+        "date": "2025-01-09",
+        "close": "08:30",
+        "sessions": ["GTH"],
+        "reason": "National day of mourning — Jimmy Carter. CME equity index traded 17:00 CT the prior evening to 08:30 CT; it did NOT close",
+        "confidence": "high",
+        "note": "source: tws-schedule. This date sat in closureSets.CME_UNSCHEDULED marked 'unverified' and nothing else; that was wrong, and NYSE and Cboe were shut while Globex was not. The closure row stays (see its own note) and this entry overrides it — the same relationship a partial session has with the holiday rule that would otherwise close the day."
+      },
+      { "date": "2025-01-20", "close": "12:00", "sessions": ["GTH"], "reason": "Martin Luther King Jr. Day — shortened Globex session", "confidence": "high", "note": "source: tws-schedule" },
+      { "date": "2025-02-17", "close": "12:00", "sessions": ["GTH"], "reason": "Washington's Birthday — shortened Globex session", "confidence": "high", "note": "source: tws-schedule" },
+      { "date": "2025-05-26", "close": "12:00", "sessions": ["GTH"], "reason": "Memorial Day — shortened Globex session", "confidence": "high", "note": "source: tws-schedule" },
+      { "date": "2025-06-19", "close": "12:00", "sessions": ["GTH"], "reason": "Juneteenth — shortened Globex session", "confidence": "high", "note": "source: tws-schedule" },
+      { "date": "2025-07-04", "close": "12:00", "sessions": ["GTH"], "reason": "Independence Day — shortened Globex session", "confidence": "high", "note": "source: tws-schedule" },
+      { "date": "2025-09-01", "close": "12:00", "sessions": ["GTH"], "reason": "Labor Day — shortened Globex session", "confidence": "high", "note": "source: tws-schedule" },
+      { "date": "2025-11-27", "close": "12:00", "sessions": ["GTH"], "reason": "Thanksgiving Day — shortened Globex session", "confidence": "high", "note": "source: tws-schedule" },
+
+      { "date": "2026-01-19", "close": "12:00", "sessions": ["GTH"], "reason": "Martin Luther King Jr. Day — shortened Globex session", "confidence": "high", "note": "source: tws-schedule" },
+      { "date": "2026-02-16", "close": "12:00", "sessions": ["GTH"], "reason": "Washington's Birthday — shortened Globex session", "confidence": "high", "note": "source: tws-schedule" },
+      { "date": "2026-04-03", "close": "08:15", "sessions": ["GTH"], "reason": "Good Friday — employment-report session; Globex equity index trades to 08:15 CT", "confidence": "high", "note": "source: tws-schedule" },
+      { "date": "2026-05-25", "close": "12:00", "sessions": ["GTH"], "reason": "Memorial Day — shortened Globex session", "confidence": "high", "note": "source: tws-schedule" },
+      { "date": "2026-06-19", "close": "12:00", "sessions": ["GTH"], "reason": "Juneteenth — shortened Globex session", "confidence": "high", "note": "source: tws-schedule" },
+      { "date": "2026-07-03", "close": "12:00", "sessions": ["GTH"], "reason": "Independence Day (observed — July 4 2026 is a Saturday) — shortened Globex session", "confidence": "high", "note": "source: tws-schedule" },
+
+      { "date": "2026-09-07", "close": "12:00", "sessions": ["GTH"], "reason": "Labor Day — shortened Globex session", "confidence": "unverified", "note": "PROJECTED, not observed. Past the 2026-07-31 end of the measured schedule; the 12:00 CT close is what every non-Christmas, non-New-Year, non-Good-Friday US holiday from 2022-11-24 to 2026-07-31 did without exception. Re-measure and promote to 'high' once the date is in the past." },
+      { "date": "2026-11-26", "close": "12:00", "sessions": ["GTH"], "reason": "Thanksgiving Day — shortened Globex session", "confidence": "unverified", "note": "PROJECTED, not observed — see 2026-09-07." },
+      { "date": "2027-01-18", "close": "12:00", "sessions": ["GTH"], "reason": "Martin Luther King Jr. Day — shortened Globex session", "confidence": "unverified", "note": "PROJECTED, not observed — see 2026-09-07." },
+      { "date": "2027-02-15", "close": "12:00", "sessions": ["GTH"], "reason": "Washington's Birthday — shortened Globex session", "confidence": "unverified", "note": "PROJECTED, not observed — see 2026-09-07." },
+      { "date": "2027-05-31", "close": "12:00", "sessions": ["GTH"], "reason": "Memorial Day — shortened Globex session", "confidence": "unverified", "note": "PROJECTED, not observed — see 2026-09-07." },
+      { "date": "2027-06-18", "close": "12:00", "sessions": ["GTH"], "reason": "Juneteenth (observed — June 19 2027 is a Saturday) — shortened Globex session", "confidence": "unverified", "note": "PROJECTED, not observed — see 2026-09-07." },
+      { "date": "2027-07-05", "close": "12:00", "sessions": ["GTH"], "reason": "Independence Day (observed — July 4 2027 is a Sunday) — shortened Globex session", "confidence": "unverified", "note": "PROJECTED, not observed — see 2026-09-07." },
+      { "date": "2027-09-06", "close": "12:00", "sessions": ["GTH"], "reason": "Labor Day — shortened Globex session", "confidence": "unverified", "note": "PROJECTED, not observed — see 2026-09-07." },
+      { "date": "2027-11-25", "close": "12:00", "sessions": ["GTH"], "reason": "Thanksgiving Day — shortened Globex session", "confidence": "unverified", "note": "PROJECTED, not observed — see 2026-09-07." }
+    ]
+  },
+
   "venues": {
     "NYSE": {
       "holidayRuleSet": "US_MARKET",
@@ -142,14 +246,15 @@
       "earlyCloseRuleSet": "US_MARKET",
       "closureSet": "US_EQUITY_UNSCHEDULED",
       "unscheduledEarlyCloseSet": "CME_UNSCHEDULED",
-      "note": "Cboe follows the NYSE holiday and unscheduled-closure schedule, including both Hurricane Sandy days. The 1997-10-27 circuit-breaker close applied to Cboe too, but the exact Cboe index-option halt time is not recorded here, so no unscheduled early close is asserted — an unasserted early close leaves a normal-length session, which shows up as a visible low-coverage afternoon rather than as silently discarded data."
+      "note": "Cboe follows the NYSE holiday and unscheduled-closure schedule, including both Hurricane Sandy days. The 1997-10-27 circuit-breaker close applied to Cboe too, but the exact Cboe index-option halt time is not recorded here, so no unscheduled early close is asserted — an unasserted early close leaves a normal-length session, which shows up as a visible low-coverage afternoon rather than as silently discarded data. No partialSessionSet: Cboe is genuinely shut on the US holidays CME trades short. Measured 2026-08-01 — the SPX and VIX index schedules carry exactly 752 sessions over 2023-08-02..2026-07-31, the same count as NYSE trading days, with no holiday session among them."
     },
     "CME": {
       "holidayRuleSet": "US_MARKET",
       "earlyCloseRuleSet": "US_MARKET",
       "closureSet": "CME_UNSCHEDULED",
       "unscheduledEarlyCloseSet": "CME_UNSCHEDULED",
-      "note": "Differs from NYSE/Cboe on Hurricane Sandy: CME's electronic markets stayed open on 2012-10-29 and 2012-10-30 while the NYSE and Cboe were shut, so those dates are absent from CME_UNSCHEDULED. The 1996 blizzard entry is likewise absent (a New York weather closure). Day-of-mourning handling for CME equity index is the least certain part of this file — see the per-entry confidence flags."
+      "partialSessionSet": "CME_EQUITY_INDEX",
+      "note": "Differs from NYSE/Cboe on Hurricane Sandy: CME's electronic markets stayed open on 2012-10-29 and 2012-10-30 while the NYSE and Cboe were shut, so those dates are absent from CME_UNSCHEDULED. The 1996 blizzard entry is likewise absent (a New York weather closure). It also differs on nearly every US holiday: Globex equity index trades a SHORTENED session rather than closing, which partialSessionSet now carries. Only Christmas Day and New Year's Day are consistently full closures (measured: Dec 24 2024/2025 close 12:15 CT with no evening reopen, and the next session starts 17:00 CT on Christmas Day itself; Dec 31 is a full 16:00 CT session with no evening reopen, and the next starts 17:00 CT on Jan 1)."
     }
   },
 
@@ -177,7 +282,7 @@
       "venue": "CBOE",
       "timeZone": "America/Chicago",
       "effectiveFrom": "1993-01-01",
-      "description": "Cboe index options regular session (SPX, SPXW, VIX). Closes 15:15 CT = 16:15 ET — fifteen minutes after the cash equity close, on full and half days alike.",
+      "description": "Cboe index OPTION regular session (SPX, SPXW). Closes 15:15 CT = 16:15 ET — fifteen minutes after the cash equity close, on full and half days alike. This is the option session and nothing else: the SPX and VIX INDEX levels are computed on different schedules and have their own calendars (CBOE_SPX_RTH, CBOE_VIX_RTH). Using this key for an index level is the defect that made 100% of SPX index sessions report succeeded_but_absent.",
       "sessions": [
         {
           "label": "RTH",
@@ -195,19 +300,134 @@
       "venue": "CBOE",
       "timeZone": "America/Chicago",
       "effectiveFrom": "2022-11-21",
-      "description": "Cboe Global Trading Hours for SPX/SPXW/VIX options: 19:15 CT the PRIOR calendar day through 08:15 CT on the trading date (20:15-09:15 ET). effectiveFrom is the near-24x5 GTH expansion; before it no overnight index-option session existed, and generating one would manufacture sessions that never happened. The 19:15 CT open is runtime-verified — docs/research/ibkr-data-capability-matrix.md records useRTH=0 SPX bars starting 19:15 US/Central on the prior calendar day, and the 20:15-09:15 ET session in the pacing/limits section.",
+      "description": "Cboe Global Trading Hours for SPX/SPXW index OPTIONS: 19:15 CT the PRIOR calendar day through 08:25 CT on the trading date (20:15-09:25 ET). effectiveFrom is the near-24x5 GTH expansion; before it no overnight index-option session existed, and generating one would manufacture sessions that never happened. The 19:15 CT open is runtime-verified — docs/research/ibkr-data-capability-matrix.md records useRTH=0 SPX bars starting 19:15 US/Central on the prior calendar day, and the 20:15-09:15 ET session in the pacing/limits section.",
       "sessions": [
         {
           "label": "GTH",
           "openDayOffset": -1,
           "open": "19:15",
           "closeDayOffset": 0,
-          "close": "08:15",
+          "close": "08:25",
           "appliesEarlyClose": false,
-          "note": "appliesEarlyClose is false because a GTH session ENDS in the morning, before any afternoon early close could shorten it. An early close on trading date D truncates D's RTH, not D's GTH. Whether Cboe suppresses the overnight session on a holiday EVENING (which would remove the GTH session belonging to the next trading date) is not asserted here — see eveningSessionClosedOn."
+          "note": "The close was 08:15 until 2026-08-01 and that was wrong by ten minutes, so 13:15Z-13:25Z on every trading date carried real SPX option quotes belonging to no session. Measured two independent ways against live TWS: contractDetails for SPXW 260807C06400000 (conId 889088590) reports tradingHours '20260802:1915-20260803:0825', and a 1-minute BID_ASK useRTH=0 request for the same contract has its last overnight bar stamped 08:24 CT on both 2026-07-30 and 2026-07-31 (a 1-minute bar stamped 08:24 covers 08:24-08:25), followed by a six-minute break to the 08:30 CT regular open. appliesEarlyClose is false because a GTH session ENDS in the morning, before any afternoon early close could shorten it. An early close on trading date D truncates D's RTH, not D's GTH. Whether Cboe suppresses the overnight session on a holiday EVENING (which would remove the GTH session belonging to the next trading date) is not asserted here — see eveningSessionClosedOn."
         }
       ],
       "eveningSessionClosedOn": []
+    },
+    {
+      "key": "CBOE_SPX_RTH",
+      "venue": "CBOE",
+      "timeZone": "America/Chicago",
+      "effectiveFrom": "1993-01-01",
+      "description": "The SPX INDEX LEVEL dissemination window — the session SPX index bars actually land in, which is the US cash equity session and NOT the 15:15 CT option close. Measured 2026-08-01 off live TWS: contractDetails for SPX IND (conId 416904) reports tradingHours and liquidHours '0830-1500' US/Central, IBKR's published schedule returns 752 sessions of 08:30-15:00 CT over 2023-08-02..2026-07-31 with 08:30-12:00 CT on half days, and five consecutive useRTH=1 1-minute TRADES sessions returned exactly 390 bars each running 08:30..14:59 CT. There is NO overnight leg: a useRTH=0 '2 D' request returned 780 bars = 2 x 390, all inside the day window.",
+      "sessions": [
+        {
+          "label": "RTH",
+          "openDayOffset": 0,
+          "open": "08:30",
+          "closeDayOffset": 0,
+          "close": "15:15",
+          "earlyClose": "12:15",
+          "appliesEarlyClose": true,
+          "effectiveTo": "2013-03-10",
+          "note": "IBKR's published schedule reports the SPX index close as 15:15 CT from at least 2001-08-07 to 2013-03-08, then 15:00 CT from 2013-03-11 (the boundary falls on a weekend, so these two rows tile the calendar exactly). One exception inside this window is knowingly NOT modelled: 2011-03-28 alone is reported at 15:00 CT, with 15:15 either side of it. A single-day row for one date fifteen years ago is not worth the entry; the cost is a 15-minute over-expectation on that one date, which is the direction that can manufacture a gap, so it is named here rather than left to be discovered. This row is also what the platform assumed for ALL of history before 2026-08-01, so nothing regresses for dates before 2013. Half-day closes before 2011 are reported by IBKR as full sessions, which is a fill rather than a fact; 12:15 is carried over from CBOE_INDEX_RTH for that stretch."
+        },
+        {
+          "label": "RTH",
+          "openDayOffset": 0,
+          "open": "08:30",
+          "closeDayOffset": 0,
+          "close": "15:00",
+          "earlyClose": "12:00",
+          "appliesEarlyClose": true,
+          "effectiveFrom": "2013-03-11",
+          "note": "08:30-15:00 CT = 09:30-16:00 ET, i.e. exactly the NYSE cash session, and 12:00 CT = 13:00 ET on a half day, exactly the NYSE half day. Half-day closes measured at 12:00 CT on 2023-11-24, 2024-07-03, 2024-11-29, 2024-12-24, 2025-07-03, 2025-11-28 and 2025-12-24."
+        }
+      ]
+    },
+    {
+      "key": "CBOE_VIX_RTH",
+      "venue": "CBOE",
+      "timeZone": "America/Chicago",
+      "effectiveFrom": "1993-01-01",
+      "description": "The VIX INDEX LEVEL day session. Measured 2026-08-01 off live TWS: contractDetails for VIX IND (conId 13455763) reports tradingHours and liquidHours '0830-1600' US/Central for the day leg, and IBKR's published schedule gives the three historical shapes below. Cross-checked against real bars rather than trusted: a 1-minute TRADES useRTH=0 request returned 765 bars on 2022-04-21 and 2022-04-22 with the last at 15:14 CT, and 810 bars on 2022-04-25 and 2022-04-26 with the last at 15:59 CT — the schedule's 15:15 -> 16:00 change on exactly that weekend, seen independently in the data.",
+      "sessions": [
+        {
+          "label": "RTH",
+          "openDayOffset": 0,
+          "open": "08:30",
+          "closeDayOffset": 0,
+          "close": "15:15",
+          "earlyClose": "12:15",
+          "appliesEarlyClose": true,
+          "effectiveTo": "2011-03-27",
+          "note": "IBKR reports 08:30-15:15 CT continuously from at least 2001-08-07 to 2011-03-25. Identical to CBOE_INDEX_RTH, which is what VIX was measured against before 2026-08-01, so this row is exactly the previous behaviour."
+        },
+        {
+          "label": "RTH",
+          "openDayOffset": 0,
+          "open": "08:30",
+          "closeDayOffset": 0,
+          "close": "15:00",
+          "earlyClose": "12:00",
+          "appliesEarlyClose": true,
+          "effectiveFrom": "2011-03-28",
+          "effectiveTo": "2011-11-29",
+          "note": "A real 171-session interval in IBKR's published schedule, not a data artefact: the one half day inside it (2011-11-25) is reported at 12:00 CT, consistent with the 15:00 CT regular close, and the shape reverts on 2011-11-30. Modelled rather than skipped because skipping it would over-expect by 15 minutes on 171 sessions, which is the direction that manufactures gaps."
+        },
+        {
+          "label": "RTH",
+          "openDayOffset": 0,
+          "open": "08:30",
+          "closeDayOffset": 0,
+          "close": "15:15",
+          "earlyClose": "12:15",
+          "appliesEarlyClose": true,
+          "effectiveFrom": "2011-11-30",
+          "effectiveTo": "2022-04-24",
+          "note": "Half days measured at 12:15 CT throughout this window, from 2012-07-03 to 2021-11-26."
+        },
+        {
+          "label": "RTH",
+          "openDayOffset": 0,
+          "open": "08:30",
+          "closeDayOffset": 0,
+          "close": "16:00",
+          "earlyClose": "12:15",
+          "appliesEarlyClose": true,
+          "effectiveFrom": "2022-04-25",
+          "note": "The current shape, and the one that matters: 08:30-16:00 CT = 09:30-17:00 ET, 450 minutes, 45 minutes past the Cboe option close. Measured on the wire (810 bars/day = 360 overnight + 450 day; last day bar 15:59 CT). Half days STAY at 12:15 CT — measured on 2022-11-25, 2023-07-03, 2023-11-24, 2024-07-03, 2024-11-29, 2024-12-24, 2025-07-03, 2025-11-28 and 2025-12-24 — so the early close is NOT the regular close minus a fixed offset."
+        }
+      ]
+    },
+    {
+      "key": "CBOE_VIX_GTH",
+      "venue": "CBOE",
+      "timeZone": "America/Chicago",
+      "effectiveFrom": "2016-04-15",
+      "description": "The VIX INDEX LEVEL overnight session — 02:15 CT to 08:15 CT on the trading date's OWN calendar date, which is a completely different window from the 19:15-08:25 CT index-OPTION session in CBOE_INDEX_GTH. Expecting the option window over VIX index bars is the original cry-wolf defect InstrumentCalendars was created to fix; leaving it unmodelled instead left the VIX series permanently unreconciled, which is the same failure in the other direction. Measured 2026-08-01: contractDetails for VIX IND reports tradingHours and liquidHours '0215-0815' US/Central as a separate leg from '0830-1600', IBKR's published schedule returns one such leg on every one of the 752 trading dates over 2023-08-02..2026-07-31 (half days included, unshortened), and a useRTH=0 1-minute TRADES request returns 360 overnight bars running 02:15..08:14 CT. effectiveFrom is the first date IBKR's schedule reports the leg at all; nothing is asserted before it.",
+      "sessions": [
+        {
+          "label": "GTH",
+          "openDayOffset": 0,
+          "open": "02:00",
+          "closeDayOffset": 0,
+          "close": "08:15",
+          "appliesEarlyClose": false,
+          "effectiveTo": "2019-04-29",
+          "note": "The leg opened at 02:00 CT from 2016-04-15 to 2019-04-29 and at 02:15 CT from 2019-04-30. Both are IBKR's published schedule; the change is on consecutive trading days."
+        },
+        {
+          "label": "GTH",
+          "openDayOffset": 0,
+          "open": "02:15",
+          "closeDayOffset": 0,
+          "close": "08:15",
+          "appliesEarlyClose": false,
+          "effectiveFrom": "2019-04-30",
+          "note": "openDayOffset is 0, NOT -1: unlike Cboe's option GTH and the Globex day, the VIX overnight leg starts after midnight on its own trading date, so its trading date and its exchange-local calendar date are the same. appliesEarlyClose is false because the leg ends in the morning — and it is measured to run unshortened on half days, not merely assumed to."
+        }
+      ]
     },
     {
       "key": "CME_ES",
@@ -233,7 +453,8 @@
           "closeDayOffset": 0,
           "close": "15:15",
           "earlyClose": "12:15",
-          "appliesEarlyClose": true
+          "appliesEarlyClose": true,
+          "note": "IBKR reports ES liquidHours as 0830-1600 CT, 45 minutes longer than this row. Left at 15:15 CT — the published CME equity-index regular session — because it is deliberately under-stated rather than over-stated, and because ES's instrument mapping claims the GTH row too, which nests this one, so the union of expected minutes is identical either way. partialSessionSets never lists RTH: on a shortened holiday session there is no regular session, only the Globex fragment, and IBKR emits no daily bar for those dates either."
         }
       ],
       "eveningSessionClosedOn": []

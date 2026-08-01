@@ -78,6 +78,37 @@ public sealed record UnscheduledEarlyClose
     public string Confidence { get; init; } = CalendarConfidence.Unverified;
 }
 
+/// <summary>
+/// A date the venue is closed by rule or by an unscheduled closure, but on which it in fact traded a
+/// shortened session.
+/// </summary>
+/// <remarks>
+/// The mechanism exists because CME equity index does exactly this on nearly every US holiday: it
+/// trades 17:00 CT the prior evening to 12:00 CT rather than closing. Modelling that as a closure
+/// deleted a 1,140-minute session AND pushed every observation inside it onto the following trading
+/// date. It is per-date data, not a rule: Christmas and New Year really are closures, and Good Friday
+/// is one or the other depending on whether the monthly employment report falls that day.
+/// </remarks>
+public sealed record PartialSessionEntry
+{
+    public DateOnly Date { get; init; }
+
+    /// <summary>Exchange-local wall-clock close time for every session listed in <see cref="Sessions"/>.</summary>
+    public TimeOnly Close { get; init; }
+
+    /// <summary>
+    /// The session labels that traded. Every other template on the calendar is suppressed for this
+    /// date — naming them explicitly rather than shortening whatever exists is what keeps a session
+    /// that genuinely did not happen (CME's 08:30-15:15 RTH row on a 08:15 CT Good Friday) from being
+    /// generated with a nonsensical or negative length.
+    /// </summary>
+    public IReadOnlyList<string> Sessions { get; init; } = [];
+
+    public string Reason { get; init; } = "";
+    public string Confidence { get; init; } = CalendarConfidence.Unverified;
+    public string? Note { get; init; }
+}
+
 /// <summary>Which rule/data sets a venue observes. Several calendars can share one venue.</summary>
 public sealed record VenueDefinition
 {
@@ -85,6 +116,13 @@ public sealed record VenueDefinition
     public string EarlyCloseRuleSet { get; init; } = "";
     public string ClosureSet { get; init; } = "";
     public string UnscheduledEarlyCloseSet { get; init; } = "";
+
+    /// <summary>
+    /// Optional. Empty means "this venue never trades on a day its rules say it is closed" — which is
+    /// true of NYSE and Cboe and false of CME.
+    /// </summary>
+    public string PartialSessionSet { get; init; } = "";
+
     public string? Note { get; init; }
 }
 
@@ -115,7 +153,28 @@ public sealed record SessionDefinition
     /// </summary>
     public bool AppliesEarlyClose { get; init; }
 
+    /// <summary>
+    /// First trading date this template's hours applied, inclusive. Null means "from the calendar's
+    /// own <see cref="CalendarDefinition.EffectiveFrom"/>".
+    /// </summary>
+    /// <remarks>
+    /// Only for a venue that genuinely re-timed a session — the VIX index day leg has moved twice
+    /// (15:15 CT to 15:00 CT in March 2011 and back in November 2011) and again to 16:00 CT in April
+    /// 2022. Rows sharing a label must tile the calendar's lifetime exactly; see
+    /// <see cref="ExchangeCalendarSet"/> for the load-time check that enforces it. The comparison is
+    /// against the TRADING DATE, not the calendar date the open's wall clock is read on.
+    /// </remarks>
+    public DateOnly? EffectiveFrom { get; init; }
+
+    /// <summary>Last trading date this template's hours applied, inclusive. Null means "still current".</summary>
+    public DateOnly? EffectiveTo { get; init; }
+
     public string? Note { get; init; }
+
+    /// <summary>Whether this template's hours are the ones in force on <paramref name="tradingDate"/>.</summary>
+    public bool AppliesOn(DateOnly tradingDate) =>
+        (EffectiveFrom is null || tradingDate >= EffectiveFrom)
+        && (EffectiveTo is null || tradingDate <= EffectiveTo);
 }
 
 /// <summary>One calendar key's timezone, venue, and session templates.</summary>
@@ -163,6 +222,7 @@ public sealed class ExchangeCalendarSet
     private readonly FrozenDictionary<string, IReadOnlyList<EarlyCloseRule>> _earlyCloseRuleSets;
     private readonly FrozenDictionary<string, FrozenDictionary<DateOnly, ClosureEntry>> _closureSets;
     private readonly FrozenDictionary<string, FrozenDictionary<DateOnly, UnscheduledEarlyClose>> _earlyCloseSets;
+    private readonly FrozenDictionary<string, FrozenDictionary<DateOnly, PartialSessionEntry>> _partialSessionSets;
 
     private ExchangeCalendarSet(CalendarFile file)
     {
@@ -188,6 +248,68 @@ public sealed class ExchangeCalendarSet
             entry => entry.Key,
             entry => entry.Value.ToFrozenDictionary(early => early.Date),
             StringComparer.Ordinal);
+        _partialSessionSets = file.PartialSessionSets.ToFrozenDictionary(
+            entry => entry.Key,
+            entry => entry.Value.ToFrozenDictionary(partial => partial.Date),
+            StringComparer.Ordinal);
+
+        ValidateSessionTemplateWindows();
+    }
+
+    /// <summary>
+    /// Rejects a calendar whose dated session templates do not tile its lifetime exactly, per label.
+    /// </summary>
+    /// <remarks>
+    /// Two failures this is here to make impossible, both of which are silent otherwise. Overlapping
+    /// windows produce two rows for one (calendar, trading date, label), which
+    /// <c>research.sessions</c>'s UNIQUE constraint rejects at insert time — long after generation,
+    /// with no clue which template pair caused it. A gap between windows produces NO row for the dates
+    /// inside it, which nothing rejects at all: a missing session shrinks every denominator, so the
+    /// hole renders as health. Requiring calendar-date contiguity (next.effectiveFrom is exactly the
+    /// day after prev.effectiveTo) rather than trading-date contiguity is deliberate — it is checkable
+    /// by eye against the JSON without knowing which days were holidays.
+    /// </remarks>
+    private void ValidateSessionTemplateWindows()
+    {
+        foreach (var calendar in _calendars.Values)
+        {
+            foreach (var byLabel in calendar.Sessions.GroupBy(session => session.Label, StringComparer.Ordinal))
+            {
+                var windows = byLabel
+                    .OrderBy(session => session.EffectiveFrom ?? calendar.EffectiveFrom)
+                    .ToArray();
+
+                for (var i = 0; i < windows.Length; i++)
+                {
+                    var expectedFrom = i == 0 ? calendar.EffectiveFrom : windows[i - 1].EffectiveTo!.Value.AddDays(1);
+                    var actualFrom = windows[i].EffectiveFrom ?? calendar.EffectiveFrom;
+
+                    if (actualFrom != expectedFrom)
+                    {
+                        throw new InvalidOperationException(
+                            $"Calendar '{calendar.Key}' label '{byLabel.Key}': session template {i} starts " +
+                            $"{actualFrom:yyyy-MM-dd} but must start {expectedFrom:yyyy-MM-dd} so the templates " +
+                            "tile the calendar with no gap and no overlap.");
+                    }
+
+                    var isLast = i == windows.Length - 1;
+
+                    if (isLast != (windows[i].EffectiveTo is null))
+                    {
+                        throw new InvalidOperationException(
+                            $"Calendar '{calendar.Key}' label '{byLabel.Key}': exactly the LAST session template " +
+                            "may omit effectiveTo, and it must omit it.");
+                    }
+
+                    if (!isLast && windows[i].EffectiveTo!.Value < actualFrom)
+                    {
+                        throw new InvalidOperationException(
+                            $"Calendar '{calendar.Key}' label '{byLabel.Key}': session template {i} ends before " +
+                            "it starts.");
+                    }
+                }
+            }
+        }
     }
 
     /// <summary>The version stamped onto every generated session row. Bumped when data or logic changes.</summary>
@@ -238,6 +360,23 @@ public sealed class ExchangeCalendarSet
             ? closures
             : throw new InvalidOperationException($"Calendar data references unknown closure set '{setName}'.");
 
+    /// <summary>
+    /// The partial-session set <paramref name="setName"/>, or an empty set when the name is blank —
+    /// a venue that never trades on a day its rules close simply omits the field.
+    /// </summary>
+    public FrozenDictionary<DateOnly, PartialSessionEntry> PartialSessions(string setName)
+    {
+        if (string.IsNullOrEmpty(setName))
+        {
+            return FrozenDictionary<DateOnly, PartialSessionEntry>.Empty;
+        }
+
+        return _partialSessionSets.TryGetValue(setName, out var partials)
+            ? partials
+            : throw new InvalidOperationException(
+                $"Calendar data references unknown partial-session set '{setName}'.");
+    }
+
     public FrozenDictionary<DateOnly, UnscheduledEarlyClose> UnscheduledEarlyCloses(string setName) =>
         _earlyCloseSets.TryGetValue(setName, out var earlyCloses)
             ? earlyCloses
@@ -284,6 +423,7 @@ public sealed class ExchangeCalendarSet
         public Dictionary<string, EarlyCloseRule[]> EarlyCloseRuleSets { get; init; } = [];
         public Dictionary<string, ClosureEntry[]> ClosureSets { get; init; } = [];
         public Dictionary<string, UnscheduledEarlyClose[]> EarlyCloseSets { get; init; } = [];
+        public Dictionary<string, PartialSessionEntry[]> PartialSessionSets { get; init; } = [];
         public Dictionary<string, VenueDefinition> Venues { get; init; } = [];
         public IReadOnlyList<CalendarDefinition> Calendars { get; init; } = [];
     }

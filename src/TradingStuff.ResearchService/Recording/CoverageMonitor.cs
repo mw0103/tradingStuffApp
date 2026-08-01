@@ -1,6 +1,7 @@
 using Microsoft.Extensions.Options;
 using Npgsql;
 using TradingStuff.ResearchContracts;
+using TradingStuff.ResearchService.Sessions;
 
 namespace TradingStuff.ResearchService.Recording;
 
@@ -18,8 +19,8 @@ public sealed class CoverageOptions
     /// core underlyings do not all trade against it: SPY is NYSE-calendared, and neither the SPX nor
     /// the VIX index level updates through Cboe GTH. Those three lines therefore cannot exceed roughly
     /// a third of the RTH+GTH denominator no matter how healthy the recording is, and
-    /// <c>OverallCoverageRatio</c> is an unweighted mean across all reporting nodes and unassigned
-    /// conIds, so they pull it down by a couple of points. This is not a regression — the old
+    /// <c>OverallCoverageRatio</c> is an unweighted mean across every registered node and every
+    /// unassigned conId, so they pull it down by a couple of points. This is not a regression — the old
     /// wall-clock denominator was worse for every instrument — but it means the 95% gate should be
     /// read against the per-node rows until per-conId calendars exist. Doing that properly needs a
     /// conId → instrument → calendar mapping, and the core underlyings are not in
@@ -49,7 +50,10 @@ public static class CoverageBasisStatus
 
     /// <summary>
     /// <c>research.sessions</c> does not match what <see cref="ISessionClock"/> generates for the same
-    /// window. The denominator cannot be trusted, so no ratio is reported.
+    /// window — different boundaries, or a row written by a different
+    /// <c>SessionGenerator.GeneratorVersion</c>. The denominator cannot be trusted, so no ratio is
+    /// reported. Note what this does and does not prove: see the class remarks on
+    /// <see cref="CoverageMonitor"/>.
     /// </summary>
     public const string SessionsOutOfSync = "sessions-out-of-sync";
 
@@ -58,6 +62,17 @@ public static class CoverageBasisStatus
 
     /// <summary>A configured calendar key is not in the shipped calendar dataset.</summary>
     public const string CalendarUnknown = "calendar-unknown";
+
+    // There is deliberately NO "grid-incomplete" status, even though an unassigned registered node
+    // used to be exactly the kind of thing that would need one. A status here means "the ratio
+    // cannot be believed", and a partly-assigned grid no longer produces an unbelievable ratio: the
+    // mean's denominator IS the registered grid (see CoverageReport.OverallCoverageRatio), so an
+    // unassigned role drags the number down instead of vanishing from it. Reporting `null` for a
+    // partly-assigned grid was the alternative and was rejected — it would make an outage
+    // (53 of 54 roles recording nothing) render as *unmeasurable*, indistinguishable from a
+    // weekend or a fresh deployment, which is the same absence-as-health failure this whole report
+    // keeps being bitten by, one level over. The grid's completeness is reported as a number
+    // instead: CoverageBasis.RegisteredNodes vs AssignedNodes, and NodeCoverage.IsAssigned per row.
 }
 
 /// <summary>
@@ -66,6 +81,13 @@ public static class CoverageBasisStatus
 /// which are single, never-rotating instruments, not registered nodes). The whole window is the
 /// correct denominator for these because there is no assignment interval to narrow it to.
 /// </summary>
+/// <remarks>
+/// Not to be confused with an UNASSIGNED NODE (<see cref="NodeCoverage.IsAssigned"/> false), which is
+/// the opposite shape: a registered role with no conId, rather than a conId with no registered role.
+/// This type is populated from conIds that ticked, so it can never report one that is entirely dead —
+/// which is exactly why the option nodes are enumerated from a registry instead, and why a dead core
+/// underlying remains a known residual.
+/// </remarks>
 public sealed record ConIdCoverage(int ConId, int MinutesWithData, int TotalMinutes, double CoverageRatio);
 
 /// <summary>
@@ -110,13 +132,41 @@ public sealed record NodeConIdSegment(
 /// same <c>now()</c> — so one node's segments never overlap and never leave a gap between them
 /// inside the window.
 /// </remarks>
-/// <param name="CoverageRatio">NULL under the same zero-denominator rule as <see cref="NodeConIdSegment.CoverageRatio"/>.</param>
+/// <param name="IsAssigned">
+/// Whether ANY conId held this role during the window. False is a first-class, reportable state, not
+/// an absent row: <c>research.option_nodes</c> defines the 54 roles that ought to be recorded and
+/// <c>NodeSelector.BootstrapAssignmentsAsync</c> has three <c>continue</c> paths that leave one
+/// unassigned (an empty candidate list skips a whole 9-node DTE bucket, no best strike, an
+/// unresolved conId). Building the expected set from <c>node_assignments</c> made those roles
+/// disappear from the report entirely — see <see cref="CoverageReport.OverallCoverageRatio"/> for
+/// what that did to the headline number.
+/// </param>
+/// <param name="CoverageRatio">
+/// How well this node's ASSIGNMENT was recorded: minutes with data over the session minutes it was
+/// actually assigned for. NULL under the same zero-denominator rule as
+/// <see cref="NodeConIdSegment.CoverageRatio"/>, which an unassigned node always hits — 0/0 is
+/// unmeasured, not 0%, and "no conId was ever chosen for this role" is a different (and more
+/// actionable) failure than "the chosen conId streamed nothing". Use
+/// <paramref name="GridCoverageRatio"/> to ask the grid-level question instead.
+/// </param>
+/// <param name="GridCoverageRatio">
+/// How much of the WINDOW's expected session minutes this role recorded — the same numerator over
+/// the whole window's denominator rather than over the assignment tenure. Never null: the role was
+/// expected to be assigned and recording for the entire window, so its expectation exists whether or
+/// not an assignment does. This, not <paramref name="CoverageRatio"/>, is what
+/// <see cref="CoverageReport.OverallCoverageRatio"/> averages, and it is reported per row so the
+/// headline figure can be re-derived from the table rather than taken on trust. It also exposes the
+/// continuous version of the unassigned case: a node assigned for the last ten minutes of a session
+/// and perfect in them reads 100% here on <paramref name="CoverageRatio"/> and ~1% on this one.
+/// </param>
 public sealed record NodeCoverage(
     short NodeId,
     string Role,
+    bool IsAssigned,
     int MinutesWithData,
     int TotalMinutes,
     double? CoverageRatio,
+    double GridCoverageRatio,
     IReadOnlyList<NodeConIdSegment> ConIdSegments);
 
 /// <summary>
@@ -147,7 +197,23 @@ public sealed record CoverageSession(
 /// <param name="GeneratedSessions">
 /// Sessions <see cref="ISessionClock"/> produces for the same window. Reported next to
 /// <paramref name="PersistedSessions"/> on purpose: a missing table row shrinks the denominator, and
-/// a shrinking denominator makes coverage look BETTER.
+/// a shrinking denominator makes coverage look BETTER. What agreement between the two does and does
+/// not prove is on <see cref="CoverageMonitor"/>'s remarks — it is narrower than it reads.
+/// </param>
+/// <param name="RegisteredNodes">
+/// Rows in <c>research.option_nodes</c> — the roles that ought to be recorded, and the denominator
+/// of the grid the 95% gate is about. Reported because <see cref="CoverageReport.PerNode"/> having
+/// 54 rows is only meaningful against the number that ought to be there: if the registry itself were
+/// ever emptied, every node row would vanish and the mean would fall back to whatever conIds happened
+/// to be ticking, which is this same defect one level higher again. The registry has no runtime
+/// writer (migration 003 seeds it and nothing else touches it), so this is a tripwire, not a
+/// suspicion.
+/// </param>
+/// <param name="AssignedNodes">
+/// How many of <paramref name="RegisteredNodes"/> had a conId at any point in the window. Below
+/// <paramref name="RegisteredNodes"/> means the grid is not fully assigned and the headline ratio is
+/// being dragged down by roles that recorded nothing at all — which is the honest reading, not a
+/// reporting artefact.
 /// </param>
 public sealed record CoverageBasis(
     string Status,
@@ -155,6 +221,8 @@ public sealed record CoverageBasis(
     int ExpectedMinutes,
     int PersistedSessions,
     int GeneratedSessions,
+    int RegisteredNodes,
+    int AssignedNodes,
     IReadOnlyList<CoverageSession> Sessions,
     string? Detail);
 
@@ -176,15 +244,38 @@ public sealed record RecorderGapSummary(
 /// Coverage as required by the Phase 1 acceptance criterion: a full RTH+GTH session at &gt;=95%
 /// coverage, with every gap explained.
 /// </summary>
+/// <param name="PerNode">
+/// One row per row of <c>research.option_nodes</c> — the registered grid — whether or not it has an
+/// assignment. Never a subset built from <c>node_assignments</c>: see
+/// <see cref="NodeCoverage.IsAssigned"/>.
+/// </param>
 /// <param name="OverallCoverageRatio">
 /// NULL whenever <see cref="CoverageBasis.Status"/> is not
 /// <see cref="CoverageBasisStatus.Measured"/> — an unmeasurable window reports no number rather than
 /// a plausible one. A weekend is not 0% covered and an unsynced calendar is not 100% covered; both
-/// were previously indistinguishable from a real reading. The unweighted mean is taken over every
-/// <see cref="NodeCoverage"/> with a non-null ratio plus every <see cref="ConIdCoverage"/> in
-/// <paramref name="UnassignedConIds"/> — a node whose own denominator collapsed to zero (see
-/// <see cref="NodeCoverage.CoverageRatio"/>) contributes nothing to average rather than a
-/// fabricated number.
+/// were previously indistinguishable from a real reading.
+/// <para>
+/// The unweighted mean is taken over <see cref="NodeCoverage.GridCoverageRatio"/> for EVERY
+/// registered node plus every <see cref="ConIdCoverage"/> in <paramref name="UnassignedConIds"/>.
+/// The two words doing the work are "every registered": the mean's denominator is the grid, not the
+/// rows that happened to be measurable. Averaging only measurable rows — the previous rule, combined
+/// with an expected set built from <c>node_assignments</c> — meant a role with no assignment was not
+/// counted as a miss but removed from the question, so ONE assignment surviving while 53 vanished
+/// reported <b>100%</b> for the same outage that reads 1.85% when all 54 are assigned and 53 of them
+/// are dead. Losing an entire SPX DTE bucket to one failed chain call moved the reported number UP,
+/// and the ≥95% gate passed while nothing was being recorded. The invariant that rules that out, and
+/// the one to preserve in any future change here: <b>removing a node's assignment must never raise
+/// this number.</b> It cannot now, because the numerator can only shrink while the denominator is
+/// fixed by the registry.
+/// </para>
+/// <para>
+/// Still NULL when nothing is being measured at all — no node assigned anywhere in the window and no
+/// conId ticking. That is a fresh deployment or a window predating the recorder's first lease, and
+/// reporting it as 0% says "every instrument is dead" (the loudest possible alarm) about a
+/// non-problem; a gate that cries wolf is a gate nobody reads. The distinction from the case above is
+/// exactly whether ANY evidence of recording exists in the window: one assigned node is evidence, and
+/// then the other 53 roles are a genuine shortfall rather than an absence of measurement.
+/// </para>
 /// </param>
 public sealed record CoverageReport(
     DateTimeOffset From,
@@ -221,20 +312,59 @@ public sealed record CoverageReport(
 /// a missing session shrinks the denominator — which makes coverage read HIGHER. That is the exact
 /// failure shape behind three of the Phase 1 review's eight confirmed defects: absence rendering as
 /// health, and here it renders as health in the direction nobody double-checks. So the persisted rows
-/// are compared, boundary for boundary, against what <see cref="ISessionClock"/> generates for the
-/// same window; on any disagreement the report refuses to produce a ratio and says
-/// <see cref="CoverageBasisStatus.SessionsOutOfSync"/> instead. The clock is a pure function of the
-/// checked-in calendar data (see <c>SessionClock</c>'s remarks on why it does not read the table), so
-/// this is a genuinely independent witness and not the same query asked twice.
+/// are compared, boundary for boundary and <c>generator_version</c> for <c>generator_version</c>,
+/// against what <see cref="ISessionClock"/> generates for the same window; on any disagreement the
+/// report refuses to produce a ratio and says <see cref="CoverageBasisStatus.SessionsOutOfSync"/>
+/// instead.
 /// </para>
 /// <para>
-/// A node is included even when it has ZERO ticks in the window, for every conId that held its
-/// role during the window: a plain <c>GROUP BY con_id</c> over the raw event tables cannot produce
-/// a row for a conId that never ticked, which would make a fully-dead subscription — the worst
-/// case this whole report exists to catch — invisible instead of showing 0%. Core underlyings
-/// (SPX/VIX/SPY) are not tracked in <c>node_assignments</c>, so a fully-dead underlying
-/// subscription is not yet covered by this check; that gap is narrower (three fixed, easily
-/// resolved symbols vs. up to 54 option nodes) and left as a known residual for now.
+/// <b>Be precise about what that reconciliation proves, because it is narrower than it reads.</b> It
+/// proves the persisted table matches <i>what this build's generator produces for the same window</i>
+/// — nothing more. It is NOT an independent witness that the calendar is right. Earlier wording here
+/// (and in <c>docs/STATE.md</c>) claimed independence on the grounds that the clock never reads the
+/// table. Table-independence is real; witness-independence is not: <c>SessionGenerator</c> is a
+/// singleton, and both sides of the comparison — the rows <c>SessionCalendarService</c> wrote and the
+/// sessions <c>SessionClock</c> generates — come from the same instance and the same memoised cache.
+/// A wrong calendar entry is therefore certified rather than caught, and that is not hypothetical:
+/// <c>CME_ES</c> emits no session at all on US holidays Globex actually trades, so both sets are
+/// empty for that date, <see cref="SessionMinutes.Matches"/> returns true, and the window reports
+/// <see cref="CoverageBasisStatus.Measured"/> while omitting a whole trading day. So: a green basis
+/// means the table has not drifted from the generator (stale rows, a partial sync, a hand edit, an
+/// older <c>generator_version</c>) and says nothing about whether the generator is right.
+/// </para>
+/// <para>
+/// <b>Cheap genuine independence was looked for and not adopted.</b> Re-constructing a second
+/// <c>SessionGenerator</c> instead of using the injected one buys only a second cache over identical
+/// code, which witnesses nothing about the calendar data. The one real oracle already in the database
+/// is the recorded data itself: minutes carrying ticks that fall OUTSIDE every session are evidence
+/// the calendar is missing a session, and that check would have caught the <c>CME_ES</c> holiday.
+/// It is deliberately not built here because out-of-session ticks are legitimately routine — TWS
+/// delivers stale snapshots between the GTH close and the RTH open, and this file has a test pinning
+/// that those must not count — so turning the signal into an alarm needs a sustained-block-across-many-conIds
+/// threshold, i.e. a heuristic with its own false-alarm budget. That is a Phase 3 piece of work with
+/// a design of its own, not a line in the coverage query.
+/// </para>
+/// <para>
+/// <b>The expected set of nodes comes from <c>research.option_nodes</c>, never from
+/// <c>node_assignments</c>.</b> Two rounds of the same defect landed here. First: a plain
+/// <c>GROUP BY con_id</c> over the raw event tables cannot produce a row for a conId that never
+/// ticked, so a fully-dead subscription — the worst case this whole report exists to catch — was
+/// invisible instead of showing 0%. That was fixed by unioning tick counts with the assignment rows.
+/// It was not fixed one level up: the assignment rows were still the definition of "expected", and
+/// <c>NodeSelector</c> can leave a registered role with no assignment row at all (an empty candidate
+/// list skips a whole 9-node DTE bucket), so the role vanished from the report — and because the
+/// overall ratio averaged only the rows present, <b>losing 53 of 54 assignments moved the reported
+/// number from 1.85% to 100%</b>. The registry is now the expected set and the assignments are LEFT
+/// JOINed onto it, so an unassigned role is a visible row with no ratio and a zero contribution to
+/// the grid mean. The general lesson, third time it has been paid for in this file: whatever table
+/// defines "what should exist" must be the FROM, not the JOIN.
+/// </para>
+/// <para>
+/// Core underlyings (SPX/VIX/SPY) are not tracked in <c>node_assignments</c> or
+/// <c>option_nodes</c>, so a fully-dead underlying subscription still produces no row rather than a
+/// 0% one; that gap is narrower (three fixed, easily resolved symbols vs. up to 54 option nodes) and
+/// left as a known residual — it needs a registry of expected underlyings to be the FROM of, which
+/// does not exist yet.
 /// </para>
 /// <para>
 /// <b>The denominator is per-NODE assignment tenure, not per-conId window length.</b> Node
@@ -306,8 +436,37 @@ public sealed class CoverageMonitor(
         await using var connection = new NpgsqlConnection(connectionString);
         await connection.OpenAsync(cancellationToken);
 
-        var persisted = await QueryOverlappingSessionsAsync(connection, calendars, windowFrom, windowTo, cancellationToken);
+        var persistedRows = await QueryOverlappingSessionsAsync(connection, calendars, windowFrom, windowTo, cancellationToken);
+        var persisted = persistedRows.Select(row => row.Session).ToArray();
         var gaps = await QueryGapsAsync(connection, windowFrom, windowTo, cancellationToken);
+
+        // A row written by an older generator whose boundaries happen to be identical passes
+        // Matches (which compares boundaries, not provenance) but is reported as `mismatched` by
+        // GET /research/sessions, which does compare generator_version. Two surfaces disagreeing
+        // about the same row is its own small defect: the operator who goes to the calendar page
+        // because coverage looks fine finds rows flagged there, or vice versa. Compared here too,
+        // so the two agree on what "in sync" means.
+        var staleVersions = persistedRows
+            .Where(row => row.GeneratorVersion != SessionGenerator.GeneratorVersion)
+            .ToArray();
+
+        if (staleVersions.Length > 0)
+        {
+            logger.LogError(
+                "{Stale} of {Total} research.sessions rows over {From:O}..{To:O} were written by a different " +
+                "generator version (expected {Expected}). Coverage cannot be measured until the calendar is " +
+                "re-synced.",
+                staleVersions.Length, persistedRows.Count, windowFrom, windowTo, SessionGenerator.GeneratorVersion);
+
+            return Rejected(
+                windowFrom, windowTo, calendars, CoverageBasisStatus.SessionsOutOfSync,
+                $"{staleVersions.Length} of {persistedRows.Count} persisted session(s) carry a generator_version " +
+                $"other than {SessionGenerator.GeneratorVersion}. GET /research/sessions names the offending " +
+                "rows; SessionCalendarSynchronizer re-materialises them on startup and on its resync timer.",
+                persisted,
+                generated.Count,
+                gaps);
+        }
 
         if (!SessionMinutes.Matches(persisted, generated))
         {
@@ -315,11 +474,11 @@ public sealed class CoverageMonitor(
                 "research.sessions disagrees with the session generator over {From:O}..{To:O}: {Persisted} " +
                 "persisted session(s) vs {Generated} generated. Coverage cannot be measured until the " +
                 "calendar is re-synced — a missing session row shrinks the denominator and inflates coverage.",
-                windowFrom, windowTo, persisted.Count, generated.Count);
+                windowFrom, windowTo, persisted.Length, generated.Count);
 
             return Rejected(
                 windowFrom, windowTo, calendars, CoverageBasisStatus.SessionsOutOfSync,
-                $"{persisted.Count} persisted session(s) vs {generated.Count} generated. " +
+                $"{persisted.Length} persisted session(s) vs {generated.Count} generated. " +
                 "GET /research/sessions names the offending rows; SessionCalendarSynchronizer " +
                 "re-materialises them on startup and on its resync timer.",
                 persisted,
@@ -346,9 +505,23 @@ public sealed class CoverageMonitor(
         // own tenure rather than the whole window.
         var minutesByConId = await QueryMinuteCoverageAsync(connection, windowFrom, windowTo, sessions, cancellationToken);
 
-        // Every node_assignments row whose tenure overlaps the window — a rotated node contributes
-        // one row per conId that held it, not just the current one.
-        var assignments = await QueryAssignmentIntervalsAsync(connection, windowFrom, windowTo, cancellationToken);
+        // The registered grid, with every node_assignments row whose tenure overlaps the window
+        // LEFT JOINed onto it — a rotated node contributes one row per conId that held it, and a
+        // node nothing ever assigned contributes a row with no conId rather than no row at all.
+        var registered = await QueryRegisteredNodesAsync(connection, windowFrom, windowTo, cancellationToken);
+        var registeredNodes = registered.RegisteredNodes;
+        var assignments = registered.Assignments;
+
+        if (registeredNodes.Count == 0)
+        {
+            // Cannot happen through any code path that exists: migration 003 seeds the 54 roles and
+            // nothing writes research.option_nodes at runtime. Logged rather than assumed away
+            // because the whole point of this fix is that "the table that says what should exist was
+            // empty" is precisely how a report ends up describing nothing and calling it health.
+            logger.LogError(
+                "research.option_nodes is empty. Coverage has no registered grid to measure against, so the " +
+                "overall ratio describes only whatever conIds happened to tick.");
+        }
 
         var clippedSegments = assignments
             .Select(assignment =>
@@ -384,11 +557,14 @@ public sealed class CoverageMonitor(
                 .ToArray(),
             cancellationToken);
 
-        var perNode = clippedSegments
-            .GroupBy(segment => (segment.Assignment.NodeId, segment.Assignment.Role))
-            .Select(group =>
+        var segmentsByNode = clippedSegments.ToLookup(segment => segment.Assignment.NodeId);
+
+        // Iterated over the REGISTRY, not over the segments: a registered role with no segment must
+        // produce a row, and a GroupBy over segments structurally cannot emit one.
+        var perNode = registeredNodes
+            .Select(node =>
             {
-                var conIdSegments = group
+                var conIdSegments = segmentsByNode[node.NodeId]
                     .Select(segment =>
                     {
                         var minutesWithData = segment.TotalMinutes == 0
@@ -414,11 +590,17 @@ public sealed class CoverageMonitor(
                 var nodeMinutesWithData = conIdSegments.Sum(segment => segment.MinutesWithData);
 
                 return new NodeCoverage(
-                    group.Key.NodeId,
-                    group.Key.Role,
+                    node.NodeId,
+                    node.Role,
+                    conIdSegments.Length > 0,
                     nodeMinutesWithData,
                     nodeTotalMinutes,
                     nodeTotalMinutes == 0 ? null : (double)nodeMinutesWithData / nodeTotalMinutes,
+                    // expectedMinutes is > 0 here (the zero case returned NoSessionInWindow above),
+                    // and the numerator counts only in-session minutes inside the node's own tenure,
+                    // so this is bounded by 1 by construction — the same numerator-inside-denominator
+                    // guarantee the per-segment ratios have, widened to the window.
+                    (double)nodeMinutesWithData / expectedMinutes,
                     conIdSegments);
             })
             .OrderBy(node => node.NodeId)
@@ -439,14 +621,40 @@ public sealed class CoverageMonitor(
             .OrderBy(row => row.ConId)
             .ToArray();
 
+        // EVERY registered node contributes, measured against the whole window rather than against
+        // its own assignment tenure. Averaging only the nodes with a tenure to measure — which is
+        // what "skip the null ratios" amounted to once the expected set came from node_assignments —
+        // let an unassigned role leave the question instead of failing it, so 1 assigned + 53
+        // missing scored 100% on the same outage that scores 1.85% with all 54 assigned and dead.
+        // With the registry fixing the denominator, dropping an assignment can only remove minutes
+        // from a numerator: fewer recorded nodes can no longer produce a higher number.
+        var assignedNodes = perNode.Count(node => node.IsAssigned);
+
         var ratios = perNode
-            .Where(node => node.CoverageRatio.HasValue)
-            .Select(node => node.CoverageRatio!.Value)
+            .Select(node => node.GridCoverageRatio)
             .Concat(unassignedConIds.Select(row => row.CoverageRatio))
             .ToArray();
 
+        // ...but "the grid recorded nothing" and "nothing is being recorded at all" are different
+        // claims, and only the first is a measurement. With no assignment anywhere in the window and
+        // no conId ticking there is no evidence of a recorder to report on — a fresh deployment, or
+        // any window predating the first lease — and 54 structural zeros would average to a
+        // fabricated 0%, saying "every instrument is dead" about a non-problem. A gate that cries
+        // wolf is a gate nobody reads (the same reasoning as the weekend case above, and why the
+        // field is nullable). One assigned node is enough evidence to make the other 53 a genuine
+        // shortfall rather than an absence of measurement.
+        var somethingIsMeasured = assignedNodes > 0 || unassignedConIds.Length > 0;
+
         var basis = new CoverageBasis(
-            CoverageBasisStatus.Measured, calendars, expectedMinutes, persisted.Count, generated.Count, sessions, null);
+            CoverageBasisStatus.Measured,
+            calendars,
+            expectedMinutes,
+            persisted.Length,
+            generated.Count,
+            registeredNodes.Count,
+            assignedNodes,
+            sessions,
+            null);
 
         return new CoverageReport(
             windowFrom,
@@ -454,13 +662,7 @@ public sealed class CoverageMonitor(
             basis,
             perNode,
             unassignedConIds,
-            // NULL, not 0d, when there is nothing to average. An unweighted mean over an empty set is
-            // undefined, and reporting it as 0% says "every instrument is dead" when the truth is
-            // "no instrument is being measured" — a fresh deployment, or any window before the
-            // recorder acquired its first lease. Those are opposite operator actions, and the
-            // catastrophic-looking one is a false alarm; a gate that cries wolf is a gate nobody
-            // reads. Same reasoning as the weekend case above, which is why the field is nullable.
-            ratios.Length == 0 ? null : ratios.Average(),
+            somethingIsMeasured ? ratios.Average() : null,
             expectedMinutes,
             gaps);
     }
@@ -485,7 +687,11 @@ public sealed class CoverageMonitor(
             // The RAW persisted count, not the clipped one: it is the number an operator reads against
             // GeneratedSessions to see how far the table has drifted, and clipping would net some of
             // the difference out.
-            new CoverageBasis(status, calendars, expectedMinutes, persisted?.Count ?? 0, generated, sessions, detail),
+            // RegisteredNodes/AssignedNodes are 0 because a rejected report never got as far as
+            // reading research.option_nodes — consistent with PerNode being empty here. They are not
+            // a claim that the grid is empty; the status and detail say why nothing was measured.
+            new CoverageBasis(
+                status, calendars, expectedMinutes, persisted?.Count ?? 0, generated, 0, 0, sessions, detail),
             [],
             [],
             null,
@@ -520,7 +726,14 @@ public sealed class CoverageMonitor(
         return sessions;
     }
 
-    private static async Task<IReadOnlyList<TradingSession>> QueryOverlappingSessionsAsync(
+    /// <summary>
+    /// A persisted session row with the provenance <see cref="SessionMinutes.Matches"/> cannot see:
+    /// two rows can agree on every boundary and still have been written by different generator
+    /// versions, which <c>GET /research/sessions</c> reports as <c>mismatched</c>.
+    /// </summary>
+    private sealed record PersistedCoverageSession(TradingSession Session, short GeneratorVersion);
+
+    private static async Task<IReadOnlyList<PersistedCoverageSession>> QueryOverlappingSessionsAsync(
         NpgsqlConnection connection,
         IReadOnlyList<string> calendars,
         DateTimeOffset from,
@@ -530,7 +743,7 @@ public sealed class CoverageMonitor(
         // Half-open overlap, matching SessionClock's containment rule: a session touching the window
         // at exactly one endpoint contributes no minutes and is not a session "in" the window.
         await using var command = new NpgsqlCommand(
-            "SELECT session_id, calendar, trading_date, open_utc, close_utc, label, is_half_day " +
+            "SELECT session_id, calendar, trading_date, open_utc, close_utc, label, is_half_day, generator_version " +
             "FROM research.sessions " +
             "WHERE calendar = ANY($1) AND open_utc < $3 AND close_utc > $2 " +
             "ORDER BY open_utc, calendar, label",
@@ -539,19 +752,21 @@ public sealed class CoverageMonitor(
         command.Parameters.AddWithValue(from);
         command.Parameters.AddWithValue(to);
 
-        var sessions = new List<TradingSession>();
+        var sessions = new List<PersistedCoverageSession>();
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
 
         while (await reader.ReadAsync(cancellationToken))
         {
-            sessions.Add(new TradingSession(
-                reader.GetInt64(0),
-                reader.GetString(1),
-                reader.GetFieldValue<DateOnly>(2),
-                reader.GetFieldValue<DateTimeOffset>(3),
-                reader.GetFieldValue<DateTimeOffset>(4),
-                reader.GetString(5),
-                reader.GetBoolean(6)));
+            sessions.Add(new PersistedCoverageSession(
+                new TradingSession(
+                    reader.GetInt64(0),
+                    reader.GetString(1),
+                    reader.GetFieldValue<DateOnly>(2),
+                    reader.GetFieldValue<DateTimeOffset>(3),
+                    reader.GetFieldValue<DateTimeOffset>(4),
+                    reader.GetString(5),
+                    reader.GetBoolean(6)),
+                reader.GetInt16(7)));
         }
 
         return sessions;
@@ -561,45 +776,84 @@ public sealed class CoverageMonitor(
     private sealed record NodeAssignmentInterval(
         short NodeId, string Role, int ConId, DateTimeOffset AssignedFrom, DateTimeOffset? AssignedTo);
 
+    /// <summary>One registered role, whether or not anything has ever been assigned to it.</summary>
+    private sealed record RegisteredNode(short NodeId, string Role);
+
     /// <summary>
-    /// Every node_assignments row whose tenure overlaps [<paramref name="from"/>,
-    /// <paramref name="to"/>) — not just the current (<c>assigned_to IS NULL</c>) row per node.
+    /// The registered grid, and the assignments that overlap [<paramref name="from"/>,
+    /// <paramref name="to"/>).
     /// </summary>
     /// <remarks>
-    /// The previous version queried only the current row, with no window filter at all, so a node
-    /// reassigned any time before "now" — including moments before an entirely historical report —
-    /// was measured as if it had held the assignment for the WHOLE window. This is a proper interval
-    /// overlap (<c>assigned_from &lt; to AND (assigned_to IS NULL OR assigned_to &gt; from)</c>), the
-    /// same shape as the session and gap overlap queries below, so a rotated node correctly yields
-    /// one row per conId that held it during the window and nothing for tenures outside it.
+    /// <para>
+    /// <b>The FROM is <c>research.option_nodes</c> and the assignments are LEFT JOINed onto it</b>,
+    /// which is the whole point of this method rather than an implementation detail. The previous
+    /// version had it the other way round — <c>FROM node_assignments JOIN option_nodes</c> — so a
+    /// registered role with no assignment row produced no row here, no row in
+    /// <see cref="CoverageReport.PerNode"/>, and therefore nothing for the overall ratio to average.
+    /// <c>NodeSelector.BootstrapAssignmentsAsync</c> has three <c>continue</c> paths that leave a
+    /// node unassigned (one of them skips an entire 9-node DTE bucket on a single failed chain call),
+    /// so this is a routine outcome, not a corrupt-database hypothetical, and it made the reported
+    /// coverage go UP as recording went down. The join predicate has to sit in the <c>ON</c> clause,
+    /// not a <c>WHERE</c>, or the outer join silently degenerates back into an inner one — the same
+    /// bug wearing different syntax.
+    /// </para>
+    /// <para>
+    /// The window filter is a proper interval overlap (<c>assigned_from &lt; to AND (assigned_to IS
+    /// NULL OR assigned_to &gt; from)</c>), the same shape as the session and gap overlap queries, so
+    /// a rotated node yields one row per conId that held it during the window and nothing for tenures
+    /// outside it. An earlier version queried only the current (<c>assigned_to IS NULL</c>) row with
+    /// no window filter at all, so a node reassigned any time before "now" was measured as if it had
+    /// held the assignment for the whole window.
+    /// </para>
     /// </remarks>
-    private static async Task<IReadOnlyList<NodeAssignmentInterval>> QueryAssignmentIntervalsAsync(
-        NpgsqlConnection connection, DateTimeOffset from, DateTimeOffset to, CancellationToken cancellationToken)
+    private static async Task<(IReadOnlyList<RegisteredNode> RegisteredNodes, IReadOnlyList<NodeAssignmentInterval> Assignments)>
+        QueryRegisteredNodesAsync(
+            NpgsqlConnection connection, DateTimeOffset from, DateTimeOffset to, CancellationToken cancellationToken)
     {
         await using var command = new NpgsqlCommand(
-            "SELECT na.node_id, n.role, na.con_id, na.assigned_from, na.assigned_to " +
-            "FROM research.node_assignments na " +
-            "JOIN research.option_nodes n ON n.node_id = na.node_id " +
-            "WHERE na.assigned_from < $2 AND (na.assigned_to IS NULL OR na.assigned_to > $1) " +
-            "ORDER BY na.node_id, na.assigned_from",
+            "SELECT n.node_id, n.role, na.con_id, na.assigned_from, na.assigned_to " +
+            "FROM research.option_nodes n " +
+            "LEFT JOIN research.node_assignments na " +
+            "    ON na.node_id = n.node_id " +
+            "   AND na.assigned_from < $2 " +
+            "   AND (na.assigned_to IS NULL OR na.assigned_to > $1) " +
+            "ORDER BY n.node_id, na.assigned_from",
             connection);
         command.Parameters.AddWithValue(from);
         command.Parameters.AddWithValue(to);
 
-        var rows = new List<NodeAssignmentInterval>();
+        var nodes = new List<RegisteredNode>();
+        var assignments = new List<NodeAssignmentInterval>();
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
 
         while (await reader.ReadAsync(cancellationToken))
         {
-            rows.Add(new NodeAssignmentInterval(
-                reader.GetInt16(0),
-                reader.GetString(1),
+            var nodeId = reader.GetInt16(0);
+            var role = reader.GetString(1);
+
+            // Ordered by node_id, so one node's rows are contiguous; a node with several assignments
+            // appears several times and must still be counted as one registered role.
+            if (nodes.Count == 0 || nodes[^1].NodeId != nodeId)
+            {
+                nodes.Add(new RegisteredNode(nodeId, role));
+            }
+
+            // NULL con_id is the outer join's "no assignment overlapping this window" — the row
+            // exists to carry the registered role, not an assignment.
+            if (reader.IsDBNull(2))
+            {
+                continue;
+            }
+
+            assignments.Add(new NodeAssignmentInterval(
+                nodeId,
+                role,
                 reader.GetInt32(2),
                 reader.GetFieldValue<DateTimeOffset>(3),
                 reader.IsDBNull(4) ? null : reader.GetFieldValue<DateTimeOffset>(4)));
         }
 
-        return rows;
+        return (nodes, assignments);
     }
 
     /// <summary>

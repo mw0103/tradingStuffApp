@@ -269,6 +269,25 @@ public sealed class IbkrOrderTracker(ILogger<IbkrOrderTracker> logger)
         order.ApplyError(errorCode, message);
     }
 
+    /// <summary>
+    /// Absorbs the permanent order id from an <c>openOrder</c> callback for a tracked order.
+    /// </summary>
+    /// <remarks>
+    /// <c>openOrder</c> is the FIRST message TWS sends for an order it has accepted — verified live
+    /// on the paper account, where every placement logged <c>openOrder</c> ahead of its first
+    /// <c>orderStatus</c> — and it is the only one of the three order callbacks that was not already
+    /// being read for its permId. Taking it here means the identifier is in hand from the earliest
+    /// moment TWS has one, rather than depending on an <c>orderStatus</c> that a later
+    /// <see cref="ApplyError"/> may already have made irrelevant.
+    /// </remarks>
+    public void ApplyOpenOrder(int orderId, long permId)
+    {
+        if (_orders.TryGetValue(orderId, out var order))
+        {
+            order.ApplyOpenOrder(permId);
+        }
+    }
+
     private sealed class TrackedOrder(
         int ibkrOrderId,
         Guid? clientOrderId,
@@ -287,6 +306,20 @@ public sealed class IbkrOrderTracker(ILogger<IbkrOrderTracker> logger)
         private long _permId;
         private string? _message;
         private DateTimeOffset _updatedAt = DateTimeOffset.UtcNow;
+
+        /// <summary>
+        /// True once TWS has itself declared a fill quantity FINAL, on an <c>orderStatus</c> whose
+        /// status is terminal.
+        /// </summary>
+        /// <remarks>
+        /// The distinction matters because there are two ways an order becomes terminal and only one
+        /// of them carries a quantity. <c>orderStatus</c> reports <c>filled</c>; the <c>error</c>
+        /// callback reports nothing but a code and a message, so an order killed by
+        /// <see cref="ApplyError"/> is terminal while <see cref="_filled"/> still holds whatever the
+        /// last WORKING status happened to say. Treating that as the total is how a partially filled
+        /// order cancelled by TWS 202 settles on a truncated fill list.
+        /// </remarks>
+        private bool _fillTotalIsFinal;
 
         public TaskCompletionSource Settled { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -314,7 +347,15 @@ public sealed class IbkrOrderTracker(ILogger<IbkrOrderTracker> logger)
             {
                 lock (_gate)
                 {
-                    return IbkrOrderBuilder.IsTerminal(_status) && _filled > 0m && legsByConId.Count > 0;
+                    // Executions in hand count as evidence of a fill in their own right, not only a
+                    // reported quantity. An order killed by ApplyError has no quantity from TWS at
+                    // all (see _fillTotalIsFinal), so asking `_filled > 0` alone would walk away from
+                    // a cancelled-after-a-partial-fill order the moment the error beat the status
+                    // callback. A rejection has neither executions nor a filled quantity, so it still
+                    // costs no grace at all.
+                    return IbkrOrderBuilder.IsTerminal(_status)
+                           && legsByConId.Count > 0
+                           && (_filled > 0m || _fillsByExecId.Count > 0);
                 }
             }
         }
@@ -331,31 +372,49 @@ public sealed class IbkrOrderTracker(ILogger<IbkrOrderTracker> logger)
 
             lock (_gate)
             {
-                // A terminal outcome is final; late status chatter must not resurrect the order.
+                // BEFORE the terminal guard, deliberately. permId is an identity, not a state: TWS
+                // reports the same value on every callback for the order's whole life, so taking it
+                // late can never contradict anything. Dropping it can: an order that ApplyError has
+                // already made terminal has no permId of its own, and a trailing orderStatus is then
+                // the last place the identifier can still come from. See CapturePermId.
+                CapturePermId(permId);
+
+                var incoming = IbkrOrderBuilder.ToLifecycleStatus(status, filled, remaining);
+
                 if (IbkrOrderBuilder.IsTerminal(_status))
                 {
-                    return;
+                    // A terminal outcome is final; late status chatter must not resurrect the order.
+                    // The QUANTITY it carries is a separate question, and one this order may still
+                    // need answering — hence the absorb rather than the old bare `return`.
+                    AbsorbLateFillTotal(filled, remaining, avgFillPrice);
                 }
-
-                _rawStatus = status;
-                _status = IbkrOrderBuilder.ToLifecycleStatus(status, filled, remaining);
-                _filled = filled;
-                _remaining = remaining;
-                _permId = permId;
-
-                // Signed, not a plain price: a combo filled for a net credit reports a negative
-                // average fill price, and the price converter would discard it as a missing quote.
-                if (QuoteRequest.TryConvertSigned(avgFillPrice, out var average))
+                else
                 {
-                    _averageFillPrice = average;
+                    _rawStatus = status;
+                    _status = incoming;
+                    _filled = filled;
+                    _remaining = remaining;
+
+                    // Signed, not a plain price: a combo filled for a net credit reports a negative
+                    // average fill price, and the price converter would discard it as a missing quote.
+                    if (QuoteRequest.TryConvertSigned(avgFillPrice, out var average))
+                    {
+                        _averageFillPrice = average;
+                    }
+
+                    if (!string.IsNullOrWhiteSpace(whyHeld))
+                    {
+                        _message = $"held: {whyHeld}";
+                    }
+
+                    _updatedAt = DateTimeOffset.UtcNow;
                 }
 
-                if (!string.IsNullOrWhiteSpace(whyHeld))
-                {
-                    _message = $"held: {whyHeld}";
-                }
-
-                _updatedAt = DateTimeOffset.UtcNow;
+                // orderStatus is the ONLY callback that both reports a quantity and says the order is
+                // done, so it is the only one that can make a fill total final. Latched, never
+                // cleared: a trailing non-terminal status (a replayed PendingCancel after a
+                // reconnect) does not un-finish a finished order.
+                _fillTotalIsFinal |= IbkrOrderBuilder.IsTerminal(incoming);
 
                 // The status is half of the completion question, so it has to ask it too: on an order
                 // whose executions all arrived BEFORE the terminal status, this is the only callback
@@ -375,12 +434,79 @@ public sealed class IbkrOrderTracker(ILogger<IbkrOrderTracker> logger)
             }
         }
 
+        /// <summary>Takes the permId from an <c>openOrder</c> callback.</summary>
+        public void ApplyOpenOrder(long permId)
+        {
+            lock (_gate)
+            {
+                CapturePermId(permId);
+            }
+        }
+
+        /// <summary>
+        /// Records the broker's permanent order id the first time TWS reports one, from whichever
+        /// callback got there first. Callers must hold <see cref="_gate"/>.
+        /// </summary>
+        /// <remarks>
+        /// permId is the ONLY order identifier stable across a reconnect or a gateway restart — the
+        /// API order id is this process's, and TWS will hand the same number out again after its
+        /// "Reset API order ID sequence" — so it is what any reconciliation against the broker has to
+        /// key on. It arrives on <c>openOrder</c>, on <c>orderStatus</c> and on every
+        /// <c>execDetails</c>, and on none of them for an order TWS refuses outright (verified live:
+        /// errors 110 and 201 on the paper account produced an <c>error</c> callback and nothing
+        /// else). Taking it from all three, first non-zero wins, is what makes an eventual absence
+        /// mean "TWS never reported one" rather than "we happened to be looking at the wrong
+        /// callback". Zero is IBKR's own not-set sentinel — <c>Execution.PermId</c> is documented as
+        /// 0 for trades originating outside IB — so it is never stored, and never overwrites a real
+        /// value.
+        /// </remarks>
+        private void CapturePermId(long permId)
+        {
+            if (permId != 0 && _permId == 0)
+            {
+                _permId = permId;
+            }
+        }
+
+        /// <summary>
+        /// Takes the fill quantity from an <c>orderStatus</c> that arrived after the order was
+        /// already terminal. Callers must hold <see cref="_gate"/>.
+        /// </summary>
+        /// <remarks>
+        /// Monotone on purpose. Going up is new information — an order killed by <c>ApplyError</c>
+        /// carries whatever the last working status said, which is a LOWER bound on what actually
+        /// filled. Going down never is: TWS replays <c>orderStatus</c> after a reconnect, and a
+        /// replayed or trailing message reporting less than is already recorded would silently shrink
+        /// the total the fill list is checked against, which is the truncation this whole predicate
+        /// exists to prevent. The average price rides along with the quantity rather than being taken
+        /// on its own, for the same reason: it only makes sense against the total it was computed for.
+        /// </remarks>
+        private void AbsorbLateFillTotal(decimal filled, decimal remaining, double avgFillPrice)
+        {
+            if (filled <= _filled)
+            {
+                return;
+            }
+
+            _filled = filled;
+            _remaining = remaining;
+
+            if (QuoteRequest.TryConvertSigned(avgFillPrice, out var average))
+            {
+                _averageFillPrice = average;
+            }
+
+            _updatedAt = DateTimeOffset.UtcNow;
+        }
+
         public void ApplyExecution(IBApi.Contract contract, Execution execution)
         {
             bool complete;
 
             lock (_gate)
             {
+                CapturePermId(execution.PermId);
+
                 // Dedupe on ExecId: executions replay after a reconnect.
                 if (_fillsByExecId.ContainsKey(execution.ExecId))
                 {
@@ -458,12 +584,23 @@ public sealed class IbkrOrderTracker(ILogger<IbkrOrderTracker> logger)
         /// would report a leg complete while the rows carrying it were still missing.
         /// </para>
         /// <para>
-        /// Only asked once the order is terminal. Before that, <c>filled</c> is still climbing, and a
-        /// predicate satisfied by a partial fill would latch <see cref="FillsSettled"/> early — the
-        /// same defect by another route, since the latch cannot be un-set when the rest fills. It
-        /// also fails in the safe direction: if TWS ever reported <c>filled</c> in leg contracts
-        /// rather than spreads, the expected total would only ever be too high, which costs a grace
-        /// timeout and a warning rather than a silently truncated record.
+        /// Only asked once the order is terminal AND the total is one TWS itself called final. The
+        /// terminal half is because <c>filled</c> is still climbing before that, and a predicate
+        /// satisfied by a partial fill would latch <see cref="FillsSettled"/> early — the same defect
+        /// by another route, since the latch cannot be un-set when the rest fills.
+        /// </para>
+        /// <para>
+        /// The <see cref="_fillTotalIsFinal"/> half is the correction to what this comment used to
+        /// claim. It said the predicate "fails in the safe direction: the expected total would only
+        /// ever be too high", which is true of the <c>orderStatus</c> path it was reasoning about and
+        /// FALSE of the other path into terminal. <see cref="ApplyError"/> — TWS 202 cancelled, 163,
+        /// 201, 110 — makes an order terminal without touching <see cref="_filled"/> at all, because
+        /// the <c>error</c> callback carries no quantity. So an order cancelled after a partial fill
+        /// reached here with the total from its last WORKING status, which is a lower bound, matched
+        /// the executions against it, and settled on a fill list missing everything that filled after
+        /// that status — the truncated record, arrived at by the one route the old reasoning did not
+        /// cover. A total the error path never updated is not a total; the order waits out the grace
+        /// and says so instead.
         /// </para>
         /// </remarks>
         private bool IsFillReportingComplete()
@@ -473,7 +610,7 @@ public sealed class IbkrOrderTracker(ILogger<IbkrOrderTracker> logger)
                 return false;
             }
 
-            if (!IbkrOrderBuilder.IsTerminal(_status))
+            if (!IbkrOrderBuilder.IsTerminal(_status) || !_fillTotalIsFinal)
             {
                 return false;
             }
@@ -523,15 +660,26 @@ public sealed class IbkrOrderTracker(ILogger<IbkrOrderTracker> logger)
                         .OrderBy(leg => leg.LegIndex)
                         .Select(leg => $"leg {leg.LegIndex} {ReportedContracts(leg.LegIndex)}/{_filled * leg.Ratio}"));
 
-                return $"filled {_filled}, status {_rawStatus}; contracts reported [{legs}]; " +
+                // An unconfirmed total is a different kind of incomplete and has to read as one. The
+                // per-leg figures below are measured against `filled`, and when the order was ended by
+                // an error callback that number is the last WORKING status's, not a final one — so
+                // "leg 0 5/5" there means "everything we know about has reported", not "this leg is
+                // done". Saying which it is decides whether an operator reconciles the fills or the
+                // whole order.
+                var total = _fillTotalIsFinal
+                    ? $"filled {_filled}"
+                    : $"filled {_filled} NOT CONFIRMED (this order was ended by {_rawStatus}, and the " +
+                      "TWS error callback carries no quantity; no terminal orderStatus has since " +
+                      "reported a final one, so this is a lower bound and the per-leg figures below " +
+                      "are measured against it)";
+
+                return $"{total}, status {_rawStatus}; contracts reported [{legs}]; " +
                        $"{_commissionByExecId.Count} of {_fillsByExecId.Count} execution(s) have a commission report";
             }
         }
 
         public void ApplyError(int errorCode, string message)
         {
-            var fillsComplete = false;
-
             lock (_gate)
             {
                 // Once terminal, stay terminal. Trailing notices — "cancel attempted when order is
@@ -562,20 +710,24 @@ public sealed class IbkrOrderTracker(ILogger<IbkrOrderTracker> logger)
                 _rawStatus = $"Error{errorCode}";
                 _updatedAt = DateTimeOffset.UtcNow;
 
-                // A cancel or rejection ends the fill stream just as surely as "Filled" does, and an
-                // order cancelled after a partial fill still owes executions for the part that did
-                // fill. Same question, same reason as in ApplyStatus.
-                fillsComplete = IsFillReportingComplete();
+                // Deliberately does NOT ask whether the fills are complete, and this is the fix. A
+                // cancel or rejection does end the fill stream, so the old code asked the question
+                // here for the same reason ApplyStatus does — but the error callback carries no
+                // quantity, so the only total available to answer it with is the last working
+                // status's. An order cancelled after a partial fill would latch FillsSettled on a
+                // total that had not caught up with what filled, and the latch cannot be un-set when
+                // the remaining executions arrive: ExecutionService gets a short fill list presented
+                // as settled and persists it as the permanent record.
+                //
+                // What ends this order's wait instead is a trailing terminal orderStatus (which does
+                // carry a final quantity, and re-asks the question in ApplyStatus), or the fill grace
+                // expiring with the warning that names the shortfall. Both are honest about a total
+                // nobody has confirmed; this was not.
             }
 
             if (IbkrOrderBuilder.IsTerminal(_status))
             {
                 Settled.TrySetResult();
-            }
-
-            if (fillsComplete)
-            {
-                FillsSettled.TrySetResult();
             }
         }
 

@@ -18,7 +18,8 @@ public sealed record FuturesContractResolution(
 
 /// <summary>
 /// Thin HTTP client for the parts of the IBKR gateway that recorder orchestration needs: underlying
-/// resolution, option chains, contract resolution, and standing-subscription leases.
+/// resolution, contract resolution, and standing-subscription leases. Option chains are fetched
+/// through <see cref="OptionChainClient"/> instead — see that type for why it is a separate client.
 /// </summary>
 /// <remarks>
 /// ResearchService talks to the gateway over HTTP, never via a project reference to it — the two
@@ -40,25 +41,6 @@ public sealed class IbkrGatewayClient(HttpClient httpClient, ILogger<IbkrGateway
         }
 
         return await response.Content.ReadFromJsonAsync<UnderlyingResolution>(cancellationToken);
-    }
-
-    public async Task<IReadOnlyList<OptionContract>> GetChainAsync(
-        string underlying, DateOnly expiration, string tradingClass, int window, CancellationToken cancellationToken)
-    {
-        var path = $"/ibkr/options/chains/{Uri.EscapeDataString(underlying)}" +
-                    $"?expiration={expiration:yyyy-MM-dd}&window={window}&tradingClass={Uri.EscapeDataString(tradingClass)}";
-
-        var response = await httpClient.GetAsync(path, cancellationToken);
-
-        if (!response.IsSuccessStatusCode)
-        {
-            logger.LogWarning(
-                "Chain request failed for {Underlying}/{TradingClass} near {Expiration}: {Status}.",
-                underlying, tradingClass, expiration, response.StatusCode);
-            return [];
-        }
-
-        return await response.Content.ReadFromJsonAsync<IReadOnlyList<OptionContract>>(cancellationToken) ?? [];
     }
 
     /// <summary>Resolves each contract to its conId; contracts the broker could not match are simply absent from the result.</summary>
@@ -101,9 +83,9 @@ public sealed class IbkrGatewayClient(HttpClient httpClient, ILogger<IbkrGateway
     /// </summary>
     /// <remarks>
     /// Swallows failure into an empty list rather than throwing, matching
-    /// <see cref="ResolveUnderlyingAsync"/> and <see cref="GetChainAsync"/>: the only caller is a
-    /// periodic scan for which "nothing back this pass" means "try again next scan", not a fatal
-    /// error worth tearing down the walker over.
+    /// <see cref="ResolveUnderlyingAsync"/>: the only caller is a periodic scan for which "nothing
+    /// back this pass" means "try again next scan", not a fatal error worth tearing down the walker
+    /// over.
     /// </remarks>
     public async Task<IReadOnlyList<FuturesContractResolution>> GetFuturesFamilyAsync(
         string symbol, string exchange, string currency, CancellationToken cancellationToken)
@@ -189,7 +171,21 @@ public sealed class IbkrGatewayClient(HttpClient httpClient, ILogger<IbkrGateway
         {
             if (response.IsSuccessStatusCode)
             {
-                var body = await response.Content.ReadFromJsonAsync<HistoricalBarsResponseDto>(cancellationToken);
+                HistoricalBarsResponseDto? body;
+
+                try
+                {
+                    body = await response.Content.ReadFromJsonAsync<HistoricalBarsResponseDto>(cancellationToken);
+                }
+                catch (Exception ex) when (IsBodyReadFailure(ex, cancellationToken))
+                {
+                    // Transient, not Unreachable: the gateway answered 200, so the request reached
+                    // TWS and may well have consumed a paced request slot. Classifying rather than
+                    // throwing is the point — see IsBodyReadFailure.
+                    return new HistoricalBarsResult(
+                        GatewayOutcome.Transient, [], null, null,
+                        $"The gateway's 200 response body could not be read. {ex.Message}");
+                }
 
                 if (body is null)
                 {
@@ -227,7 +223,18 @@ public sealed class IbkrGatewayClient(HttpClient httpClient, ILogger<IbkrGateway
         {
             if (response.IsSuccessStatusCode)
             {
-                var body = await response.Content.ReadFromJsonAsync<HeadTimestampResponseDto>(cancellationToken);
+                HeadTimestampResponseDto? body;
+
+                try
+                {
+                    body = await response.Content.ReadFromJsonAsync<HeadTimestampResponseDto>(cancellationToken);
+                }
+                catch (Exception ex) when (IsBodyReadFailure(ex, cancellationToken))
+                {
+                    return new HeadTimestampResult(
+                        GatewayOutcome.Transient, null, null, null,
+                        $"The gateway's 200 response body could not be read. {ex.Message}");
+                }
 
                 return body is null
                     ? new HeadTimestampResult(GatewayOutcome.Transient, null, null, null, "The gateway returned an empty body.")
@@ -240,8 +247,8 @@ public sealed class IbkrGatewayClient(HttpClient httpClient, ILogger<IbkrGateway
     }
 
     /// <summary>
-    /// Whether an exception thrown by the send is a transport failure this classifier owns, rather
-    /// than the caller's own cancellation.
+    /// Whether an exception thrown by <b>the send</b> is a transport failure this classifier owns,
+    /// rather than the caller's own cancellation.
     /// </summary>
     /// <remarks>
     /// Deliberately wider than <c>HttpRequestException or TaskCanceledException</c>. The resilience
@@ -250,9 +257,16 @@ public sealed class IbkrGatewayClient(HttpClient httpClient, ILogger<IbkrGateway
     /// which matched neither arm of the original filter, escaped this method entirely, and surfaced
     /// at the coordinator's outermost catch. That path never writes an outcome, so the claimed row
     /// stayed <c>inflight</c> until a reaper turned it into <c>failed</c> with its attempt already
-    /// burned: the one failure shape that both loses the slice AND spends its retry budget. Anything
-    /// this method fails to recognise now still leaves this class as a classified outcome instead of
-    /// a stranded claim, which is the property that was actually missing.
+    /// burned: the one failure shape that both loses the slice AND spends its retry budget.
+    /// <para>
+    /// <b>This covers the send and nothing else, and the earlier claim that it closed the whole
+    /// stranded-claim class was wrong.</b> Reading the response body is a second network operation
+    /// that throws its own exceptions (a connection reset part-way through a 200, a truncated JSON
+    /// document) — <see cref="IsBodyReadFailure"/> is what classifies those. The bookkeeping AFTER
+    /// this client returns is a third region again, and it is guarded where it lives, by
+    /// <c>BackfillCoordinator.ExecuteSliceAsync</c>. Whoever widens one of the three should not
+    /// assume the other two came with it.
+    /// </para>
     /// </remarks>
     private static bool IsTransportFailure(Exception ex, CancellationToken cancellationToken)
     {
@@ -268,6 +282,25 @@ public sealed class IbkrGatewayClient(HttpClient httpClient, ILogger<IbkrGateway
         // OperationCanceledException belongs to a cancellation this method has no business claiming.
         return ex is not OperationCanceledException || ex is TaskCanceledException;
     }
+
+    /// <summary>
+    /// Whether an exception thrown while reading an already-received response body is one this
+    /// classifier owns.
+    /// </summary>
+    /// <remarks>
+    /// The status line can arrive and the body still fail: a reset connection mid-stream surfaces as
+    /// <see cref="HttpRequestException"/> or <see cref="IOException"/>, a truncated document as
+    /// <see cref="JsonException"/>. None of those reached the send's catch — it had already
+    /// completed — so they escaped to the coordinator, which is the stranded-claim path this client's
+    /// classification exists to keep closed. Everything here maps to
+    /// <see cref="GatewayOutcome.Transient"/> rather than <see cref="GatewayOutcome.Unreachable"/>:
+    /// a response was produced, so TWS was reached and a paced slot was spent.
+    /// </remarks>
+    private static bool IsBodyReadFailure(Exception ex, CancellationToken cancellationToken) =>
+        // The same predicate as IsTransportFailure — anything that is not the caller's own
+        // cancellation — shared rather than restated so widening one cannot leave the other behind.
+        // What differs is the REGION it guards and therefore the outcome the call site returns.
+        IsTransportFailure(ex, cancellationToken);
 
     /// <summary>
     /// Splits a transport failure into "provably never reached TWS" and "may have reached TWS".
@@ -358,10 +391,13 @@ public sealed class IbkrGatewayClient(HttpClient httpClient, ILogger<IbkrGateway
 
             return (errorCode, detail);
         }
-        catch (JsonException)
+        catch (Exception ex) when (ex is not OperationCanceledException)
         {
             // A non-ProblemDetails body (a proxy's HTML error page, say) still classifies fine on
             // status code alone; losing the detail text is not worth failing the request over.
+            // Widened from JsonException for the reason the whole class of fix here shares: the READ
+            // can fail as well as the parse, and an IOException escaping this method would take the
+            // already-decided status-code classification with it and strand the caller's claim.
             return (null, response.ReasonPhrase);
         }
     }

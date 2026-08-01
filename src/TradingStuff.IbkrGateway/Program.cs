@@ -200,10 +200,15 @@ app.MapGet("/ibkr/futures/{symbol}/contracts", async (
     })
     .RequireAuthorization();
 
+// Two mutually exclusive ways to say how wide the window is, named so neither can be mistaken for
+// the other: strikeHalfCount is a COUNT of strikes each side, moneynessHalfWidth is a FRACTION of
+// spot. The old name was `window`, which is what let a caller pass 20 meaning ±20% and receive the
+// 41 strikes nearest spot — ±1.3% of SPX — with no error anywhere.
 app.MapGet("/ibkr/options/chains/{underlying}", async (
         string underlying,
         [FromQuery] string? expiration,
-        [FromQuery] int? window,
+        [FromQuery] int? strikeHalfCount,
+        [FromQuery] decimal? moneynessHalfWidth,
         [FromQuery] string? tradingClass,
         IbkrMarketDataClient client,
         CancellationToken cancellationToken) =>
@@ -215,9 +220,10 @@ app.MapGet("/ibkr/options/chains/{underlying}", async (
             return Results.Ok(await client.GetOptionChainAsync(
                 underlying,
                 target,
-                window,
+                strikeHalfCount,
                 cancellationToken,
-                tradingClass));
+                tradingClass,
+                moneynessHalfWidth));
         }
         catch (IbkrRequestException ex)
         {
