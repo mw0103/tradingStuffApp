@@ -57,7 +57,7 @@ namespace TradingStuff.Volatility.ThetaData
             var columns = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
             for (int i = 0; i < headers.Length; i++)
             {
-                columns[headers[i].Trim()] = i;
+                columns[Unquote(headers[i])] = i;
             }
 
             var rows = new List<string[]>(lines.Count - 1);
@@ -98,8 +98,10 @@ namespace TradingStuff.Volatility.ThetaData
             if (column >= row.Length)
                 throw new InvalidOperationException("The row has fewer fields than the header declares.");
 
+            var text = Unquote(row[column]);
+
             double value;
-            if (!double.TryParse(row[column], NumberStyles.Float, CultureInfo.InvariantCulture, out value))
+            if (!double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture, out value))
                 throw new InvalidOperationException(string.Format("Could not parse '{0}' as a number.", row[column]));
 
             return value;
@@ -110,8 +112,10 @@ namespace TradingStuff.Volatility.ThetaData
             if (column >= row.Length)
                 throw new InvalidOperationException("The row has fewer fields than the header declares.");
 
+            var text = Unquote(row[column]);
+
             long value;
-            if (!long.TryParse(row[column], NumberStyles.Integer, CultureInfo.InvariantCulture, out value))
+            if (!long.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture, out value))
                 throw new InvalidOperationException(string.Format("Could not parse '{0}' as an integer.", row[column]));
 
             return value;
@@ -119,7 +123,35 @@ namespace TradingStuff.Volatility.ThetaData
 
         public static string GetString(string[] row, int column)
         {
-            return column < row.Length ? row[column].Trim() : string.Empty;
+            return column < row.Length ? Unquote(row[column]) : string.Empty;
+        }
+
+        /// <summary>
+        /// Trims whitespace and removes one layer of surrounding double quotes.
+        /// </summary>
+        /// <remarks>
+        /// API v3 quotes its string fields and leaves numerics bare, in the same response.
+        /// Stripping here rather than at each call site keeps the asymmetry from leaking:
+        /// an option right read as <c>"CALL"</c> with the quote attached parses as neither
+        /// a call nor a put, and a quoted number parses as nothing at all.
+        /// <para>
+        /// Deliberately not a full RFC 4180 reader. Escaped quotes and embedded commas are
+        /// not handled, because this feed emits neither, and a half-implemented quoted-field
+        /// parser that silently mis-splits a row is worse than one that plainly does not
+        /// support them.
+        /// </para>
+        /// </remarks>
+        private static string Unquote(string value)
+        {
+            if (value == null) return string.Empty;
+
+            var trimmed = value.Trim();
+            if (trimmed.Length >= 2 && trimmed[0] == '"' && trimmed[trimmed.Length - 1] == '"')
+            {
+                return trimmed.Substring(1, trimmed.Length - 2);
+            }
+
+            return trimmed;
         }
     }
 }

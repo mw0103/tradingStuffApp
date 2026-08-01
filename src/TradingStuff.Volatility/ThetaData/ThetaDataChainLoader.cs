@@ -71,7 +71,11 @@ namespace TradingStuff.Volatility.ThetaData
         {
             if (table == null) throw new ArgumentNullException("table");
 
-            var dateColumn = table.RequireColumn("date");
+            // v3 carries a single ISO timestamp; the older feed split it into a date and a
+            // milliseconds-of-day column. Both spellings are resolved so a response from
+            // either shape parses, and neither is read positionally.
+            var timestampColumn = table.HasColumn("timestamp") ? table.RequireColumn("timestamp") : -1;
+            var dateColumn = timestampColumn >= 0 ? -1 : table.RequireColumn("date");
             var strikeColumn = table.RequireColumn("strike");
             var rightColumn = table.RequireColumn("right");
             var bidColumn = table.RequireColumn("bid");
@@ -83,7 +87,10 @@ namespace TradingStuff.Volatility.ThetaData
 
             foreach (var row in table.Rows)
             {
-                var date = ParseDate(CsvTable.GetString(row, dateColumn));
+                var observed = timestampColumn >= 0
+                    ? ParseTimestamp(CsvTable.GetString(row, timestampColumn))
+                    : ParseDate(CsvTable.GetString(row, dateColumn));
+                var date = observed.Date;
                 var strike = CsvTable.GetDouble(row, strikeColumn) / _options.StrikeDivisor;
                 var right = ParseRight(CsvTable.GetString(row, rightColumn));
                 var bid = CsvTable.GetDouble(row, bidColumn);
@@ -94,9 +101,13 @@ namespace TradingStuff.Volatility.ThetaData
                 OptionChainSlice slice;
                 if (!byDate.TryGetValue(date, out slice))
                 {
-                    var observedAt = timeColumn >= 0
-                        ? date.AddMilliseconds(CsvTable.GetDouble(row, timeColumn))
-                        : date.AddMilliseconds(_options.SnapshotMillisecondsOfDay);
+                    // A v3 timestamp already carries the time of day; the older shape needs
+                    // it from ms_of_day, falling back to the configured snapshot time.
+                    var observedAt = timestampColumn >= 0
+                        ? observed
+                        : timeColumn >= 0
+                            ? date.AddMilliseconds(CsvTable.GetDouble(row, timeColumn))
+                            : date.Add(_options.SnapshotTimeOfDay);
 
                     slice = new OptionChainSlice
                     {
@@ -138,6 +149,18 @@ namespace TradingStuff.Volatility.ThetaData
                     "of a cent, so this is almost certainly a units mismatch.",
                     root, expiration, lowest, highest, expectedLevel, _options.StrikeDivisor));
             }
+        }
+
+        /// <summary>Parses an ISO timestamp, keeping its time of day.</summary>
+        private static DateTime ParseTimestamp(string value)
+        {
+            DateTime parsed;
+            if (DateTime.TryParse(value, CultureInfo.InvariantCulture, DateTimeStyles.None, out parsed))
+            {
+                return parsed;
+            }
+
+            throw new InvalidOperationException(string.Format("Could not parse '{0}' as a timestamp.", value));
         }
 
         private static DateTime ParseDate(string value)

@@ -13,81 +13,65 @@ namespace TradingStuff.Volatility.ThetaData
         /// and proxies to ThetaData, so requests from here carry no authentication of
         /// their own - if calls fail with a connection error, the Terminal is not running.
         /// </summary>
+        /// <remarks>
+        /// Port 25503 is the v3 REST port. The v2 Terminal served 25510; a Terminal on that
+        /// port is too old for this client.
+        /// </remarks>
         public string BaseAddress { get; set; }
-
-        /// <summary>
-        /// API version prefix. v2 is the stable, fully documented surface and is the
-        /// default. v3 merges the hist and bulk_hist endpoints into one history endpoint
-        /// and uses a wildcard for bulk requests; see <see cref="ThetaDataEndpoints"/>.
-        /// </summary>
-        public string ApiVersion { get; set; }
 
         public TimeSpan Timeout { get; set; }
 
         /// <summary>
-        /// Divisor converting ThetaData's integer strike representation to dollars.
-        /// Strikes are quoted in tenths of a cent, so the default is 1000. Wrong here and
-        /// every strike is off by three orders of magnitude, which
-        /// <see cref="ThetaDataChainLoader"/> checks for explicitly.
+        /// Divisor converting the feed's strike representation to dollars. API v3 quotes
+        /// strikes in dollars already, so the default is 1. Wrong here and every strike is
+        /// off by orders of magnitude, which <see cref="ThetaDataChainLoader"/> checks for
+        /// explicitly - the v2 feed quoted tenths of a cent and needed 1000.
         /// </summary>
         public double StrikeDivisor { get; set; }
 
         /// <summary>
-        /// Time of day sampled for the daily snapshot, in milliseconds since midnight ET.
-        /// Defaults to 15:45, late enough to be representative but before the closing
-        /// auction widens quotes.
+        /// Time of day sampled for the daily snapshot, in exchange-local terms as the feed
+        /// reports it. Defaults to 15:45, late enough to be representative but before the
+        /// closing auction widens quotes.
         /// </summary>
-        public int SnapshotMillisecondsOfDay { get; set; }
+        public TimeSpan SnapshotTimeOfDay { get; set; }
 
         public ThetaDataOptions()
         {
-            BaseAddress = "http://127.0.0.1:25510";
-            ApiVersion = "v2";
+            BaseAddress = "http://127.0.0.1:25503";
             Timeout = TimeSpan.FromMinutes(10);
-            StrikeDivisor = 1000.0;
-            SnapshotMillisecondsOfDay = (15 * 3600 + 45 * 60) * 1000;
+            StrikeDivisor = 1.0;
+            SnapshotTimeOfDay = new TimeSpan(15, 45, 0);
         }
     }
 
     /// <summary>
-    /// Endpoint paths, isolated so an API version change is a single edit.
+    /// Endpoint paths, isolated so a version change is a single edit.
     /// </summary>
+    /// <remarks>
+    /// API v3 only. v2 is not deprecated but removed - a v2 Terminal answers every v2 route
+    /// with 410 and a message naming the renamed parameters - so there is nothing to branch
+    /// between and the version parameter these methods used to take has gone.
+    /// </remarks>
     public static class ThetaDataEndpoints
     {
-        public static string Expirations(string version)
-        {
-            // v3: /v3/option/list/expirations
-            return version == "v3" ? "/v3/option/list/expirations" : "/v2/list/expirations";
-        }
-
-        public static string Strikes(string version)
-        {
-            // v3: /v3/option/list/strikes
-            return version == "v3" ? "/v3/option/list/strikes" : "/v2/list/strikes";
-        }
+        public const string Expirations = "/v3/option/list/expirations";
+        public const string Strikes = "/v3/option/list/strikes";
 
         /// <summary>
-        /// Quotes for every strike of one expiration. v2 has a dedicated bulk endpoint;
-        /// v3 folds it into the single history endpoint with a wildcard strike.
+        /// Option quote history. Serves both the single-contract and the whole-expiration
+        /// case; see <see cref="ThetaDataClient.GetDailyChainQuotesAsync"/> for how the
+        /// bulk form is requested.
         /// </summary>
-        public static string BulkOptionQuotes(string version)
-        {
-            return version == "v3" ? "/v3/option/history/quote" : "/v2/bulk_hist/option/quote";
-        }
+        public const string OptionQuotes = "/v3/option/history/quote";
 
-        public static string IndexPrice(string version)
-        {
-            return version == "v3" ? "/v3/index/history/price" : "/v2/hist/index/price";
-        }
-
-        public static string StockOhlc(string version)
-        {
-            return version == "v3" ? "/v3/stock/history/ohlc" : "/v2/hist/stock/ohlc";
-        }
+        public const string OptionEndOfDay = "/v3/option/history/eod";
+        public const string IndexPrice = "/v3/index/history/price";
+        public const string StockOhlc = "/v3/stock/history/ohlc";
     }
 
     /// <summary>
-    /// Thin HTTP client over the local Theta Terminal.
+    /// Thin HTTP client over the local Theta Terminal, API v3.
     ///
     /// Every request asks for CSV: it is a fraction of the size of the JSON form for
     /// bulk option data, which matters when a single expiration-day pull runs to
@@ -124,7 +108,7 @@ namespace TradingStuff.Volatility.ThetaData
                         Uri.EscapeDataString(parameter.Key), Uri.EscapeDataString(parameter.Value)));
                 }
             }
-            query.Add("use_csv=true");
+            query.Add("format=csv");
 
             var url = path + "?" + string.Join("&", query);
 
@@ -142,6 +126,22 @@ namespace TradingStuff.Volatility.ThetaData
 
             var body = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
 
+            // The Terminal answers a route from an older API version with 410 and a message
+            // naming the renamed parameters. Worth calling out separately: it means the
+            // client is too old for the Terminal, not that the request was malformed.
+            if ((int)response.StatusCode == 410)
+                throw new ThetaDataVersionException(string.Format(
+                    "{0} was rejected as an outdated API version. This client speaks v3. Terminal said: {1}",
+                    url, Truncate(body, 300)));
+
+            // A subscription that does not cover the asset class is a account-level fact
+            // rather than a fault in the request, and is worth distinguishing so a caller
+            // can skip the endpoint rather than retry it.
+            if ((int)response.StatusCode == 403)
+                throw new ThetaDataSubscriptionException(string.Format(
+                    "{0} requires a subscription this account does not have. Terminal said: {1}",
+                    url, Truncate(body, 300)));
+
             if (!response.IsSuccessStatusCode)
                 throw new InvalidOperationException(string.Format(
                     "{0} returned {1}: {2}", url, (int)response.StatusCode, Truncate(body, 500)));
@@ -153,74 +153,144 @@ namespace TradingStuff.Volatility.ThetaData
             return CsvTable.Parse(body);
         }
 
-        public Task<CsvTable> ListExpirationsAsync(string root)
+        public Task<CsvTable> ListExpirationsAsync(string symbol)
         {
-            return GetAsync(ThetaDataEndpoints.Expirations(_options.ApiVersion),
-                new Dictionary<string, string> { { "root", root } });
+            return GetAsync(ThetaDataEndpoints.Expirations,
+                new Dictionary<string, string> { { "symbol", symbol } });
+        }
+
+        public Task<CsvTable> ListStrikesAsync(string symbol, DateTime expiration)
+        {
+            return GetAsync(ThetaDataEndpoints.Strikes,
+                new Dictionary<string, string>
+                {
+                    { "symbol", symbol },
+                    { "expiration", IsoDate(expiration) }
+                });
         }
 
         /// <summary>
-        /// Quotes for every strike of one expiration, sampled once per day at the
+        /// Quotes for every strike and right of one expiration, sampled once per day at the
         /// configured snapshot time across a date range.
         /// </summary>
+        /// <remarks>
+        /// The bulk form is requested by OMITTING strike and right, not by passing a
+        /// wildcard - v3 answers <c>strike=*</c> with a 400. Bounding the interval to a
+        /// single minute at the snapshot time yields exactly one row per contract per day
+        /// instead of a full session of ticks that would be discarded.
+        /// </remarks>
         public Task<CsvTable> GetDailyChainQuotesAsync(
-            string root, DateTime expiration, DateTime startDate, DateTime endDate)
+            string symbol, DateTime expiration, DateTime startDate, DateTime endDate)
         {
-            var snapshot = _options.SnapshotMillisecondsOfDay.ToString(CultureInfo.InvariantCulture);
+            var snapshot = TimeOfDay(_options.SnapshotTimeOfDay);
 
-            var parameters = new Dictionary<string, string>
+            return GetAsync(ThetaDataEndpoints.OptionQuotes,
+                new Dictionary<string, string>
+                {
+                    { "symbol", symbol },
+                    { "expiration", IsoDate(expiration) },
+                    { "start_date", IsoDate(startDate) },
+                    { "end_date", IsoDate(endDate) },
+                    { "interval", "1m" },
+                    { "start_time", snapshot },
+                    { "end_time", snapshot }
+                });
+        }
+
+        /// <summary>Quotes for a single contract over a date range.</summary>
+        public Task<CsvTable> GetContractQuotesAsync(
+            string symbol, DateTime expiration, double strike, OptionRightCode right,
+            DateTime startDate, DateTime endDate, TimeSpan interval)
+        {
+            return GetAsync(ThetaDataEndpoints.OptionQuotes,
+                new Dictionary<string, string>
+                {
+                    { "symbol", symbol },
+                    { "expiration", IsoDate(expiration) },
+                    { "strike", strike.ToString("0.####", CultureInfo.InvariantCulture) },
+                    { "right", right == OptionRightCode.Call ? "C" : "P" },
+                    { "start_date", IsoDate(startDate) },
+                    { "end_date", IsoDate(endDate) },
+                    { "interval", FormatInterval(interval) }
+                });
+        }
+
+        /// <summary>
+        /// Index level history.
+        /// </summary>
+        /// <remarks>
+        /// Requires a value subscription. Verified against a live Terminal only to the point
+        /// of the subscription check, which a FREE account fails with a 403 - so the request
+        /// shape here is unconfirmed beyond being accepted as well-formed.
+        /// </remarks>
+        public Task<CsvTable> GetIndexPriceAsync(
+            string symbol, DateTime startDate, DateTime endDate, TimeSpan interval)
+        {
+            return GetAsync(ThetaDataEndpoints.IndexPrice, HistoryParameters(symbol, startDate, endDate, interval));
+        }
+
+        /// <summary>
+        /// Stock OHLC history.
+        /// </summary>
+        /// <remarks>Requires a value subscription; see <see cref="GetIndexPriceAsync"/>.</remarks>
+        public Task<CsvTable> GetStockOhlcAsync(
+            string symbol, DateTime startDate, DateTime endDate, TimeSpan interval)
+        {
+            return GetAsync(ThetaDataEndpoints.StockOhlc, HistoryParameters(symbol, startDate, endDate, interval));
+        }
+
+        private static Dictionary<string, string> HistoryParameters(
+            string symbol, DateTime startDate, DateTime endDate, TimeSpan interval)
+        {
+            return new Dictionary<string, string>
             {
-                { "root", root },
-                { "start_date", Yyyymmdd(startDate) },
-                { "end_date", Yyyymmdd(endDate) },
-                // One-minute bars restricted to a single minute yields exactly one row per
-                // contract per day, instead of a full day of ticks that would be discarded.
-                { "ivl", "60000" },
-                { "start_time", snapshot },
-                { "end_time", snapshot }
+                { "symbol", symbol },
+                { "start_date", IsoDate(startDate) },
+                { "end_date", IsoDate(endDate) },
+                { "interval", FormatInterval(interval) }
             };
-
-            if (_options.ApiVersion == "v3")
-            {
-                parameters["expiration"] = Yyyymmdd(expiration);
-                parameters["strike"] = "*";
-                parameters["right"] = "*";
-            }
-            else
-            {
-                parameters["exp"] = Yyyymmdd(expiration);
-            }
-
-            return GetAsync(ThetaDataEndpoints.BulkOptionQuotes(_options.ApiVersion), parameters);
         }
 
-        public Task<CsvTable> GetIndexPriceAsync(string root, DateTime startDate, DateTime endDate, int intervalMs)
+        /// <summary>Dates are ISO in v3; the v2 feed used a compact yyyyMMdd form.</summary>
+        public static string IsoDate(DateTime date)
         {
-            return GetAsync(ThetaDataEndpoints.IndexPrice(_options.ApiVersion),
-                new Dictionary<string, string>
-                {
-                    { "root", root },
-                    { "start_date", Yyyymmdd(startDate) },
-                    { "end_date", Yyyymmdd(endDate) },
-                    { "ivl", intervalMs.ToString(CultureInfo.InvariantCulture) }
-                });
+            return date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
         }
 
-        public Task<CsvTable> GetStockOhlcAsync(string root, DateTime startDate, DateTime endDate, int intervalMs)
+        public static string TimeOfDay(TimeSpan timeOfDay)
         {
-            return GetAsync(ThetaDataEndpoints.StockOhlc(_options.ApiVersion),
-                new Dictionary<string, string>
-                {
-                    { "root", root },
-                    { "start_date", Yyyymmdd(startDate) },
-                    { "end_date", Yyyymmdd(endDate) },
-                    { "ivl", intervalMs.ToString(CultureInfo.InvariantCulture) }
-                });
+            if (timeOfDay < TimeSpan.Zero || timeOfDay >= TimeSpan.FromDays(1))
+                throw new ArgumentOutOfRangeException("timeOfDay", "A time of day must fall within one day.");
+
+            return string.Format(CultureInfo.InvariantCulture, "{0:00}:{1:00}:{2:00}",
+                timeOfDay.Hours, timeOfDay.Minutes, timeOfDay.Seconds);
         }
 
-        public static string Yyyymmdd(DateTime date)
+        /// <summary>
+        /// Formats a sampling interval the way v3 expects: a whole number of seconds,
+        /// minutes or hours.
+        /// </summary>
+        /// <remarks>
+        /// The largest whole unit is used, because that is the form the documentation shows
+        /// and the only one confirmed against a live Terminal across the range. Days are
+        /// deliberately not produced - v3 rejects <c>1d</c> - and neither is zero, which it
+        /// also rejects.
+        /// </remarks>
+        public static string FormatInterval(TimeSpan interval)
         {
-            return date.ToString("yyyyMMdd", CultureInfo.InvariantCulture);
+            if (interval <= TimeSpan.Zero)
+                throw new ArgumentOutOfRangeException("interval", "A sampling interval must be positive.");
+            if (interval.Milliseconds != 0)
+                throw new ArgumentOutOfRangeException("interval", "Sub-second intervals are not supported.");
+
+            var totalSeconds = (long)interval.TotalSeconds;
+
+            if (totalSeconds % 3600 == 0)
+                return (totalSeconds / 3600).ToString(CultureInfo.InvariantCulture) + "h";
+            if (totalSeconds % 60 == 0)
+                return (totalSeconds / 60).ToString(CultureInfo.InvariantCulture) + "m";
+
+            return totalSeconds.ToString(CultureInfo.InvariantCulture) + "s";
         }
 
         private static string Truncate(string value, int length)
@@ -235,6 +305,13 @@ namespace TradingStuff.Volatility.ThetaData
         }
     }
 
+    /// <summary>Which side of the chain a single-contract request wants.</summary>
+    public enum OptionRightCode
+    {
+        Call = 0,
+        Put = 1
+    }
+
     /// <summary>
     /// Raised when the Terminal reports no data for a request. Distinguished from a
     /// genuine failure because an expiration with no quotes on a given date is normal and
@@ -243,6 +320,29 @@ namespace TradingStuff.Volatility.ThetaData
     public class ThetaDataNoDataException : Exception
     {
         public ThetaDataNoDataException(string message) : base(message)
+        {
+        }
+    }
+
+    /// <summary>
+    /// Raised when the Terminal rejects the request as belonging to a removed API version.
+    /// Separate from a malformed request: nothing about the arguments will fix it.
+    /// </summary>
+    public class ThetaDataVersionException : Exception
+    {
+        public ThetaDataVersionException(string message) : base(message)
+        {
+        }
+    }
+
+    /// <summary>
+    /// Raised when the account's subscription does not cover the asset class. A property of
+    /// the account rather than the request, so a caller should skip the endpoint rather than
+    /// retry or adjust it.
+    /// </summary>
+    public class ThetaDataSubscriptionException : Exception
+    {
+        public ThetaDataSubscriptionException(string message) : base(message)
         {
         }
     }

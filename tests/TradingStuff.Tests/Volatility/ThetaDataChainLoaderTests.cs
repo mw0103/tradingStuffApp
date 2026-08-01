@@ -20,9 +20,9 @@ public class ThetaDataChainLoaderTests
     private static CsvTable Table(params string[] rows) =>
         CsvTable.Parse("date,ms_of_day,strike,right,bid,ask\n" + string.Join("\n", rows) + "\n");
 
-    /// <summary>Strikes are quoted in tenths of a cent, so 5000.0 is written 5000000.</summary>
+    /// <summary>API v3 quotes strikes in dollars, so 5000.0 is written 5000.000.</summary>
     private static string Row(string date, double strike, string right, double bid, double ask, int ms = 56_700_000) =>
-        $"{date},{ms},{strike * 1000:F0},{right},{bid},{ask}";
+        $"{date},{ms},{strike:F3},{right},{bid},{ask}";
 
     // ---------- settlement ----------
 
@@ -72,7 +72,7 @@ public class ThetaDataChainLoaderTests
     }
 
     [Fact]
-    public void StrikesAreConvertedFromTenthsOfACent()
+    public void StrikesArriveInDollars()
     {
         var slices = new ThetaDataChainLoader().Parse(
             Table(Row("20240304", 5000.0, "C", 1.0, 1.2)), "SPXW", Expiry);
@@ -82,11 +82,13 @@ public class ThetaDataChainLoaderTests
     }
 
     [Fact]
-    public void TheDivisorIsConfigurable()
+    public void TheDivisorIsConfigurableForFeedsThatDoNot()
     {
-        var loader = new ThetaDataChainLoader(new ThetaDataOptions { StrikeDivisor = 1.0 });
+        // The v2 feed quoted tenths of a cent and needed 1000. Kept configurable rather than
+        // hardcoded, because the units are a property of the feed, not of options.
+        var loader = new ThetaDataChainLoader(new ThetaDataOptions { StrikeDivisor = 1000.0 });
 
-        var slices = loader.Parse(Table(Row("20240304", 5.0, "C", 1.0, 1.2)), "SPXW", Expiry);
+        var slices = loader.Parse(Table(Row("20240304", 5_000_000.0, "C", 1.0, 1.2)), "SPXW", Expiry);
 
         Assert.Equal(5000.0, slices[0].Quotes[0].Strike, 9);
     }
@@ -231,9 +233,9 @@ public class ThetaDataChainLoaderTests
     [Fact]
     public void AWrongDivisorIsCaughtByTheUnderlyingCrossCheck()
     {
-        // Divisor left at 1 turns 5000-point strikes into 5,000,000: parses cleanly, and is
-        // wrong by three orders of magnitude.
-        var loader = new ThetaDataChainLoader(new ThetaDataOptions { StrikeDivisor = 1.0 });
+        // A divisor left at the v2 value of 1000 turns 5000-point strikes into 5: parses
+        // cleanly, and is wrong by three orders of magnitude.
+        var loader = new ThetaDataChainLoader(new ThetaDataOptions { StrikeDivisor = 1000.0 });
 
         var ex = Assert.Throws<InvalidOperationException>(() => loader.Parse(
             Table(Row("20240304", 4500.0, "P", 1.0, 1.2), Row("20240304", 5500.0, "C", 1.0, 1.2)),
@@ -258,7 +260,7 @@ public class ThetaDataChainLoaderTests
     [Fact]
     public void TheGuardIsSkippedWhenNoLevelIsSupplied()
     {
-        var loader = new ThetaDataChainLoader(new ThetaDataOptions { StrikeDivisor = 1.0 });
+        var loader = new ThetaDataChainLoader(new ThetaDataOptions { StrikeDivisor = 1000.0 });
 
         // No exception: the caller did not ask for the check.
         Assert.Single(loader.Parse(Table(Row("20240304", 5000.0, "C", 1.0, 1.2)), "SPXW", Expiry));
