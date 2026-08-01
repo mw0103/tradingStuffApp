@@ -91,6 +91,7 @@ builder.Services.AddSingleton<IOrderRouter>(sp =>
 // request, so a mismatch would surface as a failed order on a service that had been reporting
 // healthy for hours. Startup is the only moment at which refusing costs nothing.
 ExecutionSafetyConfiguration.EnsureRouterAndPortfolioAgree(builder.Configuration);
+ExecutionSafetyConfiguration.EnsureRouterAndMarketDataAgree(builder.Configuration);
 
 var app = builder.Build();
 

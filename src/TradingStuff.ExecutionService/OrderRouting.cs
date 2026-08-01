@@ -280,4 +280,49 @@ public static class ExecutionSafetyConfiguration
             $"'{PortfolioSources.Ibkr}' — real orders would be risk-checked against fabricated " +
             "development figures. Set Portfolio__Source=ibkr, or route to the paper engine.");
     }
+
+    /// <summary>
+    /// The same guard for the third setting in the pair's blind spot: the quotes risk prices from.
+    /// </summary>
+    /// <remarks>
+    /// Demonstrated live on 2026-08-01, and the reason this exists rather than being assumed safe:
+    /// <c>MarketData:Source</c> was set to <c>"ibkr"</c> — a plausible-looking value that is not one
+    /// of the recognised strings (<c>ibkr-live</c> / <c>ibkr-delayed</c>) — so MarketDataService
+    /// silently degraded to the deterministic generator while <c>Execution:Router=ibkr</c> kept
+    /// transmitting. A 10-lot SPY vertical was approved against synthetic quotes of bid 27.34 /
+    /// ask 28.46 on a Saturday, when the real market for that contract was 0/0, and the order rested
+    /// at TWS. Risk had checked numbers that were invented.
+    /// <para>
+    /// Note this survives the <c>UNPRICEABLE_LEG</c> guard rather than being caught by it: that guard
+    /// refuses quotes it cannot price, and the deterministic feed always produces confident,
+    /// well-formed, entirely fictional ones. Fail-safe degradation plus fail-closed pricing still
+    /// leaves this hole, because neither component can see that the OTHER one changed meaning — the
+    /// same shape as the router/portfolio pair above, which is why the check belongs beside it.
+    /// </para>
+    /// </remarks>
+    public static void EnsureRouterAndMarketDataAgree(IConfiguration configuration)
+    {
+        var router = configuration["Execution:Router"];
+        var marketDataSource = configuration["MarketData:Source"];
+
+        // Recognised here rather than referencing MarketDataService's own constants: ExecutionService
+        // does not depend on that project, and duplicating two strings beats a project reference
+        // whose only purpose is a startup guard. The values are asserted by test against the real
+        // MarketDataSources so a rename cannot silently disarm this.
+        var usesIbkrQuotes =
+            string.Equals(marketDataSource, "ibkr-live", StringComparison.OrdinalIgnoreCase) ||
+            string.Equals(marketDataSource, "ibkr-delayed", StringComparison.OrdinalIgnoreCase);
+
+        if (!OrderRouters.UsesIbkr(router) || usesIbkrQuotes)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException(
+            $"Execution:Router is '{router}', so approved orders are transmitted to IBKR, but " +
+            $"MarketData:Source is '{marketDataSource ?? "(unset)"}' rather than 'ibkr-live' or " +
+            "'ibkr-delayed' — real orders would be risk-checked against generated quotes that look " +
+            "entirely plausible and describe no real market. Set MarketData__Source=ibkr-live, or " +
+            "route to the paper engine.");
+    }
 }
