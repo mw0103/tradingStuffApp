@@ -241,3 +241,89 @@ more expensive every day the recorder runs, and Phase 3 snapshots will key deriv
 shape.
 
 Recorded here as a known debt with its reversal cost, rather than as a principle the code honours.
+
+## 16. Model and effort are assigned by class of work, not by phase
+
+The operative rules — the table, the class overrides, the two exceptions, the delegation remedy —
+live in `CLAUDE.md`, because they must be read on every task. This entry holds the reasoning, the
+calibration history, and the phase-start protocol, which do not.
+
+### Why a policy exists at all
+
+Left to per-task judgement, model choice drifts toward whatever is convenient in the moment, and the
+drift is invisible: a review done on too small a model does not announce that it missed something.
+The policy exists to make the choice a property of the *work*, decided in advance, rather than a
+property of the session's current state.
+
+### Why the overrides are by class, and why they beat the phase row
+
+The phase table is a **prior**, written from a guess at how hard each phase looked before it was
+built. It is not a measurement. The class overrides are, and they came from counting confirmed
+defects:
+
+| Class | Evidence |
+|---|---|
+| (a) split-path lifetime state machines | 4 of Phase 1's 8 confirmed defects, all top-severity; most of Phase 2's; the Phase 1+2 line-budget leak |
+| (b) ground-truth manufacturers | The `CME_ES` holiday hole — invisible *by construction*, because the reconciliation that should catch it inherits the same assumption |
+| (c) negative-claim acceptance criteria | Three Phase 1 defects and the Phase 2 critical shared one root: a query cannot emit a row for the absent case |
+| (d) read-only UI stays low | Empirically zero defects across shipped phases — the row exists to be **defended against escalation**, not to be raised |
+
+Phase number turned out to be a poor predictor and class of work a good one, which is why the
+overrides win. Note (d) is as load-bearing as the others: a policy that only ever ratchets upward
+costs real money and stops being followed.
+
+### Why a `/model` switch is not an exception
+
+Changing the session model is **ambient state, not an instruction**. It is at least as likely to be a
+leftover from earlier work, a mistake, or unrelated to the task being asked for. "The user selected
+Opus, so they must want Opus for this" is precisely the inference the policy exists to prevent — and
+it was made, and corrected, in this repository.
+
+**Rejected:** treating a `/model` switch immediately preceding a prompt as consent. The user's
+correction was explicit: *"a change just before a prompt is not the same as a prompt telling you to go
+with the selection."*
+
+### Phase-start validation: adversarial, with a separate arbiter
+
+Before starting a phase, decide the **per-work-package** model assignment with three agents:
+
+1. **Attacker (Opus, high)** — argues the standing table is already correct for every package, and
+   attacks each candidate escalation on its merits.
+2. **Justifier (Opus, high)** — argues for escalation wherever warranted, strongest case available.
+3. **Arbiter (Fable)** — decides per package, on the arguments presented.
+
+A single validator both *generates* the escalation case and *judges* it, which is exactly where bias
+hides; telling one model to "watch its own bias" is a weak corrective. Splitting the sides removes the
+stake — an agent instructed to argue *against* escalation has no incentive to escalate — and the
+arbiter then adjudicates a narrow question (which brief is better supported) rather than an open one.
+
+Constraints that make this worth three times the cost rather than merely costing it:
+
+- **Per work package, not per phase.** A phase mixes subtle work with plumbing; one verdict for the
+  whole phase is too coarse to act on.
+- **The table wins ties.** Deviation requires positive justification, or "balanced" becomes a ratchet.
+- **A deviation must name an escalation trigger.** "Seems complex" is not one. The list: novel
+  concurrency or process-lifecycle invariants; correctness hard to cover with tests (timezone/session
+  semantics — *especially any single authority whose output downstream artifacts are validated
+  against*, since the hazard is not that conversion is hard but that the validator and the validated
+  share an assumption, which is what defeats the "but it is a testable oracle" counter-argument;
+  decimal/precision boundaries; idempotency under concurrency; partitioning/storage-engine semantics);
+  safety invariants (order placement, live-capital gates, the leakage firewall); irreversible data
+  paths (anything writing the prospective recording, which cannot be re-collected); cross-cutting
+  refactors touching many call sites.
+- **Both advocates must steelman the other side** and concede its strongest point explicitly, or the
+  arbiter is choosing between two weak briefs on style.
+- **De-escalation is in scope.** Plainly CRUD, plumbing or docs work should be named as such even
+  where the table says otherwise.
+- **Calibrate from outcomes, not forecasts.** All three agents receive the *previous* phase's
+  adversarial-review results — how many defects were confirmed, and of what class — and are told to
+  weight that over any impression of difficulty. Confirmed-defect classes are the only real signal
+  about where the table is mis-calibrated, and the durable output is a correction **by class**, not by
+  phase number.
+- **Record the verdict, the winning argument, and the conceded counterpoint in `docs/STATE.md`** with
+  the phase entry, so a wrong call is visible later rather than becoming folklore.
+
+Phase 2's run is the evidence this does not simply ratchet: the attacker won 4 of 7 packages, and the
+one escalation granted (Sonnet/medium → Sonnet/high for the backfill coordinator) carried a conceded
+counterpoint recorded alongside it — that the planner's slice arithmetic on its own is ordinary date
+math and rode along on package cohesion rather than merit.

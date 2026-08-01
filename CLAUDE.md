@@ -18,11 +18,19 @@ mkdir -p /tmp/dotnet_home
 
 ```bash
 dotnet build TradingStuff.slnx
-dotnet test tests/TradingStuff.Tests/TradingStuff.Tests.csproj -m:1    # 149 tests, all should pass
+dotnet test tests/TradingStuff.Tests/TradingStuff.Tests.csproj -m:1    # unit only; all should pass
 aspire start --non-interactive                                        # full distributed app
 ```
 
-`-m:1` on the test run is deliberate — keep it.
+`-m:1` on the test run is deliberate — keep it. Two suites are trait-gated out of that run and are
+NOT optional before claiming something works:
+
+- `--filter "Category=RequiresPostgres"` — needs `TRADING_TEST_POSTGRES`. Start the container with a
+  raised `-c max_connections` (the harness leaks pools and never drops its test databases).
+- `--filter "Category=RequiresTws"` — needs `TRADING_TEST_TWS=127.0.0.1:7497` and a running paper
+  TWS. Some of these drive a raw `EClientSocket`, bypassing the pacing governor, so sustained probing
+  can trip TWS's limits: it is not a reliable single-run gate. Re-run before concluding a failure is
+  real.
 
 `aspire start` brings up Postgres, RabbitMQ, and Keycloak containers, so it needs Docker running.
 For logic changes, `dotnet test` alone is the fast loop.
@@ -35,7 +43,9 @@ For logic changes, `dotnet test` alone is the fast loop.
 | `TradingStuff.ExecutionService` | Order REST API, validation, lifecycle, paper fills, event publishing |
 | `TradingStuff.RiskService` | Pre-trade risk: buying power, max loss, contract count, daily loss, Greeks limits. Inputs come from the stubbed provider or the real IBKR account, per `Portfolio:Source`. |
 | `TradingStuff.MarketDataService` | Option quotes, Greeks, chains. Deterministic generator or IBKR, per `MarketData:Source`. |
-| `TradingStuff.IbkrGateway` | Owns the **single** TWS socket. Contract resolution, chains, quotes, account/positions, order placement. |
+| `TradingStuff.IbkrGateway` | Owns the **single** TWS socket. Contract resolution, chains, quotes, account/positions, order placement. Also the recorder — raw ticks go straight to Postgres from here, not via ResearchService (`docs/DECISIONS.md` §4). |
+| `TradingStuff.ResearchService` | Research plane: migrations, session calendar, node selection, coverage, backfill, gap detection, `/research/*` + the `/ui` SPA. |
+| `TradingStuff.ResearchContracts` | Research-side records. Churns faster than `Contracts`, deliberately separate so it does not ripple through the execution services. |
 | `third_party/IBApi` | Vendored IBKR TWS API 10.45.01. Do not edit. |
 | `TradingStuff.AuditDashboard` | Local operator surface |
 | `TradingStuff.ServiceDefaults` | OpenTelemetry, health checks, resilience, dev auth handler |
@@ -89,8 +99,9 @@ Outstanding (from `docs/STATE.md`):
 - In-memory order/event stores → Postgres
 - In-memory event publisher → RabbitMQ
 - `DevelopmentJwtAuthenticationHandler` → Keycloak OIDC/JWT validation
-- Risk engine has 12 breach codes and 1 is tested (**highest priority** now that the risk inputs are
-  real)
+- Provider identifiers are in the canonical schema's primary key (`research.bars` is keyed on
+  `con_id` plus two verbatim TWS parameter names) — a recorded debt whose reversal cost grows daily,
+  see `docs/DECISIONS.md` §15
 - SPX/SPXW combos park in `PreSubmitted` at TWS while SPY combos fill — unexplained, see `docs/STATE.md`
 - Python ML signal service
 - Aspire transitive `MessagePack` advisory, pending an upstream patch
@@ -100,15 +111,12 @@ Milestone 1 is **not** complete: persistence and event transport are unmet, and 
 Keycloak start but nothing connects to them. Prerequisites and gotchas are in `docs/STATE.md`; API
 detail is in the `ibkr` skill.
 
-## Model and effort policy (milestone 2 research phases) — MANDATORY DEFAULT
+## Model and effort policy — MANDATORY DEFAULT
 
-This is a default that governs behavior, not a suggestion to surface and move past. **Use the
-recommended model and reasoning effort for the work at hand unless one of the two exceptions below
-applies.** At the start of any research-platform task, check which phase is active in
-`docs/STATE.md` (the "Left" list names the next phase; the last "Done" entry names the completed
-one), then match the work against this table:
+Governs behaviour; not a suggestion to surface and move past. Check the active phase in
+`docs/STATE.md`, then match the work:
 
-| Work | Model | Reasoning effort |
+| Work | Model | Effort |
 |---|---|---|
 | Phase 1–3 and Phase 7 implementation (recorder, backfill, snapshots, execution simulator) | Sonnet | medium |
 | Phase 4 implementation (features, labels, baselines, study runner) | Sonnet | high |
@@ -116,100 +124,43 @@ one), then match the work against this table:
 | ALL leakage reviews and order-safety reviews, any phase | Opus | high |
 | UI (`ClientApp/`) and documentation work | Haiku | low |
 
-**Class-based overrides — these beat the phase row above, whatever phase the work falls in.**
-Derived from measured review outcomes (see `docs/STATE.md`), not from guesses about difficulty:
+**Class-based overrides beat the phase row, whatever phase the work falls in.** These come from
+counted defect outcomes, not guesses — see `docs/DECISIONS.md` §16 for the evidence:
 
 - **(a) Split-path lifetime state machines → Opus/high.** Any object or row whose
-  acquire/complete/release is managed across two or more interleaving code paths: leases,
-  registries, replay/reconnect reconciliation, claim-then-update coordinators, crash/inflight
-  reapers. *This class produced 4 of Phase 1's 8 confirmed defects, all top-severity.*
-- **(b) Ground-truth manufacturers → Opus/high.** Anything producing the reference data other
-  components are validated *against* — session calendars, clocks, the as-of/cutoff machinery. A
-  defect here is invisible by construction: the validating artifact inherits the same bug.
+  acquire/complete/release spans two or more interleaving code paths: leases, registries,
+  replay/reconnect reconciliation, claim-then-update coordinators, crash/inflight reapers.
+- **(b) Ground-truth manufacturers → Opus/high.** Anything producing reference data other components
+  are validated *against* — session calendars, clocks, as-of/cutoff machinery.
 - **(c) Negative-claim acceptance criteria → minimum Sonnet/high.** Packages whose correctness
-  statement is "nothing is silently missing / a rerun adds nothing / no duplicates exist" — gap
-  reports, coverage, idempotency assertions. The phase review must name the absent-row check AND
-  which table the negative claim is measured on. *Three Phase 1 defects shared one root: a query
-  cannot emit a row for the absent case, so absence renders as health.*
-- **(d) Read-only UI stays Haiku/low** even when listed beside backend work — empirically zero
-  defects across two shipped phases. Defend this row against escalation. A server-side aggregation
-  endpoint is NOT UI: it belongs to the package owning its query semantics.
+  statement is "nothing is silently missing / a rerun adds nothing / no duplicates exist". The review
+  must name the absent-row check AND which table the claim is measured on.
+- **(d) Read-only UI stays Haiku/low** even beside backend work. Defend this row against escalation.
+  A server-side aggregation endpoint is NOT UI — it belongs to the package owning its query semantics.
 
-**The two exceptions, and only these — both require words in the prompt itself:**
-1. The prompt says not to apply this policy (for this task, or generally).
-2. The prompt names a specific model or effort level to use for this task.
+**Two exceptions, and only these — both require words in the prompt itself:** the prompt says not to
+apply the policy, or the prompt names a specific model/effort for this task.
 
-**A `/model` switch is NOT an exception**, no matter how immediately it precedes the prompt.
-Changing the session model is ambient state, not an instruction, and is at least as likely to be a
-mistake, a leftover from earlier work, or unrelated to the task being asked for. "The user selected
-Opus, so they must want Opus for this" is exactly the inference this policy exists to prevent —
-only an explicit in-prompt instruction overrides the table.
+**A `/model` switch is NOT an exception**, however immediately it precedes the prompt. Session model
+is ambient state, not an instruction. Reasoning in `docs/DECISIONS.md` §16.
 
-Absent an in-prompt exception, apply the policy without asking and without waiting for confirmation:
+Absent an in-prompt exception, apply it without asking:
 
-- **Main-loop work**: if the active session model/effort does not match the row for the work about
-  to start, say so in one line and **delegate that work to the matching pinned agent below** — do
-  not do it inline on the wrong model. Delegation is the default remedy, not a preference. Only
-  when delegation is genuinely impossible (a one-line fix mid-task; the work is inseparable from an
-  interactive back-and-forth) may the work proceed on the session's model, and then only by saying
-  so plainly first.
-- **Delegated work (Agent/Workflow tool calls)**: always pass the `model` (and `effort` inside
-  Workflow's `agent()` calls) matching the table — this is fully within direct control and has no
-  excuse for drifting from policy.
+- **Main-loop work** — if the session model does not match the row, say so in one line and
+  **delegate to the matching pinned agent**. Delegation is the default remedy. Only when genuinely
+  impossible (a one-line fix mid-task; work inseparable from interactive back-and-forth) may it
+  proceed on the session's model, and then only by saying so plainly first.
+- **Delegated work** — always pass the `model` (and `effort` in Workflow `agent()` calls) matching
+  the table. This is fully within direct control.
 
-Pinned-model agents exist for exactly this: `implementer` (Sonnet), `ui-builder` (Haiku),
-`leakage-reviewer` (Opus, high effort) — see `.claude/agents/`. Route leakage/order-safety review
-work through `leakage-reviewer` rather than reviewing inline on a smaller model. If a project-level
-agent isn't yet visible to the current session's Agent tool (a known lag right after the agent
-files are added), fall back to `general-purpose` with an explicit `model` override matching the
-table rather than dropping the policy.
+Pinned agents: `implementer` (Sonnet), `ui-builder` (Haiku), `leakage-reviewer` (Opus/high) — see
+`.claude/agents/`. If one is not yet visible to the session's Agent tool (a known lag after the files
+are added), fall back to `general-purpose` with an explicit `model` override rather than dropping the
+policy.
 
-### Phase-start validation: adversarial, with a separate arbiter
-
-Before starting a phase, decide the per-work-package model assignment with a three-agent
-adversarial structure, not a single validator:
-
-1. **Attacker (Opus, high)** — argues the standing table is already correct for every package, and
-   attacks each candidate escalation on its merits.
-2. **Justifier (Opus, high)** — argues for escalation wherever warranted, making the strongest
-   available case.
-3. **Arbiter (Fable)** — decides per package, on the arguments presented.
-
-The table is a prior written in advance from a guess at phase difficulty; it is not a measurement,
-and this step exists to correct it. But a single validator both *generates* the escalation case and
-*judges* it, which is precisely where bias hides — telling one model to "watch its own bias" is a
-weak corrective. Assigning the two sides removes the stake: an agent instructed to argue against
-escalation has no incentive to escalate, and the arbiter adjudicates a narrow question (which brief
-is better supported) rather than an open-ended one.
-
-Constraints that make this work rather than just cost three times as much:
-
-- **Per work package, not per phase.** A phase mixes genuinely subtle work with plumbing; one
-  verdict for the whole phase is too coarse to act on.
-- **The table wins ties.** If the briefs are evenly matched, the default stands. Deviation requires
-  positive justification, or "balanced" quietly becomes a ratchet upward.
-- **Escalation triggers** — a deviation must name at least one; "seems complex/important" is not
-  one: novel concurrency or process-lifecycle invariants; correctness that is hard to cover with
-  tests (timezone/session semantics — **especially any single authority whose output downstream
-  artifacts are validated against**, because the operative hazard is not that conversion is hard
-  but that the validator and the validated share an assumption, which is exactly what defeats the
-  "but it is a testable oracle" counter-argument; decimal/precision boundaries; idempotency under
-  concurrency; partitioning/storage-engine semantics); safety invariants (order placement,
-  live-capital gates, the leakage firewall); irreversible or unrecoverable data paths (anything
-  writing the prospective recording, which cannot be re-collected); cross-cutting refactors
-  touching many call sites.
-- **Both advocates must steelman the other side** and concede its strongest point explicitly.
-  Otherwise the arbiter is choosing between two weak briefs on style.
-- **De-escalation is in scope.** A package that is plainly CRUD, plumbing, or docs should be named
-  as such even where the table says otherwise.
-- **Calibrate from outcomes, not forecasts.** All three agents get the PREVIOUS phase's
-  adversarial-review results — how many defects were confirmed and of what *class* — and are told
-  to weight that over any impression of difficulty. Confirmed-defect classes are the only real
-  signal about where the table is mis-calibrated, and the durable output is a correction **by class
-  of work**, not by phase number.
-- **Record the verdict, the winning argument, and the conceded counterpoint in `docs/STATE.md`**
-  with the phase entry — so the next phase can check what was predicted against what its review
-  actually found, and so a wrong call is visible rather than folklore.
+**Before starting a phase**, run the three-agent arbitration (Opus attacker vs Opus justifier, Fable
+arbiter) defined in `docs/DECISIONS.md` §16, per work package, and record the verdict, winning
+argument and conceded counterpoint in `docs/STATE.md`.
 
 ## Trading safety
 
