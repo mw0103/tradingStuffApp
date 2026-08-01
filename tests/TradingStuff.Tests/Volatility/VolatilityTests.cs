@@ -136,7 +136,7 @@ namespace TradingStuff.Tests.Volatility
         [Fact]
         public void CleaningHandlesReversedOrderAndDuplicates()
         {
-            var bars = BuildFlatSession(new DateTime(2024, 3, 4), 100.0);
+            var bars = BuildFlatSession(new DateOnly(2024, 3, 4), 100.0);
 
             var forward = BuildSeries(bars);
             var reversed = BuildSeries(Enumerable.Reverse(bars).ToList());
@@ -214,9 +214,9 @@ namespace TradingStuff.Tests.Volatility
         public void OvernightPoliciesOrderAsExpected()
         {
             var bars = new List<IntradayBar>();
-            bars.AddRange(BuildFlatSession(new DateTime(2024, 3, 4), 100.0));
+            bars.AddRange(BuildFlatSession(new DateOnly(2024, 3, 4), 100.0));
             // Next session opens 1% higher: a pure overnight move with no intraday action.
-            bars.AddRange(BuildFlatSession(new DateTime(2024, 3, 5), 101.0));
+            bars.AddRange(BuildFlatSession(new DateOnly(2024, 3, 5), 101.0));
 
             var excluded = BuildSeries(bars, OvernightPolicy.Exclude);
             var added = BuildSeries(bars, OvernightPolicy.AddSquaredReturn);
@@ -241,15 +241,16 @@ namespace TradingStuff.Tests.Volatility
             var dividend = 1.75;
 
             var bars = new List<IntradayBar>();
-            bars.AddRange(BuildFlatSession(new DateTime(2024, 3, 4), 500.0));
+            bars.AddRange(BuildFlatSession(new DateOnly(2024, 3, 4), 500.0));
             // The ETF opens lower by exactly the distribution: a cash transfer, not volatility.
-            bars.AddRange(BuildFlatSession(exDate, 500.0 - dividend));
+            bars.AddRange(BuildFlatSession(DateOnly.FromDateTime(exDate), 500.0 - dividend));
 
             var unadjusted = BuildSeries(bars, OvernightPolicy.AddSquaredReturn);
 
             var options = DefaultOptions(OvernightPolicy.AddSquaredReturn);
             options.ExDividends[exDate] = dividend;
-            var adjusted = new RealizedVolatilitySeriesBuilder(SessionProfile.UsEquity(), options)
+            var adjusted = new RealizedVolatilitySeriesBuilder(
+                    SessionBars.Clock, SessionBars.Nyse, SessionQualityPolicy.UsEquity(), options)
                 .Build("SPY", bars);
 
             IsTrue("unadjusted ex-dividend date shows a spurious gap",
@@ -266,24 +267,21 @@ namespace TradingStuff.Tests.Volatility
         [Fact]
         public void ShortSessionIsDetected()
         {
-            var full = BuildSeries(BuildFlatSession(new DateTime(2024, 3, 4), 100.0));
+            var full = BuildSeries(BuildFlatSession(new DateOnly(2024, 3, 4), 100.0));
             IsTrue("a full session is not flagged short", !full[0].IsShortSession);
 
-            var half = BuildSeries(BuildFlatSession(new DateTime(2024, 11, 29), 100.0, closeHour: 13));
+            // 2024-11-29 is a genuine early close, and the calendar says so - the fixture is a
+            // full session by that calendar's own definition, not a truncated one.
+            var half = BuildSeries(BuildFlatSession(new DateOnly(2024, 11, 29), 100.0));
             IsTrue("an early close is flagged short", half[0].IsShortSession);
+            IsTrue("a calendar half day is still a complete session", half[0].IsComplete);
         }
 
         [Fact]
         public void IncompleteDaysAreFlaggedNotDropped()
         {
-            var day = new DateTime(2024, 3, 4);
-            var bars = new List<IntradayBar>();
             // Only 30 minutes of data: enough to build a session, not enough to trust.
-            for (int i = 0; i < 30; i++)
-            {
-                var t = day.AddHours(9).AddMinutes(31 + i);
-                bars.Add(new IntradayBar(t, 100.0, 100.0, 100.0, 100.0));
-            }
+            var bars = SessionBars.Session(new DateOnly(2024, 3, 4), _ => 100.0, minutes: 30);
 
             var days = BuildSeries(bars);
             IsTrue("a thin session is still emitted", days.Count == 1);
@@ -297,15 +295,19 @@ namespace TradingStuff.Tests.Volatility
         {
             var day = new DateTime(2024, 3, 4);
 
-            var full = BuildFlatSession(day, 100.0);
+            var full = BuildFlatSession(DateOnly.FromDateTime(day), 100.0);
             IsTrue("a dense session is complete", BuildSeries(full)[0].IsComplete);
 
-            // Same session span, but the middle four hours are missing. Previous-tick
-            // sampling fills the hole with repeated prices, so the return count stays high
-            // while the variance is silently understated.
+            // Same session span, but the middle is missing. Previous-tick sampling fills the
+            // hole with repeated prices, so the return count stays high while the variance is
+            // silently understated. The cut points come from the session itself rather than a
+            // wall clock, since the bars are UTC instants.
+            var session = SessionBars.Regular(DateOnly.FromDateTime(day))!;
+            var gapStart = session.OpenUtc.AddMinutes(30).UtcDateTime;
+            var gapEnd = session.CloseUtc.AddMinutes(-30).UtcDateTime;
+
             var gapped = full
-                .Where(b => b.Timestamp.TimeOfDay < new TimeSpan(10, 0, 0)
-                            || b.Timestamp.TimeOfDay >= new TimeSpan(15, 30, 0))
+                .Where(b => b.Timestamp < gapStart || b.Timestamp >= gapEnd)
                 .ToList();
 
             var result = BuildSeries(gapped)[0];
@@ -574,23 +576,18 @@ namespace TradingStuff.Tests.Volatility
             OvernightPolicy policy = OvernightPolicy.Exclude,
             bool subsample = true)
         {
-            var builder = new RealizedVolatilitySeriesBuilder(SessionProfile.UsEquity(), DefaultOptions(policy, subsample));
+            var builder = new RealizedVolatilitySeriesBuilder(
+                SessionBars.Clock, SessionBars.Nyse, SessionQualityPolicy.UsEquity(),
+                DefaultOptions(policy, subsample));
             return builder.Build("TEST", bars);
         }
 
-        /// <summary>A flat session: constant price, so realized variance is exactly zero.</summary>
-        private static List<IntradayBar> BuildFlatSession(DateTime date, double price, int closeHour = 16)
-        {
-            var bars = new List<IntradayBar>();
-            var t = date.AddHours(9).AddMinutes(30);
-            var end = date.AddHours(closeHour);
-            while (t < end)
-            {
-                bars.Add(new IntradayBar(t, price, price, price, price));
-                t = t.AddMinutes(1);
-            }
-            return bars;
-        }
+        /// <summary>
+        /// A flat session: constant price, so realized variance is exactly zero. Spans whatever
+        /// the calendar says the session is, which is what makes a half day a half day here.
+        /// </summary>
+        private static List<IntradayBar> BuildFlatSession(DateOnly date, double price) =>
+            SessionBars.Session(date, _ => price);
 
         private static List<RealizedVolatilityDay> SimulateSeries(
             int seed, int sessions, double dailyVariance, bool subsample = true)
@@ -599,25 +596,19 @@ namespace TradingStuff.Tests.Volatility
             var perMinuteVol = Math.Sqrt(dailyVariance / 390.0);
 
             var bars = new List<IntradayBar>();
-            var date = new DateTime(2020, 1, 1);
             var price = 400.0;
 
-            for (int s = 0; s < sessions; s++)
+            foreach (var date in SessionBars.TradingDates(sessions, new DateOnly(2020, 1, 2)))
             {
-                while (date.DayOfWeek == DayOfWeek.Saturday || date.DayOfWeek == DayOfWeek.Sunday)
-                {
-                    date = date.AddDays(1);
-                }
+                var session = SessionBars.Regular(date)!;
+                var minutes = (int)(session.CloseUtc - session.OpenUtc).TotalMinutes;
 
-                var t = date.AddHours(9).AddMinutes(30);
-                for (int minute = 0; minute < 390; minute++)
+                for (int minute = 0; minute < minutes; minute++)
                 {
                     price *= Math.Exp(Gaussian(rng) * perMinuteVol);
+                    var t = session.OpenUtc.AddMinutes(minute).UtcDateTime;
                     bars.Add(new IntradayBar(t, price, price, price, price));
-                    t = t.AddMinutes(1);
                 }
-
-                date = date.AddDays(1);
             }
 
             return BuildSeries(bars, OvernightPolicy.Exclude, subsample);

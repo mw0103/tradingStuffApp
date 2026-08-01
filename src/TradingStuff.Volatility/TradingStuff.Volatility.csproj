@@ -25,6 +25,12 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- ISessionClock. Session boundaries, trading dates and half days are the platform's
+         to answer, not this library's; see RealizedVolatilitySeriesBuilder. -->
+    <ProjectReference Include="..\TradingStuff.ResearchContracts\TradingStuff.ResearchContracts.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
     <!-- Subsampling offsets and estimator internals are worth testing directly. -->
     <InternalsVisibleTo Include="TradingStuff.Tests" />
   </ItemGroup>
