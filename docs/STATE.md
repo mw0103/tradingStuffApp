@@ -871,6 +871,75 @@ meanwhile. ES `liquidHours` is 45 minutes longer than the modelled RTH row (unde
 direction). No CME partial entries before 2022-11-24, because IBKR reports earlier holidays as full
 sessions, which is demonstrably wrong for Thanksgiving 2021 and unresolvable from available bars.
 
+### `NYSE_EXTENDED` calendar (2026-08-01)
+
+Closes the SPY audit hole recorded above: 570 minutes a day of real extended-hours data sat outside
+every modelled session, latent only because both shipped SPY jobs are `useRth=true`. Class (b) work,
+established from `reqHistoricalData(whatToShow="SCHEDULE")` against live paper TWS and cross-checked
+against `contractDetails` and 1-minute bar spans.
+
+**Measured, all of it.** 04:00–20:00 ET confirmed by exactly 960 bars (04:00–19:59, zero missing
+minutes) on two sessions. Early closes shorten the extended session to **17:00 ET while pre-market
+still opens at 04:00** — measured, not derived: the schedule returns 04:00–17:00 on exactly the 34
+dates the existing `US_MARKET` early-close rules already produce, diffed programmatically, with 780
+bars confirming. Holidays and closures match NYSE RTH exactly across all 4,166 schedule dates from
+2010, so no `partialSessionSet` was needed — established rather than assumed.
+
+**Found by measurement, not anticipated: 2015-06-30.** One anomalous session in sixteen years —
+04:00–**19:30**, the leap-second day, when venues closed after-hours early rather than trade through
+23:59:60 UTC. Bars agree exactly (930, ending 19:29), and critically they run straight through 16:00,
+so **the regular session was untouched**. That forced a separate `NYSE_EXTENDED` *venue*, not just a
+calendar: an unscheduled early close carries a wall-clock time the generator applies to every
+template on its venue, so putting 19:30 in the set NYSE RTH reads would have **lengthened** RTH from
+16:00 to 19:30 rather than shortened anything.
+
+**Pre-2010 is refused, not projected.** IBKR's schedule feed reaches 1998 but is a weekday fill
+before ~2010 — it reports sessions on Christmas Day 1998, July 4 2000-2006 and New Year's Day
+1999-2004, every half day 1999-2005 as a full 20:00 close, RTH-only rows on real 2006/2007 holidays,
+and zero-length 16:00–16:00 rows. The bars say the same thing positively: the first traded minute
+walks earlier over time — exactly 08:00 with exactly 720 bars in early 2005 (an open, not a
+coincidence), ~07:25 later in 2005, ~06:25 in 2007, 04:15 by 2008, 04:00 by 2011. Modelling 04:00
+back to 2005 would over-expect up to 240 min/day, which manufactures gaps. `effectiveFrom` is
+**2010-01-04** and nothing is asserted before it. Dated rows were considered and rejected: a
+trade-driven first bar is only an upper bound on the open, and the 20:00 close alone is not a session.
+
+**Nesting was forced by the schema, not chosen.** `research.sessions` has
+`label CHECK (label IN ('RTH','GTH'))` plus `UNIQUE (calendar, trading_date, label)`, and the tiling
+check rejects two undated rows sharing a label — so separate pre/post rows are not representable. One
+`GTH` row 04:00–20:00 nests `NYSE`/`RTH`, the `CME_ES` precedent applied across two calendar keys.
+Arithmetic verified against literal observed counts: per-session **sum is 1350** (wrong), the union
+sweep gives **960** (right, and it is calendar-blind), `BuildSessionUnits` yields separate 960 and 390
+units, and the max unit equals CoverageMonitor's denominator — so the two consumers agree. A
+`useRth=true` job still filters to RTH and sees 390, unchanged. **Verified in a live database**: a
+normal day is 960/390, the 2025-11-28 half day is 780/210, and 2015-06-30 is 930/390.
+
+**`UnmodelledSessionWindow` is now bounded.** Removing SPY's blanket admission orphaned a
+`GapDetector` test whose subject was that window, and no shipped job could replace it. Rather than
+delete the guard, the admission gained `From`/`To` + `Intersect` and `GapDetector` clips it to the
+audited window. SPY now admits only pre-2010. This is strictly better than the status quo: the
+unbounded admission made **both** shipped SPY jobs permanently unreconciled, whereas now the top-up
+never reaches it and the historical job reports it over 2005–2010 and nowhere else — the residual
+becomes visible instead of silently under-audited.
+
+**A false-green generator inside the false-green detector.** The agent's negative-control script
+restored files with `mv`, which left the build binary stale — so "restored" runs silently executed
+the *mutated* build. Fixed with `touch` and every one of the ten controls re-run. Also worth
+recording: the live schedule test's failing runs take ~200 ms, so **duration is not evidence of
+connection** — it proved the socket by mutating the calendar and reading TWS's real rows back out of
+the failure message, in both directions (sessions the venue publishes that the calendar does not
+generate, and vice versa).
+
+**Known, not fixed:** `mapping.Unmodelled` is not gated on `job.UseRth`, so a `useRth=true` job still
+receives an admission for data it never requested — which is why the shipped SPY historical job
+(target_from 2005) reports its 2005–2010 stretch unaudited. Pre-existing; the bounding shrinks the
+blast radius without removing it. `CoverageOptions.Calendars` still defaults to the Cboe pair, so
+coverage denominators are untouched by this change and the per-conId calendar work remains open.
+
+**Test-suite honesty:** the `RequiresTws` suite failed 1 of 12 on its first run after heavy
+historical probing and passed 12/12 on re-run. Some of these tests deliberately drive a raw
+`EClientSocket`, bypassing the pacing governor, so sustained probing can trip TWS's own limits. It is
+not currently a reliable single-run gate.
+
 ## Left
 
 Milestone 2 (research platform — sequenced in `docs/plans/ibkr-edge-research-roadmap.md`):

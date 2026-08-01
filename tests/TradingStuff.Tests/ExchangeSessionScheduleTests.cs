@@ -1,4 +1,6 @@
 using TradingStuff.ResearchContracts;
+using TradingStuff.ResearchService.Backfill;
+using TradingStuff.ResearchService.Recording;
 using TradingStuff.ResearchService.Sessions;
 
 namespace TradingStuff.Tests;
@@ -36,6 +38,7 @@ namespace TradingStuff.Tests;
 public sealed class ExchangeSessionScheduleTests
 {
     private const string Nyse = "NYSE";
+    private const string NyseExtended = "NYSE_EXTENDED";
     private const string CboeOptionRth = "CBOE_INDEX_RTH";
     private const string CboeOptionGth = "CBOE_INDEX_GTH";
     private const string SpxIndex = "CBOE_SPX_RTH";
@@ -451,6 +454,229 @@ public sealed class ExchangeSessionScheduleTests
         Assert.True(vix.Includes(VixGth, "GTH"));
         Assert.False(vix.Includes(CboeOptionRth, "RTH"));
         Assert.False(vix.Includes(CboeOptionGth, "GTH"));
+    }
+
+    // ============================================ DEFECT 5: SPY's 570 unmodelled extended-hours minutes
+
+    [Theory]
+    // Columns: trading date, then the session's open and close as UTC instants, then its length.
+    // Every literal here was read off a live paper TWS socket on 2026-08-01 and converted to UTC with
+    // CPython zoneinfo, not with this repository's own generator.
+    //
+    // Full days. Cross-checked against real bars two ways over: a useRth=false 1-minute TRADES request
+    // returns exactly 960 bars on 2026-07-30 and 2026-07-31, running 04:00..19:59 ET with not one
+    // minute missing, so the last bar (19:59, covering 19:59-20:00) lands exactly on a 20:00 close.
+    [InlineData(2026, 7, 30, 2026, 7, 30, 8, 0, 2026, 7, 31, 0, 0, 960, false, false)]
+    [InlineData(2026, 7, 31, 2026, 7, 31, 8, 0, 2026, 8, 1, 0, 0, 960, false, false)]
+    // The earliest date this calendar asserts anything for. 2010-01-04 returned 953 bars running
+    // 04:07..19:59 ET — the 04:00-04:06 minutes simply carried no trade, which is what pre-market bars
+    // look like; the close is the same 20:00.
+    [InlineData(2010, 1, 4, 2010, 1, 4, 9, 0, 2010, 1, 5, 1, 0, 960, false, false)]
+    // Half days. The extended session shortens to 17:00 ET and pre-market still opens at 04:00 — this
+    // is MEASURED on each of these dates, not derived from the 13:00 ET regular close. 780 bars a day
+    // running 04:00..16:59 ET on all three, again with no minute missing.
+    [InlineData(2025, 11, 28, 2025, 11, 28, 9, 0, 2025, 11, 28, 22, 0, 780, true, true)]  // day after Thanksgiving
+    [InlineData(2025, 7, 3, 2025, 7, 3, 8, 0, 2025, 7, 3, 21, 0, 780, true, true)]        // day before Independence Day
+    [InlineData(2025, 12, 24, 2025, 12, 24, 9, 0, 2025, 12, 24, 22, 0, 780, true, true)]  // Christmas Eve
+    // The one unscheduled shortening in sixteen years of published schedule: the 2015 leap second.
+    // US equity venues closed the after-hours session at 19:30 ET rather than run through the extra
+    // second. Measured twice — the published schedule row is 04:00-19:30, and the bars are 930 running
+    // 04:00..19:29 ET. The REGULAR session was untouched, which is the whole reason this early close
+    // cannot live in the set NYSE RTH reads — and it is the one row where the two columns below differ.
+    [InlineData(2015, 6, 30, 2015, 6, 30, 8, 0, 2015, 6, 30, 23, 30, 930, true, false)]
+    public void The_nyse_extended_session_is_0400_to_2000_eastern_and_shortens_to_1700_on_a_half_day(
+        int year, int month, int day,
+        int openYear, int openMonth, int openDay, int openHour, int openMinute,
+        int closeYear, int closeMonth, int closeDay, int closeHour, int closeMinute,
+        int minutes, bool isHalfDay, bool regularIsHalfDay)
+    {
+        var tradingDate = Date(year, month, day);
+        var extended = Single(NyseExtended, tradingDate, "GTH");
+
+        Assert.Equal(Utc(openYear, openMonth, openDay, openHour, openMinute), extended.OpenUtc);
+        Assert.Equal(Utc(closeYear, closeMonth, closeDay, closeHour, closeMinute), extended.CloseUtc);
+        Assert.Equal(minutes, Minutes(extended));
+        Assert.Equal(isHalfDay, extended.IsHalfDay);
+
+        // ONE session per trading date, spanning the regular one rather than sitting beside it.
+        // research.sessions permits only the labels RTH and GTH and keys them UNIQUE (calendar,
+        // trading_date, label), so a separate pre-market and post-market row on this calendar is not
+        // representable at all — the nesting is forced by the schema, not chosen for convenience.
+        Assert.Equal(
+            new[] { "GTH" },
+            _clock.SessionsBetween(NyseExtended, tradingDate, tradingDate).Select(s => s.Label).ToArray());
+
+        // And it really does NEST the regular session: same trading date, strictly wider on both ends.
+        var regular = Single(Nyse, tradingDate, "RTH");
+
+        Assert.True(extended.OpenUtc < regular.OpenUtc, "the extended session must open before the regular one");
+        Assert.True(extended.CloseUtc > regular.CloseUtc, "the extended session must close after the regular one");
+
+        // Shortened is a per-SESSION fact, not a per-DATE one. On the rule-derived early closes both
+        // sessions shorten together; on 2015-06-30 only the extended one did, and asserting one flag
+        // for both would have hidden exactly the case the separate venue exists for.
+        Assert.Equal(regularIsHalfDay, regular.IsHalfDay);
+    }
+
+    [Fact]
+    public void The_extended_session_nests_rth_so_spy_expects_960_minutes_a_day_and_not_1350()
+    {
+        // The arithmetic that makes the nesting safe, asserted rather than assumed. CME_ES is the
+        // precedent — SessionMinutes.DistinctMinutes unions instead of summing precisely so a nested
+        // row does not inflate a denominator — but SPY nests ACROSS two calendar keys rather than
+        // within one, and nothing had pinned that the union sweep is calendar-blind.
+        //
+        // 960 is the literal bar count TWS returned for 2026-07-30, not a number re-derived here.
+        var spy = InstrumentCalendars.For("SPY", "stock");
+        var tradingDate = Date(2026, 7, 30);
+        var dayStart = Utc(2026, 7, 30, 0, 0);
+
+        var sessions = spy.Calendars
+            .SelectMany(calendar => _clock.SessionsBetween(calendar, tradingDate.AddDays(-2), tradingDate.AddDays(2)))
+            .Where(session => spy.Includes(session.Calendar, session.Label) && session.TradingDate == tradingDate)
+            .ToArray();
+
+        Assert.Equal(2, sessions.Length);
+
+        // Summing is what a naive denominator does, and it is wrong by exactly the nested RTH session.
+        Assert.Equal(1350, sessions.Sum(Minutes));
+
+        // CoverageMonitor's denominator: the union, over a window wide enough to hold the whole day.
+        var clipped = SessionMinutes.Clip(sessions, dayStart, dayStart.AddDays(2));
+        Assert.Equal(960, SessionMinutes.DistinctMinutes(clipped));
+
+        // GapArithmetic's expectation units are the SAME clipped sessions, deliberately kept separate
+        // so a shortfall can be attributed to a specific window — so they must not be summed either.
+        // The unit a gap report checks bar counts against is 960 for the extended window and 390 for
+        // the regular one, and 960 bars satisfy both.
+        var units = GapArithmetic.BuildSessionUnits(sessions, useRth: false, dayStart, dayStart.AddDays(2));
+
+        Assert.Equal(
+            new[] { (NyseExtended, "GTH", 960), (Nyse, "RTH", 390) },
+            units.Select(u => (u.Calendar, u.Label, u.ExpectedMinutes)).ToArray());
+        Assert.Equal(SessionMinutes.DistinctMinutes(clipped), units.Max(u => u.ExpectedMinutes));
+
+        // A useRth=true job is unchanged by any of this: it filters to RTH and sees only the 390.
+        var rthOnly = GapArithmetic.BuildSessionUnits(sessions, useRth: true, dayStart, dayStart.AddDays(2));
+        Assert.Equal(new[] { 390 }, rthOnly.Select(u => u.ExpectedMinutes).ToArray());
+    }
+
+    [Fact]
+    public void Spy_declares_only_the_pre_2010_stretch_unmodelled_and_no_longer_its_whole_day()
+    {
+        // The declaration this calendar replaces was unbounded: SPY's entire 04:00-20:00 window was
+        // named as unaudited, which was right while nothing described it and made every SPY series
+        // report as never-reconciled on every run — the same permanently-red gate VIX carried.
+        var spy = InstrumentCalendars.For("SPY", "stock");
+
+        Assert.Equal([Nyse, NyseExtended], spy.Calendars);
+        Assert.True(spy.Includes(Nyse, "RTH"));
+        Assert.True(spy.Includes(NyseExtended, "GTH"));
+
+        // Still nothing Cboe about SPY, which is the mapping's original reason to exist.
+        Assert.False(spy.Includes(CboeOptionRth, "RTH"));
+        Assert.False(spy.Includes(CboeOptionGth, "GTH"));
+
+        // What remains is one BOUNDED admission, ending exactly where the calendar starts asserting.
+        var admission = Assert.Single(spy.Unmodelled);
+
+        Assert.Null(admission.From);
+        Assert.Equal(Utc(2010, 1, 4, 0, 0), admission.To);
+        Assert.Equal(
+            ExchangeCalendarSet.Embedded.Calendar(NyseExtended).EffectiveFrom,
+            DateOnly.FromDateTime(admission.To!.Value.UtcDateTime));
+
+        // A modern window is untouched by it — that is the whole difference from the unbounded form,
+        // and it is what stops the shipped SPY jobs from being permanently unreconciled.
+        Assert.Null(admission.Intersect(Utc(2026, 7, 1, 0, 0), Utc(2026, 7, 31, 0, 0)));
+
+        // A window reaching into the unmodelled stretch is clipped to it, never stamped across the
+        // caller's whole window.
+        var clipped = admission.Intersect(Utc(2005, 1, 1, 0, 0), Utc(2026, 7, 31, 0, 0));
+
+        Assert.NotNull(clipped);
+        Assert.Equal(Utc(2005, 1, 1, 0, 0), clipped!.Value.From);
+        Assert.Equal(Utc(2010, 1, 4, 0, 0), clipped.Value.To);
+    }
+
+    [Fact]
+    public void The_extended_session_observes_the_same_holidays_and_closures_as_the_regular_one()
+    {
+        // Measured, not assumed: IBKR's published SPY schedule returns 4,166 sessions over
+        // 2010-01-04..2026-07-31 and every one of their dates is a date the NYSE calendar already
+        // generates — no holiday session, no closure session, nothing the rules do not predict. That
+        // is also why this calendar carries NO partialSessionSet: unlike CME equity index, the venue
+        // never trades on a day its own rules call it shut.
+        foreach (var shut in new[]
+        {
+            Date(2012, 10, 29), Date(2012, 10, 30), // Hurricane Sandy
+            Date(2018, 12, 5),                      // day of mourning — George H. W. Bush
+            Date(2025, 1, 9),                       // day of mourning — Jimmy Carter
+            Date(2026, 4, 3),                       // Good Friday
+            Date(2026, 7, 3),                       // Independence Day observed (July 4 is a Saturday)
+            Date(2026, 1, 19),                      // Martin Luther King Jr. Day
+        })
+        {
+            Assert.Empty(_clock.SessionsBetween(NyseExtended, shut, shut));
+            Assert.Empty(_clock.SessionsBetween(Nyse, shut, shut));
+            Assert.False(_clock.IsTradingDay(NyseExtended, shut));
+        }
+
+        // The contrast that gives that claim teeth: CME really does trade three of those dates, so
+        // "the holiday rules close everything" is not what is being asserted here.
+        Assert.NotEmpty(_clock.SessionsBetween(CmeEs, Date(2025, 1, 9), Date(2025, 1, 9)));
+        Assert.NotEmpty(_clock.SessionsBetween(CmeEs, Date(2026, 4, 3), Date(2026, 4, 3)));
+        Assert.NotEmpty(_clock.SessionsBetween(CmeEs, Date(2026, 7, 3), Date(2026, 7, 3)));
+
+        Assert.Null(new SessionGenerator().PartialSession(NyseExtended, Date(2025, 1, 9)));
+    }
+
+    [Fact]
+    public void The_extended_calendar_asserts_nothing_before_2010_because_the_window_provably_moved()
+    {
+        // The honest edge. IBKR's SPY schedule reaches 1998 and claims 04:00-20:00 throughout, but
+        // that stretch of the feed is a weekday FILL, not a schedule: it returns sessions on Christmas
+        // Day 1998, on July 4 2000-2006 and on New Year's Day 1999-2004, reports every half day from
+        // 1999 to 2005 as a full 20:00 close, and emits zero-length 16:00-16:00 rows on 2007-11-23,
+        // 2007-12-24 and 2009-11-27.
+        //
+        // The bars say the same thing positively rather than by absence — the first traded minute of
+        // the extended session walks earlier over time: exactly 08:00 ET with exactly 720 bars on
+        // 2005-01-04, 2005-02-02 and 2005-03-01 (an open, not a coincidence), ~07:25 later in 2005,
+        // ~06:25 in 2007, 04:15 by 2008-03-05, and 04:00 exactly by 2011-03-16. Modelling 04:00 back
+        // through 2005 would over-expect by up to 240 minutes a day, which is the direction that
+        // MANUFACTURES gaps. The 20:00 close is measured back to 2005; a close without an established
+        // open is not a session.
+        Assert.Empty(_clock.SessionsBetween(NyseExtended, Date(2005, 1, 1), Date(2009, 12, 31)));
+        Assert.NotEmpty(_clock.SessionsBetween(NyseExtended, Date(2010, 1, 4), Date(2010, 1, 4)));
+
+        // The regular session is unaffected and still reaches back to 1993, so a useRth=true SPY job
+        // reaching 2005 keeps exactly the expectation it had.
+        Assert.NotEmpty(_clock.SessionsBetween(Nyse, Date(2005, 1, 3), Date(2005, 1, 3)));
+        Assert.Equal(390, Minutes(Single(Nyse, Date(2005, 1, 3), "RTH")));
+    }
+
+    [Fact]
+    public void The_leap_second_early_close_shortens_the_extended_session_and_not_the_regular_one()
+    {
+        // Why NYSE_EXTENDED is its own VENUE rather than a second calendar on the NYSE venue. An
+        // unscheduled early close carries an explicit wall-clock time and the generator applies that
+        // time to every session template on the venue that takes early closes. Putting 19:30 in the
+        // set NYSE RTH reads would not shorten RTH — it would LENGTHEN it, from 16:00 to 19:30, by
+        // three and a half hours, on a date the regular session was entirely normal. The two venues'
+        // unscheduled early closes are genuinely different facts and are stored as different facts.
+        var extended = Single(NyseExtended, Date(2015, 6, 30), "GTH");
+        var regular = Single(Nyse, Date(2015, 6, 30), "RTH");
+
+        Assert.Equal(Utc(2015, 6, 30, 23, 30), extended.CloseUtc);
+        Assert.True(extended.IsHalfDay);
+
+        Assert.Equal(Utc(2015, 6, 30, 20, 0), regular.CloseUtc);
+        Assert.Equal(390, Minutes(regular));
+        Assert.False(regular.IsHalfDay);
+
+        // The bars run continuously through the regular close and stop at 19:29 — 930 of them.
+        Assert.Equal(930, Minutes(extended));
     }
 
     // ========================================================================== structural guards

@@ -120,8 +120,9 @@ public static class GapAuditReasons
 
     /// <summary>
     /// The instrument trades here but this platform has no session definition for the window, so no
-    /// expectation exists. See <c>InstrumentCalendars</c>'s unmodelled windows — VIX's overnight
-    /// session is the current instance.
+    /// expectation exists. See <c>InstrumentCalendars</c>'s unmodelled windows — SPY's extended
+    /// session BEFORE 2010-01-04 is the only remaining instance, and it is bounded, so it names a
+    /// stretch of old history rather than the whole of every window on the instrument.
     /// </summary>
     public const string NoSessionDefinition = "no-session-definition";
 
@@ -540,11 +541,21 @@ public sealed class GapDetector(
         }
 
         // A window this platform knows the instrument trades in but has no session definition for is
-        // named explicitly rather than quietly producing no expectation unit. VIX's overnight bars
-        // are the current case: they exist, they are not audited, and before this their absence
-        // rendered as a clean report.
-        unaudited.AddRange(mapping.Unmodelled.Select(
-            window => new UnauditedRange(from, to, $"{GapAuditReasons.NoSessionDefinition}: {window.Description}")));
+        // named explicitly rather than quietly producing no expectation unit: it exists, it is not
+        // audited, and its absence would otherwise render as a clean report.
+        //
+        // INTERSECTED with the window actually being audited, not stamped across the whole of it. An
+        // admission that is bounded in history (SPY's pre-2010 extended session is the only one left)
+        // says nothing about a job whose window is entirely after it, and reporting it anyway made
+        // every job on that instrument permanently unreconciled — which is how the previous unbounded
+        // VIX admission turned a real caveat into a gate nobody reads.
+        unaudited.AddRange(mapping.Unmodelled
+            .Select(window => (window.Description, Range: window.Intersect(from, to)))
+            .Where(admission => admission.Range is not null)
+            .Select(admission => new UnauditedRange(
+                admission.Range!.Value.From,
+                admission.Range!.Value.To,
+                $"{GapAuditReasons.NoSessionDefinition}: {admission.Description}")));
 
         if (to <= from)
         {
