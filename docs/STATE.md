@@ -980,6 +980,68 @@ Milestone 1 remainder:
 
 ## Trading prerequisites
 
+**Set `IBKR__MarketDataType=1` for any recording session whose data is meant for research.** The
+AppHost default is `3` (delayed) so first-run setup works without an OPRA subscription — see
+`Program.cs`'s comment on `ibkr-market-data-type` — but delayed quotes are up to 15 minutes stale,
+and a recorded tick carries no visible difference from a live one once the session is over. Before
+starting a recording session intended to feed a study, confirm the paper account's live market-data
+entitlements are actually active — the account can report a subscription exists and still serve
+delayed data if the entitlement lapsed or was never activated; `docs/research/ibkr-data-capability-matrix.md`
+is where that verification is recorded, and a fresh probe belongs in `research.capability_probes`
+(`docs/DECISIONS.md` §8) before trusting a session's data as live.
+
+Leaving the default at `3` no longer fails silently:
+
+- `gateway.option_quote_events` and `gateway.underlying_tick_events` carry a nullable
+  `market_data_type` (migration 016), populated from what TWS's `marketDataType` callback
+  **reported** for that ticker — never the requested value, since TWS downgrades a live request
+  whose entitlement is missing without saying so anywhere else. NULL means "TWS has not answered
+  yet" and is never to be read as live. It legitimately returns to NULL after a reconnect: a
+  subscription is re-issued with a fresh ticker id, so the sink starts over not knowing.
+- A reported type other than `1` opens a `gateway.recorder_gaps` row with reason
+  `non_live_market_data` on the lease's scope and logs Critical, so a non-live session renders as
+  an explicit gap in coverage. A later live report retires **only** that alarm — `CloseGapAsync`
+  gained an `onlyIfReason` guard so it cannot close a `disconnect` gap sharing the same scope
+  (the defect class already fixed once for the write-failure scopes).
+- Values outside 1–4 are reported as non-live but not stored: a value migration 016's CHECK
+  rejects would abort the whole 5,000-row COPY batch it landed in, and losing a batch of
+  unrecoverable ticks costs more than one unknown column.
+- No boot refusal — the gateway still boots and records at the default, because refusing on the
+  documented first-run default would break `aspire start` for everyone. The gap row is the alarm.
+
+**Replay ordering is handled in both directions, deliberately.** TWS does not guarantee
+`marketDataType` arrives before the first tick of a re-issued subscription, and each ordering
+breaks differently:
+
+- *type first:* the non-live open is deduped away by the still-open `disconnect` row on the same
+  scope, and the replay tick would then close it — with TWS reporting a ticker's type once per
+  `reqMktData`, nothing would ever raise it again. So `NotifyGapClosed` carries the sink's
+  effective type and the recorder sequences close-then-reopen inside **one** task; firing them as
+  two `_ = XxxAsync()` calls would make the outcome a race.
+- *tick first:* the type is NULL at that moment, so nothing reopens — but the ticks in that window
+  are stamped NULL, which reads as *unknown*, never as live. `ApplyMarketDataType` then raises the
+  alarm when the callback lands. The window is honest rather than empty, which is the acceptable
+  direction.
+
+Verified: **1,463 unit and 148 `RequiresPostgres`** green, with reintroduce-and-confirm-fail
+controls on all fourteen mutations — including one on the *rejected* design (a type map keyed by
+lease id, which survives a replay and wrongly stamps `[3,3,3]` where the correct answer is
+`[3,null,null]`) and one on the wrapper wiring itself, since every other test called the sink
+directly and would have passed with the callback routing deleted (`docs/LESSONS.md` §2's
+`openOrder` failure, verbatim).
+
+**Live paper TWS, 2026-08-01:** the callback fires and its value is what gets stamped — probe read
+`reported=1 stampedRows=4 stamped=1,1,1,1`, proved non-vacuous by breaking the expectation. Two
+things that establishes beyond the mechanism: this paper account **is** entitled to live Cboe index
+data (requested 1, served 1). **What it does NOT establish:** a downgrade. Requested and served
+agree here, so the divergence this whole feature exists for is covered by unit tests only, never on
+the wire. That limitation is written into the test itself, not just here.
+
+An earlier version of this section described all of the above in the present tense **before any of
+it was implemented** — migration 016 shipped without its writer, and the doc claimed the alarm
+existed. Recorded rather than quietly overwritten: a document asserting a safety mechanism that
+does not exist is precisely `docs/LESSONS.md` §4, and this was its second occurrence here.
+
 **TWS Precautionary Settings block combo orders until cleared.** Error 163 — *"price exceeds the
 Percentage constraint of 3%"* — comes from TWS's client-side presets, not an exchange, and it rejects
 even a marketable spread priced at the natural against a live book: for a combo TWS compares the

@@ -55,8 +55,24 @@ public sealed class IbkrClientWrapper(
         ConnectionClosedReceived?.Invoke();
     }
 
-    public override void marketDataType(int reqId, int marketDataType) =>
+    /// <summary>
+    /// TWS's answer to <c>reqMarketDataType</c> for one ticker: the regime it is ACTUALLY serving,
+    /// which is not necessarily the one that was requested (an unentitled request for 1 comes back
+    /// as 2 or 3, with no error).
+    /// </summary>
+    /// <remarks>
+    /// Routed through the same registry as every other tick callback, and for the same reason: a
+    /// re-issue after a 1101 replay or a reconnect allocates a BRAND-NEW ticker id and deregisters
+    /// the old one, so a late report for a superseded ticker resolves to nothing and is dropped
+    /// rather than being applied to a subscription that no longer exists. Keeping this state in the
+    /// sink instance — reachable only through the registry — is what makes that true without a
+    /// second map to re-key.
+    /// </remarks>
+    public override void marketDataType(int reqId, int marketDataType)
+    {
         logger.LogInformation("Market data type for request {ReqId} is {MarketDataType}.", reqId, marketDataType);
+        registry.Get<ITickSink>(reqId)?.ApplyMarketDataType(marketDataType);
+    }
 
     // ---- errors ---------------------------------------------------------------------------
 

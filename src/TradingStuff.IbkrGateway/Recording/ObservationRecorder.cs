@@ -19,7 +19,24 @@ internal interface IObservationSink
 
     void EnqueueUnderlying(UnderlyingTickObservation observation);
 
-    void NotifyGapClosed(Guid leaseId);
+    /// <summary>
+    /// A tick was observed on this lease after a re-issue: whatever gap its scope holds is closed.
+    /// </summary>
+    /// <param name="effectiveMarketDataType">
+    /// What TWS has reported for the NEW ticker so far, or null if it has not reported yet. A
+    /// non-live value here re-opens the non-live gap AFTER the close, because the close cannot tell
+    /// one open reason from another and would otherwise silently retire an alarm nothing reopens.
+    /// </param>
+    void NotifyGapClosed(Guid leaseId, short? effectiveMarketDataType);
+
+    /// <summary>
+    /// TWS reported an effective market-data type other than 1 (live) for this lease's ticker: the
+    /// recording continues, and it is recorded as a gap so it cannot pass silently for a live one.
+    /// </summary>
+    void NotifyNonLiveMarketData(Guid leaseId, int marketDataType);
+
+    /// <summary>TWS reported live (1) for this lease's ticker; retires the non-live alarm.</summary>
+    void NotifyLiveMarketData(Guid leaseId);
 }
 
 /// <summary>
@@ -77,7 +94,23 @@ public sealed class ObservationRecorder : IObservationSink, IAsyncDisposable
     // Process-local guard against opening a duplicate gap row for a scope that already has one
     // open. Gap rows themselves are the durable record; this dictionary only avoids spamming the
     // table while a condition (e.g. sustained buffer saturation) persists across many ticks.
-    private readonly ConcurrentDictionary<string, long> _openGapIdByScope = new();
+    //
+    // The REASON is carried alongside the id because one caller needs to close only the gap IT
+    // opened: a non-live market-data alarm must retire when TWS reports live, but must not retire a
+    // 'disconnect' row that happens to occupy the same scope — closing that one would stamp
+    // closed_by='observed' ("a tick resumed") on an outage where nothing of the sort had happened,
+    // and truncate it early. That is a fabricated measurement, which is the thing
+    // docs/DECISIONS.md §8 exists to forbid.
+    private readonly ConcurrentDictionary<string, OpenGap> _openGapIdByScope = new();
+
+    /// <summary>One scope's currently-open gap row.</summary>
+    /// <remarks>
+    /// A readonly record struct so <see cref="ConcurrentDictionary{TKey,TValue}"/>'s
+    /// compare-and-remove overload can be used: removing only if the value is still the one that
+    /// was read makes "close the gap I looked at" a single atomic step, rather than a read followed
+    /// by a remove that can take a row someone else opened in between.
+    /// </remarks>
+    private readonly record struct OpenGap(long GapId, string Reason);
 
     private readonly Counter<long> _eventsPersisted;
     private readonly Counter<long> _writeFailures;
@@ -370,7 +403,7 @@ public sealed class ObservationRecorder : IObservationSink, IAsyncDisposable
         // would be bounded as though it were an orphan — a window of one round trip, and one that
         // heals itself: the scope stays in _openGapIdByScope, so this recorder's own CloseGapAsync
         // still runs when recording resumes and rewrites ended_at/closed_by to the observed values.
-        var owned = _openGapIdByScope.Values.ToArray();
+        var owned = _openGapIdByScope.Values.Select(gap => gap.GapId).ToArray();
 
         try
         {
@@ -451,7 +484,7 @@ public sealed class ObservationRecorder : IObservationSink, IAsyncDisposable
 
             var gapId = (long)(await command.ExecuteScalarAsync(cancellationToken))!;
 
-            if (!_openGapIdByScope.TryAdd(scope, gapId))
+            if (!_openGapIdByScope.TryAdd(scope, new OpenGap(gapId, reason)))
             {
                 // Another caller opened one concurrently; close the redundant row rather than leak it.
                 await using var close = _dataSource.CreateCommand(
@@ -480,9 +513,31 @@ public sealed class ObservationRecorder : IObservationSink, IAsyncDisposable
     /// outage that is still in progress, so a row left open on purpose does not read as "this
     /// subscription is over" — it reads as "coverage is broken, and will be for all future windows."
     /// </remarks>
-    public async Task CloseGapAsync(string scope, bool observed = true)
+    public Task CloseGapAsync(string scope, bool observed = true) =>
+        CloseGapAsync(scope, observed, onlyIfReason: null);
+
+    /// <param name="onlyIfReason">
+    /// When non-null, the close applies ONLY if the scope's open row was opened for that reason,
+    /// and does nothing otherwise. A gap scope holds one open row whatever opened it, so a caller
+    /// that can only speak for its own condition — "TWS now reports live" says nothing about
+    /// whether a disconnect has ended — must not be able to close somebody else's.
+    /// </param>
+    private async Task CloseGapAsync(string scope, bool observed, string? onlyIfReason)
     {
-        if (_dataSource is null || !_openGapIdByScope.TryRemove(scope, out var gapId))
+        if (_dataSource is null || !_openGapIdByScope.TryGetValue(scope, out var open))
+        {
+            return;
+        }
+
+        if (onlyIfReason is not null && !string.Equals(open.Reason, onlyIfReason, StringComparison.Ordinal))
+        {
+            return;
+        }
+
+        // Compare-and-remove, not a bare remove: between the read above and here another caller can
+        // have closed this row and opened a different one for the same scope, and taking that one
+        // would close a condition still in force.
+        if (!_openGapIdByScope.TryRemove(new KeyValuePair<string, OpenGap>(scope, open)))
         {
             return;
         }
@@ -491,24 +546,96 @@ public sealed class ObservationRecorder : IObservationSink, IAsyncDisposable
         {
             await using var command = _dataSource.CreateCommand(
                 "UPDATE gateway.recorder_gaps SET ended_at = now(), closed_by = $2 WHERE gap_id = $1");
-            command.Parameters.AddWithValue(gapId);
+            command.Parameters.AddWithValue(open.GapId);
             command.Parameters.AddWithValue(observed ? "observed" : "inferred");
             await command.ExecuteNonQueryAsync();
 
-            _logger.LogInformation("Recording gap closed: scope={Scope} gapId={GapId}.", scope, gapId);
+            _logger.LogInformation("Recording gap closed: scope={Scope} gapId={GapId}.", scope, open.GapId);
         }
         catch (Exception ex) when (ex is NpgsqlException or InvalidOperationException or TimeoutException)
         {
-            _logger.LogError(ex, "Could not close the gap for scope {Scope} (gapId {GapId}).", scope, gapId);
+            _logger.LogError(ex, "Could not close the gap for scope {Scope} (gapId {GapId}).", scope, open.GapId);
 
             // Put it back so a later close attempt (or the next OpenGapAsync no-op check) can retry;
             // otherwise the in-memory guard forgets a gap the database still has open.
-            _openGapIdByScope.TryAdd(scope, gapId);
+            _openGapIdByScope.TryAdd(scope, open);
         }
     }
 
     /// <summary>Convenience for <see cref="RecordingTickSink"/>: closes a lease's own gap scope.</summary>
-    public void NotifyGapClosed(Guid leaseId) => _ = CloseGapAsync(LeaseScope(leaseId));
+    /// <param name="effectiveMarketDataType">
+    /// What TWS has reported for the re-issued ticker so far, or null if it has not reported yet.
+    /// </param>
+    /// <remarks>
+    /// The close and the non-live re-open are sequenced here, in one task, rather than being fired
+    /// as two independent calls from the sink. They target the same single-row scope, so the order
+    /// decides the outcome: closed-then-reopened leaves the alarm standing, reopened-then-closed
+    /// silently retires it — and since TWS reports a ticker's type once per <c>reqMktData</c>,
+    /// nothing would ever raise it again for the rest of that subscription's life.
+    /// </remarks>
+    public void NotifyGapClosed(Guid leaseId, short? effectiveMarketDataType) =>
+        _ = ResumeRecordingAsync(leaseId, effectiveMarketDataType);
+
+    private async Task ResumeRecordingAsync(Guid leaseId, short? effectiveMarketDataType)
+    {
+        await CloseGapAsync(LeaseScope(leaseId));
+
+        if (effectiveMarketDataType is { } type && type != LiveMarketDataType)
+        {
+            NotifyNonLiveMarketData(leaseId, type);
+        }
+    }
+
+    /// <summary>The one <c>marketDataType</c> value that is not an alarm.</summary>
+    private const short LiveMarketDataType = 1;
+
+    /// <summary>
+    /// The <c>recorder_gaps.reason</c> written when TWS is serving a lease something other than
+    /// live data. Public so a test — and a coverage query — names the same string this does.
+    /// </summary>
+    public const string NonLiveMarketDataReason = "non_live_market_data";
+
+    /// <summary>
+    /// Records that TWS is serving this lease a non-live regime. Loud, and NOT a refusal: the
+    /// subscription keeps running and the ticks keep landing, because delayed data is the AppHost's
+    /// documented first-run default (<c>IBKR__MarketDataType=3</c>) and a gateway that refused to
+    /// boot on it would be unusable. The gap row IS the alarm.
+    /// </summary>
+    /// <remarks>
+    /// Both halves are needed and neither substitutes for the other. The log line is what a person
+    /// watching a session sees; the gap row is what a coverage query sees months later, when the
+    /// only remaining question is whether a recorded surface can be trusted — and by then the log
+    /// is gone. Per-lease scope, like every other subscription-level gap, so it is bounded by the
+    /// same <c>TerminateAsync</c> that bounds the rest and cannot outlive its lease.
+    /// </remarks>
+    public void NotifyNonLiveMarketData(Guid leaseId, int marketDataType)
+    {
+        _logger.LogCritical(
+            "TWS is serving lease {LeaseId} market data type {MarketDataType} ({Regime}), NOT live. " +
+            "Recording continues and every tick captured under it is stamped with that type, but the " +
+            "quotes are not live and a {Reason} gap is open for this lease until TWS reports live. " +
+            "IBKR:MarketDataType is what was REQUESTED; this is what was SERVED, and TWS downgrades " +
+            "silently when the entitlement is missing.",
+            leaseId, marketDataType, DescribeMarketDataType(marketDataType), NonLiveMarketDataReason);
+
+        _ = OpenGapAsync(LeaseScope(leaseId), NonLiveMarketDataReason, CancellationToken.None);
+    }
+
+    /// <summary>
+    /// Retires the non-live alarm when TWS reports live for this lease's ticker — and only that
+    /// alarm: see <see cref="CloseGapAsync(string, bool, string?)"/>'s <c>onlyIfReason</c>.
+    /// </summary>
+    public void NotifyLiveMarketData(Guid leaseId) =>
+        _ = CloseGapAsync(LeaseScope(leaseId), observed: true, onlyIfReason: NonLiveMarketDataReason);
+
+    private static string DescribeMarketDataType(int marketDataType) => marketDataType switch
+    {
+        1 => "live",
+        2 => "frozen",
+        3 => "delayed",
+        4 => "delayed-frozen",
+        _ => "unrecognised",
+    };
 
     public static string LeaseScope(Guid leaseId) => $"lease:{leaseId:N}";
 
@@ -641,7 +768,7 @@ public sealed class ObservationRecorder : IObservationSink, IAsyncDisposable
         const string columns =
             "con_id, lease_id, observed_at, changed_fields, bid, ask, bid_size, ask_size, last, last_size, " +
             "volume, open_interest, greeks_variant, iv, delta, gamma, vega, theta, und_price, locked, crossed, " +
-            "origin, normalization_version";
+            "origin, normalization_version, market_data_type";
 
         for (var attempt = 0; ; attempt++)
         {
@@ -677,6 +804,7 @@ public sealed class ObservationRecorder : IObservationSink, IAsyncDisposable
                     await writer.WriteAsync(observation.Crossed, NpgsqlDbType.Boolean, cancellationToken);
                     await writer.WriteAsync((short)observation.Envelope.Origin, NpgsqlDbType.Smallint, cancellationToken);
                     await writer.WriteAsync(observation.Envelope.NormalizationVersion, NpgsqlDbType.Smallint, cancellationToken);
+                    await WriteNullableSmallintAsync(writer, observation.Envelope.MarketDataType, cancellationToken);
                 }
 
                 await writer.CompleteAsync(cancellationToken);
@@ -721,7 +849,7 @@ public sealed class ObservationRecorder : IObservationSink, IAsyncDisposable
         const string scope = UnderlyingWriteScope;
         const string columns =
             "con_id, lease_id, observed_at, changed_fields, bid, ask, bid_size, ask_size, last, last_size, " +
-            "volume, locked, crossed, origin, normalization_version";
+            "volume, locked, crossed, origin, normalization_version, market_data_type";
 
         for (var attempt = 0; ; attempt++)
         {
@@ -749,6 +877,7 @@ public sealed class ObservationRecorder : IObservationSink, IAsyncDisposable
                     await writer.WriteAsync(observation.Crossed, NpgsqlDbType.Boolean, cancellationToken);
                     await writer.WriteAsync((short)observation.Envelope.Origin, NpgsqlDbType.Smallint, cancellationToken);
                     await writer.WriteAsync(observation.Envelope.NormalizationVersion, NpgsqlDbType.Smallint, cancellationToken);
+                    await WriteNullableSmallintAsync(writer, observation.Envelope.MarketDataType, cancellationToken);
                 }
 
                 await writer.CompleteAsync(cancellationToken);
@@ -784,6 +913,15 @@ public sealed class ObservationRecorder : IObservationSink, IAsyncDisposable
     private static Task WriteNullableDecimalAsync(NpgsqlBinaryImporter writer, decimal? value, CancellationToken cancellationToken) =>
         value is { } present
             ? writer.WriteAsync(present, NpgsqlDbType.Numeric, cancellationToken)
+            : writer.WriteNullAsync(cancellationToken);
+
+    /// <summary>
+    /// Writes a nullable smallint, with NULL meaning UNMEASURED rather than any particular value —
+    /// which for <c>market_data_type</c> is the whole point (migration 016).
+    /// </summary>
+    private static Task WriteNullableSmallintAsync(NpgsqlBinaryImporter writer, short? value, CancellationToken cancellationToken) =>
+        value is { } present
+            ? writer.WriteAsync(present, NpgsqlDbType.Smallint, cancellationToken)
             : writer.WriteNullAsync(cancellationToken);
 
     /// <summary>

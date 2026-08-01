@@ -16,6 +16,9 @@ internal sealed class RecordingTickSink : ITickSink
 {
     private const short NormalizationVersion = 1;
 
+    /// <summary>The one <c>marketDataType</c> value that is not an alarm.</summary>
+    private const short LiveMarketDataType = 1;
+
     private readonly int _conId;
     private readonly Guid _leaseId;
     private readonly bool _isOption;
@@ -38,6 +41,27 @@ internal sealed class RecordingTickSink : ITickSink
     private decimal? _vega;
     private decimal? _theta;
     private decimal? _undPrice;
+
+    /// <summary>
+    /// What TWS has REPORTED for this sink's ticker, or null until it has reported anything.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately per-SINK state rather than an entry in a map keyed by ticker or lease id. Every
+    /// (re)issue — a grant, a replay after TWS's 1101 notice, a reconnect — allocates a brand-new
+    /// ticker and constructs a brand-new sink registered at it, and deregisters the old ticker
+    /// (<c>SubscriptionManager.IssueAsync</c>/<c>TerminateAsync</c>). Held here, the old ticker's
+    /// reported type becomes garbage the instant its registry entry goes, so there is nothing to
+    /// leak, nothing to re-key, and a late <c>marketDataType</c> callback for the superseded ticker
+    /// resolves to no sink at all. A separate dictionary would have had to be re-keyed on every
+    /// re-issue — the exact shape of this area's worst defects (docs/DECISIONS.md §16).
+    /// <para>
+    /// It follows that a fresh sink starts UNKNOWN, so the first ticks after a replay carry
+    /// <c>null</c> rather than inheriting the previous ticker's value. That is the correct answer,
+    /// not a shortcoming: the new subscription's regime is genuinely unmeasured until TWS answers
+    /// for it, and the previous ticker's answer is not evidence about this one.
+    /// </para>
+    /// </remarks>
+    private short? _marketDataType;
 
     /// <summary>
     /// True until the next tick emits — that tick is tagged <see cref="ObservationOrigin.ReplayResubscribe"/>
@@ -262,6 +286,57 @@ internal sealed class RecordingTickSink : ITickSink
         Emit(changed);
     }
 
+    /// <summary>
+    /// Records the regime TWS says it is actually serving this ticker, and raises the alarm when
+    /// that is not live.
+    /// </summary>
+    /// <remarks>
+    /// This class has no access to <c>IbkrOptions.MarketDataType</c> — the REQUESTED type — and
+    /// that is the design, not an oversight. TWS answers an unentitled request for live data with
+    /// 2 or 3 and no error, so a column stamped from the request would say "live" on a whole
+    /// session of 15-minute-old quotes: a confident column, the same defect class as a confident
+    /// comment (docs/LESSONS.md #4). Only what arrived on this callback is ever written.
+    /// </remarks>
+    public void ApplyMarketDataType(int marketDataType)
+    {
+        if (marketDataType is < 1 or > 4)
+        {
+            // Outside the domain migration 016's CHECK holds. NOT stored: a value the schema
+            // rejects would abort the entire 5,000-row COPY batch it landed in, and losing a batch
+            // of unrecoverable ticks is far worse than one unknown column. Still reported as
+            // non-live, because "TWS said something about the data regime we do not understand" is
+            // precisely the case that must not read as live (docs/LESSONS.md #8). Whatever was last
+            // validly reported stays in place — this callback is evidence that something is wrong,
+            // not evidence that the previous answer was withdrawn.
+            _recorder.NotifyNonLiveMarketData(_leaseId, marketDataType);
+            return;
+        }
+
+        var reported = (short)marketDataType;
+
+        lock (_gate)
+        {
+            if (_marketDataType == reported)
+            {
+                // TWS re-reports the same type on some paths. One alarm per regime, not one per
+                // message: a signal that fires on every repeat is one operators stop reading
+                // (docs/LESSONS.md #10).
+                return;
+            }
+
+            _marketDataType = reported;
+        }
+
+        if (reported == LiveMarketDataType)
+        {
+            _recorder.NotifyLiveMarketData(_leaseId);
+        }
+        else
+        {
+            _recorder.NotifyNonLiveMarketData(_leaseId, reported);
+        }
+    }
+
     public void CompletePartial()
     {
         // No concept of "complete" for a standing subscription — it lives for the lease's duration.
@@ -275,6 +350,7 @@ internal sealed class RecordingTickSink : ITickSink
         bool locked;
         bool crossed;
         ObservationOrigin origin;
+        short? marketDataType;
 
         lock (_gate)
         {
@@ -282,8 +358,10 @@ internal sealed class RecordingTickSink : ITickSink
             crossed = _bid.HasValue && _ask.HasValue && _bid > _ask;
             origin = _pendingReplayTag ? ObservationOrigin.ReplayResubscribe : ObservationOrigin.Stream;
             _pendingReplayTag = false;
+            marketDataType = _marketDataType;
 
-            var envelope = new ObservationEnvelope(_conId, _leaseId, observedAt, NormalizationVersion, origin);
+            var envelope = new ObservationEnvelope(
+                _conId, _leaseId, observedAt, NormalizationVersion, origin, marketDataType);
 
             if (_isOption)
             {
@@ -300,7 +378,15 @@ internal sealed class RecordingTickSink : ITickSink
 
         if (origin == ObservationOrigin.ReplayResubscribe)
         {
-            _recorder.NotifyGapClosed(_leaseId);
+            // The effective type goes WITH the close rather than being asserted separately
+            // afterwards. This lease's scope holds at most one open gap, so "a tick resumed" closes
+            // whatever is open — including a non_live_market_data row this very sink opened moments
+            // earlier, when TWS answered marketDataType before the first tick arrived. TWS reports
+            // the type once per reqMktData, so nothing would ever reopen it, and the alarm would
+            // vanish on exactly the path (a 1101 replay) where it is most likely to be seen. The
+            // recorder re-opens it after the close has landed; passing it here is what makes that
+            // ordered instead of a race between two fire-and-forget calls.
+            _recorder.NotifyGapClosed(_leaseId, marketDataType);
         }
     }
 

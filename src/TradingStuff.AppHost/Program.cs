@@ -21,9 +21,26 @@ var ibkrMarketDataType = builder.AddParameter("ibkr-market-data-type", "3", publ
 var postgresUser = builder.AddParameter("postgres-user", "trading", publishValueAsDefault: true);
 var postgresPassword = builder.AddParameter("postgres-password", "trading", publishValueAsDefault: true);
 
+// A named data volume, not the Aspire default (ephemeral, destroyed with the container): the
+// `trading` database holds the SPX/SPY backfill (~15h/~23h respectively) and every recorded tick,
+// and Track B tick recording is unrecoverable by construction. Losing the volume on an ordinary
+// `aspire start`/stop cycle would silently discard both.
+//
+// WithLifetime(Persistent) as well, not just the volume: without it, Aspire stops and REMOVES the
+// container on every app-host shutdown and recreates a fresh one on the next `aspire start`. The
+// named volume survives that regardless (a volume outlives the container that mounted it), so data
+// is not lost either way — but a fresh container means initdb runs again, Postgres logs the startup
+// sequence again, and this AppHost model has other containers (rabbitmq, keycloak) with their own
+// state that benefits from the same treatment for local-first iteration speed: a persistent
+// container reattaches to what was already running instead of paying container startup cost on
+// every `aspire start`. The cost is that `aspire start` no longer guarantees a clean container
+// per run — acceptable here because this is a local dev/research box, not a shared or CI
+// environment, and the whole point of this host is long-lived state across restarts.
 var postgres = builder.AddPostgres("postgres", postgresUser, postgresPassword)
     .WithImageTag("17")
-    .WithHostPort(5432);
+    .WithHostPort(5432)
+    .WithDataVolume("tradingstuff-postgres-data")
+    .WithLifetime(ContainerLifetime.Persistent);
 
 // POSTGRES_USER=trading makes initdb create a database named "trading"; MigrationRunner also
 // creates it defensively if a different server is pointed at.

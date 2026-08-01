@@ -27,6 +27,22 @@ internal interface ITickSink : IPendingRequest
     {
     }
 
+    /// <summary>
+    /// The <c>marketDataType</c> callback's answer for this sink's ticker: the regime TWS is
+    /// ACTUALLY serving — 1 live, 2 frozen, 3 delayed, 4 delayed-frozen — which is not necessarily
+    /// the one <c>reqMarketDataType</c> asked for, because TWS silently downgrades a request when
+    /// the account's entitlement is missing.
+    /// </summary>
+    /// <remarks>
+    /// Default no-op for the same reason <see cref="ApplySize"/> is one: only the recorder's
+    /// standing-subscription sinks write this down. A one-shot execution quote settles from the
+    /// tick fields it receives and carries no provenance column, so
+    /// <see cref="QuoteRequest"/>/<see cref="SpotPriceRequest"/> would need an empty override each.
+    /// </remarks>
+    void ApplyMarketDataType(int marketDataType)
+    {
+    }
+
     /// <summary>Settle with whatever has arrived so far.</summary>
     void CompletePartial();
 }

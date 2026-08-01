@@ -203,6 +203,168 @@ public sealed class LiveTwsSubscriptionManagerTests
         }
     }
 
+    /// <summary>Captures what a <see cref="RecordingTickSink"/> emits, with no Postgres behind it.</summary>
+    private sealed class CapturingSink : IObservationSink
+    {
+        public List<OptionQuoteObservation> Options { get; } = [];
+
+        public List<UnderlyingTickObservation> Underlyings { get; } = [];
+
+        public List<int> NonLiveReports { get; } = [];
+
+        public List<Guid> LiveReports { get; } = [];
+
+        public void EnqueueOption(OptionQuoteObservation observation)
+        {
+            lock (Options)
+            {
+                Options.Add(observation);
+            }
+        }
+
+        public void EnqueueUnderlying(UnderlyingTickObservation observation)
+        {
+            lock (Underlyings)
+            {
+                Underlyings.Add(observation);
+            }
+        }
+
+        public void NotifyGapClosed(Guid leaseId, short? effectiveMarketDataType)
+        {
+        }
+
+        public void NotifyNonLiveMarketData(Guid leaseId, int marketDataType)
+        {
+            lock (NonLiveReports)
+            {
+                NonLiveReports.Add(marketDataType);
+            }
+        }
+
+        public void NotifyLiveMarketData(Guid leaseId)
+        {
+            lock (LiveReports)
+            {
+                LiveReports.Add(leaseId);
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Paper_TWS_reports_an_effective_market_data_type_and_it_is_what_gets_stamped()
+    {
+        // The broker fact a stubbed socket cannot supply (docs/LESSONS.md #5): that TWS answers
+        // reqMarketDataType with a marketDataType callback per ticker at all, that the answer is in
+        // the documented 1|2|3|4 domain the schema's CHECK holds, and — the point of this whole
+        // change — that the answer for THIS account may not be the value that was requested.
+        //
+        // Deliberately market-hours independent in its required half. The callback arrives on the
+        // subscription's acceptance, not on trading activity, so it is asserted unconditionally.
+        // Whether any TICK follows depends on the session being open; that half is asserted only if
+        // ticks actually arrive, and the test says out loud when they did not rather than passing
+        // quietly as though it had checked (docs/LESSONS.md #12).
+        if (TwsEndpoint is not { } endpoint || !CanReachTws(endpoint))
+        {
+            return;
+        }
+
+        Assert.True(endpoint.Port is 7497 or 4002, $"refusing to run against non-paper port {endpoint.Port}");
+
+        const int requested = 1; // ask for LIVE, so requested and served can differ visibly
+        var options = Options.Create(new IbkrOptions
+        {
+            Host = endpoint.Host,
+            Port = endpoint.Port,
+            ClientId = TestClientId + 1,
+            MarketDataType = requested,
+        });
+
+        var registry = new IbkrRequestRegistry();
+        var governor = new IbkrPacingGovernor(
+            options, TimeProvider.System, new TestMeterFactory(), NullLogger<IbkrPacingGovernor>.Instance);
+        var wrapper = new IbkrClientWrapper(
+            registry, new IbkrOrderTracker(NullLogger<IbkrOrderTracker>.Instance),
+            NullLogger<IbkrClientWrapper>.Instance);
+
+        using var connection = new IbkrConnection(
+            options, registry, wrapper, governor, NullLogger<IbkrConnection>.Instance);
+        var socket = new PacedSocket(connection, governor, NullLogger<PacedSocket>.Instance);
+
+        await connection.StartAsync(CancellationToken.None);
+
+        try
+        {
+            await WaitUntilAsync(() => Task.FromResult(connection.IsConnected), TimeSpan.FromSeconds(30));
+            Assert.True(connection.IsConnected, "TWS did not accept the API connection.");
+
+            var capture = new CapturingSink();
+            var leaseId = Guid.NewGuid();
+            var ticker = registry.NextRequestId();
+
+            registry.Register(
+                ticker,
+                new RecordingTickSink(
+                    SpxIndexConId, leaseId, isOption: false, markFirstTickAsReplay: false, capture, _ => { }));
+
+            var line = await socket.ReqMktDataAsync(
+                ticker,
+                new IBApi.Contract { ConId = SpxIndexConId, Exchange = "CBOE" },
+                genericTickList: string.Empty,
+                snapshot: false,
+                regulatorySnapshot: false,
+                mktDataOptions: null,
+                LineClass.Research,
+                CancellationToken.None);
+
+            try
+            {
+                await WaitUntilAsync(
+                    () => Task.FromResult(capture.NonLiveReports.Count + capture.LiveReports.Count > 0),
+                    TimeSpan.FromSeconds(20));
+
+                var reported = capture.LiveReports.Count > 0 ? 1 : capture.NonLiveReports.FirstOrDefault();
+
+                Assert.True(
+                    capture.NonLiveReports.Count + capture.LiveReports.Count > 0,
+                    "Paper TWS never sent a marketDataType callback for this subscription, so nothing " +
+                    "here has been demonstrated about what regime the account is actually served.");
+
+                // Measured on paper TWS, 2026-08-01: this account IS entitled to live Cboe index
+                // data, so a request for 1 came back as 1 and four SPX ticks arrived stamped 1.
+                // Recorded because it fixes what the assertion below is worth: on THIS account the
+                // requested and served values happen to agree, so this test demonstrates that the
+                // callback arrives and that what it says is what gets stamped — it does NOT
+                // demonstrate a downgrade. Only an unentitled account or an explicit request for 3
+                // can do that, and the unit tests cover the divergence directly.
+                Assert.InRange(reported, 1, 4);
+
+                // What the recorder stamps is what arrived on the callback — every emitted row, not
+                // the requested value, and not a null once the answer is in.
+                var stamped = capture.Underlyings.Select(o => o.Envelope.MarketDataType).ToArray();
+
+                Assert.All(
+                    stamped.Where(value => value is not null),
+                    value => Assert.Equal((short)reported, value));
+
+                Assert.True(
+                    stamped.Length > 0,
+                    $"TWS reported market data type {reported} for the SPX index, but no tick arrived " +
+                    "within the window, so the stamping half of this test proved nothing. Expected " +
+                    "outside RTH/GTH — re-run while the Cboe session is open.");
+            }
+            finally
+            {
+                await socket.CancelMktDataAsync(ticker, line);
+                registry.Remove(ticker);
+            }
+        }
+        finally
+        {
+            await connection.StopAsync(CancellationToken.None);
+        }
+    }
+
     private static async Task<int> GapCountAsync(string connectionString, string scope)
     {
         await using var connection = new NpgsqlConnection(connectionString);

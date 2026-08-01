@@ -46,12 +46,23 @@ public enum ObservationOrigin
 }
 
 /// <summary>Fields every raw observation carries, regardless of instrument kind.</summary>
+/// <param name="MarketDataType">
+/// The regime TWS REPORTED for the ticker this observation arrived on — 1 live, 2 frozen,
+/// 3 delayed, 4 delayed-frozen — as of the moment it arrived. Null means UNKNOWN: TWS's
+/// <c>marketDataType</c> callback had not yet answered for that ticker. Null is never to be read as
+/// "assume live", and this field must never be populated from the REQUESTED type
+/// (<c>IbkrOptions.MarketDataType</c>): TWS silently downgrades a request whose entitlement is
+/// missing, so stamping the request would make every row claim the regime that was wanted rather
+/// than the one that was served. Deliberately has no default value — a raw observation is
+/// unrecoverable, and every construction site must state what it knows.
+/// </param>
 public sealed record ObservationEnvelope(
     int ConId,
     Guid LeaseId,
     DateTimeOffset ObservedAt,
     short NormalizationVersion,
-    ObservationOrigin Origin);
+    ObservationOrigin Origin,
+    short? MarketDataType);
 
 /// <summary>
 /// One full-state row for an option leg: every field the sink currently holds, not only what

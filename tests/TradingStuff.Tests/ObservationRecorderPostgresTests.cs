@@ -128,14 +128,18 @@ public sealed class ObservationRecorderPostgresTests
             configuration, meterFactory ?? new TestMeterFactory(), NullLogger<ObservationRecorder>.Instance);
     }
 
-    private static OptionQuoteObservation SampleOptionObservation(int conId, Guid leaseId) => new(
-        new ObservationEnvelope(conId, leaseId, DateTimeOffset.UtcNow, NormalizationVersion: 1, ObservationOrigin.Stream),
+    private static OptionQuoteObservation SampleOptionObservation(
+        int conId, Guid leaseId, short? marketDataType = null) => new(
+        new ObservationEnvelope(
+            conId, leaseId, DateTimeOffset.UtcNow, NormalizationVersion: 1, ObservationOrigin.Stream, marketDataType),
         QuoteFieldChanges.Bid, Bid: 1.95m, Ask: 2.05m, BidSize: 8m, AskSize: 12m, Last: 2.00m, LastSize: 1m,
         Volume: 5m, OpenInterest: 100m, GreeksVariant.Model, Iv: 0.20m, Delta: 0.51m, Gamma: 0.001m,
         Vega: 7.9m, Theta: -2.4m, UnderlyingPrice: 7436.57m, Locked: false, Crossed: false);
 
-    private static UnderlyingTickObservation SampleUnderlyingObservation(int conId, Guid leaseId) => new(
-        new ObservationEnvelope(conId, leaseId, DateTimeOffset.UtcNow, NormalizationVersion: 1, ObservationOrigin.Stream),
+    private static UnderlyingTickObservation SampleUnderlyingObservation(
+        int conId, Guid leaseId, short? marketDataType = null) => new(
+        new ObservationEnvelope(
+            conId, leaseId, DateTimeOffset.UtcNow, NormalizationVersion: 1, ObservationOrigin.Stream, marketDataType),
         QuoteFieldChanges.Last, Bid: 7436.50m, Ask: 7436.75m, BidSize: 3m, AskSize: 4m, Last: 7436.57m,
         LastSize: 1m, Volume: 12m, Locked: false, Crossed: false);
 
@@ -170,6 +174,61 @@ public sealed class ObservationRecorderPostgresTests
                 }, TimeSpan.FromSeconds(5)),
                 "The 10 enqueued observations never reached gateway.option_quote_events.");
         }
+    }
+
+    [Fact]
+    public async Task The_reported_market_data_type_round_trips_through_the_binary_copy_including_null()
+    {
+        // The COPY path is written by ordinal: a column list and a matching sequence of
+        // writer.WriteAsync calls, with nothing but their order tying the two together. Adding a
+        // column to one and not the other, or writing the wrong NpgsqlDbType, is caught here and
+        // essentially nowhere else — and it would be caught on unrecoverable data.
+        //
+        // Both values matter. 3 is the measurement; NULL is the honest "TWS had not reported yet",
+        // which must survive the write as NULL rather than becoming 0 or defaulting to live.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var leaseId = Guid.NewGuid();
+
+        await using (var recorder = CreateRecorder(connectionString))
+        {
+            recorder.EnqueueOption(SampleOptionObservation(561, leaseId, marketDataType: 3));
+            recorder.EnqueueOption(SampleOptionObservation(561, leaseId, marketDataType: null));
+            recorder.EnqueueUnderlying(SampleUnderlyingObservation(562, leaseId, marketDataType: 2));
+            recorder.EnqueueUnderlying(SampleUnderlyingObservation(562, leaseId, marketDataType: null));
+        }
+
+        // DisposeAsync above is a full graceful drain, so everything accepted is already durable.
+        Assert.Equal(
+            [(short?)3, null],
+            await MarketDataTypesAsync(connectionString, "gateway.option_quote_events", 561));
+
+        Assert.Equal(
+            [(short?)2, null],
+            await MarketDataTypesAsync(connectionString, "gateway.underlying_tick_events", 562));
+    }
+
+    private static async Task<short?[]> MarketDataTypesAsync(string connectionString, string table, int conId)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+        await using var command = new NpgsqlCommand(
+            $"SELECT market_data_type FROM {table} WHERE con_id = $1 ORDER BY event_id", connection);
+        command.Parameters.AddWithValue(conId);
+
+        var values = new List<short?>();
+        await using var reader = await command.ExecuteReaderAsync();
+
+        while (await reader.ReadAsync())
+        {
+            values.Add(await reader.IsDBNullAsync(0) ? null : reader.GetInt16(0));
+        }
+
+        return [.. values];
     }
 
     [Fact]
