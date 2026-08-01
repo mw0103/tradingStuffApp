@@ -499,7 +499,13 @@ public class RealizedVolatilityEngineTests
         Assert.Equal(1, spyPolicy.SkipMinutesAfterOpen);
         Assert.Equal(5, spxPolicy.SkipMinutesAfterOpen);
         Assert.Equal("NYSE", VolatilityPresets.SpyCalendar);
-        Assert.Equal("CBOE_INDEX_RTH", VolatilityPresets.SpxCalendar);
+
+        // NOT CBOE_INDEX_RTH, which is the index OPTION window (08:30-15:15 CT, 405 min). The SPX
+        // index level stops at the cash close — TWS reports liquidHours 0830-1500 and returns exactly
+        // 390 one-minute bars a session. Pinning the option calendar here made this assertion agree
+        // with the constant while both disagreed with the data the estimator is fed; see
+        // VolatilityPresets.SpxCalendar's remarks.
+        Assert.Equal("CBOE_SPX_RTH", VolatilityPresets.SpxCalendar);
 
         foreach (var o in new[] { spyOptions, spxOptions })
         {

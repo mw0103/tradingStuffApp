@@ -31,8 +31,30 @@ namespace TradingStuff.Volatility
         /// <summary>SPY is NYSE-listed; its sessions follow that calendar.</summary>
         public const string SpyCalendar = "NYSE";
 
-        /// <summary>SPX is a Cboe index; its regular session is the Cboe index RTH calendar.</summary>
-        public const string SpxCalendar = "CBOE_INDEX_RTH";
+        /// <summary>
+        /// The SPX INDEX LEVEL's session, which is not the SPX option session.
+        /// </summary>
+        /// <remarks>
+        /// This was <c>CBOE_INDEX_RTH</c> — the Cboe index <b>option</b> window, 08:30-15:15 CT
+        /// (405 minutes). SPX/SPXW options do trade until 16:15 ET, but the index level itself stops
+        /// disseminating at the cash close: TWS <c>contractDetails</c> for SPX IND reports
+        /// <c>liquidHours</c>/<c>tradingHours</c> = <c>0830-1500</c> US/Central, and five consecutive
+        /// sessions returned exactly 390 one-minute bars each, 08:30..14:59 CT, never 405.
+        /// <para>
+        /// So the option calendar over-stated the session this estimator's own input spans by fifteen
+        /// minutes. Nothing broke, because the annualisation here uses a literal 390 and
+        /// <see cref="SessionQualityPolicy"/> gates on a minimum sampled-return count rather than on
+        /// session length — but that is two sources of truth for one session disagreeing, with the
+        /// arithmetic silently right and the calendar silently wrong. See docs/LESSONS.md on
+        /// fail-safe parts composing into an unsafe whole.
+        /// </para>
+        /// <para>
+        /// <c>CBOE_SPX_RTH</c> carries dated rows: the close moved 15:15 -&gt; 15:00 CT on 2013-03-11,
+        /// so a series reaching back before that date gets the boundary in force at the time rather
+        /// than today's.
+        /// </para>
+        /// </remarks>
+        public const string SpxCalendar = "CBOE_SPX_RTH";
 
         /// <summary>
         /// SPY from one-minute bars. Ex-dividend dates are deliberately left empty:
