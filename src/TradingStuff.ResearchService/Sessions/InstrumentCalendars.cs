@@ -11,6 +11,14 @@ namespace TradingStuff.ResearchService.Sessions;
 /// The session label within that calendar this expectation applies to (<c>"RTH"</c> or <c>"GTH"</c>).
 /// Named per entry rather than inferred from the calendar key because <c>CME_ES</c> carries both
 /// labels under one key, with GTH nesting RTH for the same trading date.
+/// <para>
+/// Nesting comes in both shapes and neither may be summed. <c>CME_ES</c> nests WITHIN one calendar
+/// key; SPY nests ACROSS two (<c>NYSE_EXTENDED</c>'s 04:00-20:00 GTH row contains <c>NYSE</c>'s
+/// 09:30-16:00 RTH row). Consumers union — <c>SessionMinutes.DistinctMinutes</c> sweeps every clipped
+/// session regardless of which calendar it came from, and gap detection counts bars per window rather
+/// than adding expectations up — so both shapes are safe, and adding two entries together is wrong
+/// for both.
+/// </para>
 /// </param>
 public sealed record InstrumentSessionExpectation(string Calendar, string Label);
 
@@ -21,7 +29,34 @@ public sealed record InstrumentSessionExpectation(string Calendar, string Label)
 /// <param name="Description">
 /// Human-readable, and meant to be read: it is what a report prints instead of a silent pass.
 /// </param>
-public sealed record UnmodelledSessionWindow(string Description);
+/// <param name="From">
+/// Inclusive lower bound of the stretch of HISTORY the admission covers, or null for "as far back as
+/// the instrument goes".
+/// </param>
+/// <param name="To">
+/// Exclusive upper bound, or null for "still true". Bounds exist because an unbounded admission is
+/// nearly as bad as a silent one: VIX's overnight leg was declared unmodelled with no end, so every
+/// VIX series reported as never-reconciled on every run — a permanently red gate for a window that
+/// turned out to be fully describable, and a gate that is always red is a gate nobody reads. The
+/// remaining admissions are not like that. They are bounded stretches of old history where the venue
+/// schedule this platform can obtain is demonstrably a fill rather than a schedule, so the honest
+/// report is "unaudited from here to there", which an operator can act on, rather than "unaudited,
+/// forever", which they cannot.
+/// </param>
+public sealed record UnmodelledSessionWindow(string Description, DateTimeOffset? From, DateTimeOffset? To)
+{
+    /// <summary>
+    /// This window intersected with [<paramref name="from"/>, <paramref name="to"/>), or null when
+    /// they do not overlap and the admission therefore says nothing about the caller's window.
+    /// </summary>
+    public (DateTimeOffset From, DateTimeOffset To)? Intersect(DateTimeOffset from, DateTimeOffset to)
+    {
+        var start = From is { } f && f > from ? f : from;
+        var end = To is { } t && t < to ? t : to;
+
+        return end > start ? (start, end) : null;
+    }
+}
 
 /// <summary>
 /// What an instrument's expected sessions are, plus what is knowingly missing from that answer.
@@ -145,22 +180,46 @@ public static class InstrumentCalendars
         // SPY is NYSE/ARCA cash equities, not Cboe. Nothing about its session resembles the index
         // pair, and the shared default had it measured against Cboe hours.
         //
-        // SPY does trade outside the NYSE regular session, and that window is declared unmodelled
-        // rather than left silent. MEASURED 2026-08-01 off live TWS: SPY reports tradingHours
-        // 0400-2000 US/Eastern against liquidHours 0930-1600, and a useRth=false 1-minute TRADES
-        // request returns 960 bars a day running 04:00..19:59 ET — 570 minutes a day that the NYSE
-        // calendar's 390-minute session does not describe. Latent today because both shipped SPY jobs
-        // are useRth=true, exactly as the SPX index GTH claim was latent; the difference is that here
-        // the extra data provably EXISTS, so an expectation-free window is a real audit hole and gets
-        // named. Writing an NYSE_EXTENDED calendar is the complete fix and belongs in
-        // exchange-calendars.json alongside the rest.
+        // SPY also trades 570 minutes a day outside the regular session, and that window used to be
+        // declared unmodelled here — right while nothing described it, wrong once something could,
+        // because an unmodelled window makes every SPY series report as never-reconciled forever (the
+        // same permanently-red gate VIX carried until its own GTH calendar was written). NYSE_EXTENDED
+        // now describes it. MEASURED 2026-08-01 off live TWS: SPY (conId 756733) reports tradingHours
+        // 0400-2000 US/Eastern against liquidHours 0930-1600; IBKR's published schedule returns 4,166
+        // sessions over 2010-01-04..2026-07-31 (4,131 at 04:00-20:00, 34 at 04:00-17:00 on exactly the
+        // dates the US_MARKET early-close rules already produce, one at 04:00-19:30 for the 2015 leap
+        // second); and a useRth=false 1-minute TRADES request returns exactly 960 bars a day running
+        // 04:00..19:59 ET.
+        //
+        // TWO calendar keys, not two labels on one. NYSE_EXTENDED's 04:00-20:00 GTH row NESTS the NYSE
+        // 09:30-16:00 RTH row, exactly as CME_ES's Globex day nests its regular session — so a full day
+        // is 960 expected minutes, NOT 960 + 390. Every consumer of this mapping unions rather than
+        // sums (SessionMinutes.DistinctMinutes for the coverage denominator, per-window bar counts for
+        // gap detection), which is what makes the nesting safe; a consumer that adds the two together
+        // double-counts 390 minutes a day. A useRth=true job filters to RTH and is unaffected either
+        // way, which is why this was latent until now.
+        //
+        // ONE bounded admission remains, and it shrank rather than vanished. NYSE_EXTENDED asserts
+        // nothing before 2010-01-04, because IBKR's SPY schedule is a weekday FILL before then (it
+        // returns sessions on Christmas Day 1998 and July 4 2000-2006) and the bars show the extended
+        // session's open genuinely moving earlier over the years — 08:00 ET in early 2005, ~06:25 in
+        // 2007, 04:00 by 2011. Modelling 04:00 back through 2005 would over-expect by up to 240
+        // minutes a day, the direction that manufactures gaps. So the pre-2010 extended window is
+        // named as unaudited instead of quietly measured against the 390-minute regular session, which
+        // is the absence-renders-as-health failure this platform keeps paying for. It is BOUNDED, so
+        // it cannot make the whole SPY series permanently red the way VIX's unbounded one did: the
+        // seeded top-up job never reaches it at all, and the seeded historical job (target_from
+        // 2005-01-01) reports it over 2005..2010 and nowhere else.
         ("SPY", "stock") => new(
-            [new("NYSE", "RTH")],
+            [new("NYSE", "RTH"), new("NYSE_EXTENDED", "GTH")],
             [new(
-                "SPY trades 04:00-20:00 ET while the NYSE calendar models only the 09:30-16:00 ET " +
-                "regular session (runtime-verified 2026-08-01: 960 useRth=false 1-minute bars a day, " +
-                "04:00..19:59 ET). Pre- and post-market SPY bars are therefore NOT audited — their " +
-                "absence would not be reported.")]),
+                "SPY's extended session (04:00-20:00 ET) is modelled by NYSE_EXTENDED only from " +
+                "2010-01-04, the first trading date IBKR publishes a real schedule for rather than a " +
+                "weekday fill. Before that the extended window is NOT audited — pre- and post-market " +
+                "bars are measured against nothing, and the regular session alone under-states the " +
+                "day. Nothing here is wrong; it is unchecked, which is a different claim.",
+                From: null,
+                To: new DateTimeOffset(2010, 1, 4, 0, 0, 0, TimeSpan.Zero))]),
 
         // CME_ES carries both labels under one key, with the Globex GTH row NESTING the RTH row for
         // the same trading date. A consumer that adds the two together double-counts the overlap;

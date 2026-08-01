@@ -1,6 +1,6 @@
 {
-  "generatorVersion": 2,
-  "revision": "2026-08-01",
+  "generatorVersion": 3,
+  "revision": "2026-08-01b",
   "knownGoodThrough": "2026-12-31",
   "notes": [
     "AUDITABLE SOURCE OF TRUTH for every exchange session this platform generates. Downstream code",
@@ -39,6 +39,14 @@
     "during 2025). This platform cannot follow that: two sessions would then share one (calendar,",
     "trading date, label), which research.sessions forbids, and an ES bar at 09:00 CT on Thanksgiving",
     "would be attributed to the Friday. The date a session ends on is the date it belongs to.",
+    "",
+    "AN UNSCHEDULED EARLY CLOSE IS PER VENUE, AND ITS TIME IS APPLIED TO EVERY SESSION TEMPLATE ON THAT",
+    "venue that takes early closes. That is why NYSE_EXTENDED is its own venue rather than a second",
+    "calendar on the NYSE one: the 2015 leap-second close at 19:30 ET shortened the extended session and",
+    "left the regular session entirely alone, and an entry for it in the set NYSE RTH reads would not",
+    "shorten RTH — it would LENGTHEN it from 16:00 to 19:30. Two venues that share every rule set and",
+    "differ only in their unscheduled data are cheap; a shared set that silently re-times the wrong",
+    "session is not.",
     "",
     "SESSION TEMPLATES MAY BE DATED. A session row can carry `effectiveFrom`/`effectiveTo` when a venue",
     "genuinely changed a session's hours (the VIX index day leg has done so three times). Rows sharing",
@@ -169,6 +177,15 @@
         "confidence": "high"
       }
     ],
+    "US_EQUITY_EXTENDED_UNSCHEDULED": [
+      {
+        "date": "2015-06-30",
+        "close": "19:30",
+        "reason": "Leap second — US equity venues closed the after-hours session at 19:30 ET rather than trade through 23:59:60 UTC (19:59:60 ET)",
+        "confidence": "high",
+        "note": "source: tws-schedule, cross-checked against bars. IBKR's published SPY schedule reports 0400-1930 on this date alone out of 4,166 sessions over 2010-01-04..2026-07-31, and a useRth=false 1-minute TRADES request returns exactly 930 bars running 04:00..19:29 ET with no minute missing. The bars run straight through 16:00, so the REGULAR session was untouched — which is exactly why this set exists separately from US_EQUITY_UNSCHEDULED rather than being one entry in it."
+      }
+    ],
     "CME_UNSCHEDULED": []
   },
 
@@ -241,6 +258,13 @@
       "closureSet": "US_EQUITY_UNSCHEDULED",
       "unscheduledEarlyCloseSet": "US_EQUITY_UNSCHEDULED"
     },
+    "NYSE_EXTENDED": {
+      "holidayRuleSet": "US_MARKET",
+      "earlyCloseRuleSet": "US_MARKET",
+      "closureSet": "US_EQUITY_UNSCHEDULED",
+      "unscheduledEarlyCloseSet": "US_EQUITY_EXTENDED_UNSCHEDULED",
+      "note": "Every RULE is shared with NYSE, and that is measured rather than assumed: IBKR's published SPY schedule returns 4,166 sessions over 2010-01-04..2026-07-31 and every one of their dates is a date the NYSE calendar already generates — no session on a holiday, none on Hurricane Sandy (2012-10-29/30) or either day of mourning (2018-12-05, 2025-01-09), and the 34 dates it reports at 17:00 are exactly the 34 the US_MARKET early-close rules produce, with no extra and none missing. Hence no partialSessionSet: unlike CME equity index, this venue never trades a shortened session on a day its own rules call it shut. Only the UNSCHEDULED early-close set differs, because only that set carries an explicit wall-clock time — see the note block above."
+    },
     "CBOE": {
       "holidayRuleSet": "US_MARKET",
       "earlyCloseRuleSet": "US_MARKET",
@@ -276,6 +300,26 @@
           "appliesEarlyClose": true
         }
       ]
+    },
+    {
+      "key": "NYSE_EXTENDED",
+      "venue": "NYSE_EXTENDED",
+      "timeZone": "America/New_York",
+      "effectiveFrom": "2010-01-04",
+      "description": "The full NYSE/ARCA cash-equity trading day — 04:00-20:00 ET — which NESTS the 09:30-16:00 regular session on the NYSE calendar. SPY's second calendar, and the fix for 570 minutes a day of real data that no session described. Measured 2026-08-01 off live TWS: SPY (conId 756733, US/Eastern) reports tradingHours 0400-2000 against liquidHours 0930-1600; IBKR's published schedule returns 4,166 sessions over 2010-01-04..2026-07-31, of which 4,131 are 04:00-20:00, 34 are 04:00-17:00 and one is 04:00-19:30; and a useRth=false 1-minute TRADES request returns exactly 960 bars a day running 04:00..19:59 ET with no minute missing. Latent before this entry only because both shipped SPY jobs are useRth=true — the moment one is not, every extended session reported as an audit hole.",
+      "sessions": [
+        {
+          "label": "GTH",
+          "openDayOffset": 0,
+          "open": "04:00",
+          "closeDayOffset": 0,
+          "close": "20:00",
+          "earlyClose": "17:00",
+          "appliesEarlyClose": true,
+          "note": "ONE session spanning the regular one, not a pre-market row plus a post-market row. That is forced, not preferred: research.sessions permits only the labels RTH and GTH and keys them UNIQUE (calendar, trading_date, label), so two GTH rows on one calendar and trading date cannot be stored, and the load-time tiling check rejects two undated rows sharing a label before it ever gets that far. CME_ES is the precedent and SessionMinutes.DistinctMinutes unions rather than sums so the nesting cannot double-count; here the nesting is across two calendar KEYS (NYSE + NYSE_EXTENDED) rather than within one, and the union sweep is calendar-blind, so a full SPY day is 960 expected minutes and not 960 + 390. openDayOffset is 0: unlike Cboe's option GTH and the Globex day, this session opens after midnight on its own trading date. The 17:00 early close is MEASURED, not the 20:00 close minus the 3 hours the regular session loses — the VIX day leg is a live counter-example where the early close did not move with the regular one. 780 bars running 04:00..16:59 ET on 2025-07-03, 2025-11-28 and 2025-12-24, and 04:48..16:59 on 2009-12-24."
+        }
+      ],
+      "note": "effectiveFrom is 2010-01-04 — the first trading date of the first calendar year in which every row IBKR publishes for SPY is a real schedule — and NOTHING is asserted before it, deliberately. The feed reaches 1998 and claims 04:00-20:00 throughout, but that stretch is a weekday FILL: it returns sessions on Christmas Day 1998, on July 4 2000-2006 and on New Year's Day 1999-2004, reports every half day from 1999 to 2005 as a full 20:00 close, emits 09:30-16:00 regular-session rows on actual 2006/2007 holidays, and emits zero-length 16:00-16:00 rows on 2007-11-23, 2007-12-24 and 2009-11-27. The bars say the same thing POSITIVELY rather than by absence — the extended session's first traded minute walks earlier over the years: exactly 08:00 ET with exactly 720 bars on 2005-01-04, 2005-02-02 and 2005-03-01 (that is an open, not three coincidences), ~07:25 later in 2005, ~06:25 in 2007, 04:15 by 2008-03-05, 04:00 exactly by 2011-03-16. So the window genuinely moved, and dated rows were considered and rejected: modelling 04:00 back through 2005 would over-expect by up to 240 minutes a day, which is the direction that MANUFACTURES gaps, and the earlier shapes cannot be pinned because a trade-driven first bar is only an upper bound on the open. The 20:00 close IS measured back to 2005-06-01 (last bar 19:59 on every sampled date), but a close without an established open is not a session. KNOWN RESIDUAL: a useRth=false SPY job reaching before 2010 is audited against the 390-minute regular session alone, which under-states rather than manufacturing, and is the same direction as CME_ES having no partial entries before 2022-11-24."
     },
     {
       "key": "CBOE_INDEX_RTH",

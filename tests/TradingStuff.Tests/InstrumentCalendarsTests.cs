@@ -20,9 +20,63 @@ public sealed class InstrumentCalendarsTests
     {
         var spy = InstrumentCalendars.For("SPY", "stock");
 
-        Assert.Equal(["NYSE"], spy.Calendars);
+        Assert.Equal(["NYSE", "NYSE_EXTENDED"], spy.Calendars);
         Assert.True(spy.Includes("NYSE", "RTH"));
+        Assert.True(spy.Includes("NYSE_EXTENDED", "GTH"));
         Assert.False(spy.Includes("CBOE_INDEX_RTH", "RTH"));
+    }
+
+    [Fact]
+    public void SPY_declares_no_unmodelled_window_over_any_window_the_calendar_covers()
+    {
+        // SPY's real 04:00-20:00 ET day was declared unmodelled while nothing described it — 570
+        // minutes a day whose absence would not have been reported. NYSE_EXTENDED describes it now
+        // (measured 2026-08-01 against the venue's published schedule and against 960 useRth=false
+        // 1-minute bars a day), and the second calendar key NESTS the first rather than sitting beside
+        // it, so a full day expects 960 minutes and not 960 + 390. The shapes are pinned with literal
+        // instants in ExchangeSessionScheduleTests.
+        var spy = InstrumentCalendars.For("SPY", "stock");
+        var window = spy.Unmodelled.Single();
+
+        Assert.Null(window.Intersect(
+            new DateTimeOffset(2010, 1, 4, 0, 0, 0, TimeSpan.Zero),
+            new DateTimeOffset(2026, 8, 1, 0, 0, 0, TimeSpan.Zero)));
+    }
+
+    [Fact]
+    public void Every_unmodelled_window_a_shipped_instrument_declares_is_bounded()
+    {
+        // The property that matters, stated over the whole mapping rather than per instrument. An
+        // UNBOUNDED admission makes its series report as never-reconciled on every run forever, and
+        // both that ever existed (VIX's overnight leg, SPY's whole extended day) were retired by
+        // measuring the venue rather than by deciding the window did not matter. What is left is
+        // allowed to exist but must name where it stops, or the report goes permanently red again and
+        // stops being read — which costs more than the caveat is worth.
+        string[][] shipped =
+        [
+            ["SPX", "option_class"], ["SPX", "index"], ["VIX", "index"],
+            ["SPY", "stock"], ["ES", "future_family"],
+        ];
+
+        Assert.All(shipped, entry =>
+        {
+            var mapping = InstrumentCalendars.For(entry[0], entry[1]);
+
+            Assert.NotEmpty(mapping.Expectations);
+            Assert.All(mapping.Unmodelled, window =>
+            {
+                Assert.NotEmpty(window.Description);
+                Assert.True(
+                    window.From is not null || window.To is not null,
+                    $"{entry[0]} ({entry[1]}) declares an unbounded unmodelled window, which makes its " +
+                    "series permanently unreconciled.");
+            });
+        });
+
+        // VIX and SPX have none at all, which is the stronger statement and the one their own
+        // calendars earned.
+        Assert.Empty(InstrumentCalendars.For("VIX", "index").Unmodelled);
+        Assert.Empty(InstrumentCalendars.For("SPX", "index").Unmodelled);
     }
 
     [Fact]

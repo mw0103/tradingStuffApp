@@ -195,6 +195,18 @@ public sealed record CalendarDefinition
 
     public string? Description { get; init; }
 
+    /// <summary>
+    /// Why the calendar's <see cref="EffectiveFrom"/> is where it is, and what is knowingly not
+    /// asserted outside it.
+    /// </summary>
+    /// <remarks>
+    /// Separate from <see cref="Description"/> because they answer different questions and the second
+    /// one is the one that gets lost: a description says what the session IS, and this says what the
+    /// evidence for it does not cover. Deserialized rather than left as an unmapped JSON field on
+    /// purpose — a field nothing binds is a comment that silently survives a rename.
+    /// </remarks>
+    public string? Note { get; init; }
+
     public IReadOnlyList<SessionDefinition> Sessions { get; init; } = [];
 
     /// <summary>

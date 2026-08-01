@@ -69,7 +69,7 @@ public sealed class SessionGenerator(ExchangeCalendarSet data)
     /// stale one. A unit test asserts this equals the JSON's own <c>generatorVersion</c>, so the two
     /// cannot drift.
     /// </summary>
-    public const short GeneratorVersion = 2;
+    public const short GeneratorVersion = 3;
 
     /// <summary>Sessions generated but not yet persisted carry this id.</summary>
     public const long UnpersistedSessionId = 0;

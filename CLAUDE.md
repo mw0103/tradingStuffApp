@@ -71,6 +71,19 @@ persist → publish lifecycle events. Routing goes to the simulated engine or IB
 `docs/PLAN.md` is the milestone definition, `docs/STATE.md` is the current done/left list, and
 `docs/ARCHITECTURE.md` the structural view. **Update `docs/STATE.md` when completing a milestone item.**
 
+Two documents are worth reading before you write code here, not just when you get stuck:
+
+- **`docs/LESSONS.md`** — the practices that have actually caught defects in this repository, each
+  with the incident that produced it. Read it before reviewing, before fixing, and before believing a
+  green test run. The two that matter most: **reproduce, don't inspect** (careful reading has twice
+  produced confident wrong verdicts on code a harness disproved in minutes), and **reintroduce the
+  defect to prove your test fails** — six false-green tests were caught that way in one session, three
+  of them by the agent that had just written them.
+- **`docs/DECISIONS.md`** — load-bearing architectural choices *with the alternatives that were
+  rejected and why*. Consult it before changing a boundary, adding a dependency, or "simplifying"
+  something that looks redundant. Several entries exist because the obvious simplification was tried
+  and caused an outage.
+
 Outstanding (from `docs/STATE.md`):
 
 - In-memory order/event stores → Postgres

@@ -41,6 +41,17 @@ public sealed class LiveTwsSessionScheduleTests
 {
     private const int SpxIndexConId = 416904;   // verified live: SPX index, CBOE
     private const int VixIndexConId = 13455763; // verified live: VIX index, CBOE
+    private const int SpyConId = 756733;        // verified live: SPY, STK, primary ARCA
+
+    /// <summary>
+    /// IBKR's SPY schedule reaches 1998 and is a weekday FILL before this date — it returns sessions
+    /// on Christmas Day 1998 and July 4 2000-2006, reports every half day from 1999 to 2005 as a full
+    /// 20:00 close, and emits zero-length 16:00-16:00 rows on 2007-11-23, 2007-12-24 and 2009-11-27.
+    /// <c>NYSE_EXTENDED</c> deliberately asserts nothing before it, so comparing against those rows
+    /// would fail on IBKR's fill rather than on this calendar. Matches the calendar's own
+    /// <c>effectiveFrom</c>, and a test below pins that they agree.
+    /// </summary>
+    private static readonly DateOnly NyseExtendedTrustedFrom = new(2010, 1, 4);
 
     /// <summary>
     /// IBKR's schedule only distinguishes CME's shortened holiday sessions from this date. Earlier
@@ -144,6 +155,50 @@ public sealed class LiveTwsSessionScheduleTests
         Assert.True(shortened > 0, "the sampled year contained no shortened CME session at all");
     }
 
+    [Fact]
+    public void The_nyse_extended_calendar_matches_the_schedule_the_venue_publishes()
+    {
+        if (TwsEndpoint is not { } endpoint || !CanReachTws(endpoint))
+        {
+            return;
+        }
+
+        using var client = new ScheduleClient(endpoint.Host, endpoint.Port, clientId: 284);
+        client.Connect();
+
+        // A year, so the window necessarily contains at least two of the 34 measured half days. One
+        // session a day, so ~250 rows.
+        var schedule = client.Schedule(Stock(SpyConId), "1 Y");
+
+        AssertMatches(schedule, ["NYSE_EXTENDED"], NyseExtendedTrustedFrom, minimumRows: 200);
+
+        // And specifically: at least one row must be a SHORTENED session, or this comparison would
+        // pass just as happily against a calendar that models no early close at all — which is exactly
+        // the defect a calendar copied from `tradingHours` alone would have. The same guard the CME
+        // test carries, for the same reason.
+        var shortened = schedule.Count(row => row.Close != new TimeOnly(20, 0));
+        Assert.True(shortened > 0, "the sampled year contained no shortened SPY extended session at all");
+
+        // The venue's regular session is a strict subset of what this schedule reports: useRTH=0
+        // SCHEDULE returns trading hours, and every row must therefore be wider than the 09:30-16:00
+        // NYSE calendar. If IBKR ever started answering this request with liquid hours instead, the
+        // set comparison above would still pass on a calendar that had been "corrected" to match, so
+        // the relationship is asserted rather than assumed.
+        Assert.All(schedule, row => Assert.Equal(new TimeOnly(4, 0), TimeOnly.FromDateTime(row.OpenLocal)));
+    }
+
+    [Fact]
+    public void The_extended_calendars_trusted_window_matches_what_it_claims_to_assert()
+    {
+        // Cheap, and it is the seam where a live comparison quietly stops being a comparison: if the
+        // calendar's effectiveFrom were moved earlier than the date IBKR's feed becomes real, the
+        // comparison above would keep passing (its window is a recent year) while the calendar
+        // asserted sessions for years nothing has ever checked.
+        Assert.Equal(
+            NyseExtendedTrustedFrom,
+            ExchangeCalendarSet.Embedded.Calendar("NYSE_EXTENDED").EffectiveFrom);
+    }
+
     // ------------------------------------------------------------------------------------ comparison
 
     private static void AssertMatches(
@@ -222,6 +277,9 @@ public sealed class LiveTwsSessionScheduleTests
 
     private static Contract Index(int conId) =>
         new() { ConId = conId, SecType = "IND", Exchange = "CBOE", Currency = "USD" };
+
+    private static Contract Stock(int conId) =>
+        new() { ConId = conId, SecType = "STK", Exchange = "SMART", PrimaryExch = "ARCA", Currency = "USD" };
 
     /// <summary>One published session, in the contract's own exchange-local wall clock.</summary>
     private sealed record ScheduleRow(DateTime OpenLocal, DateTime CloseLocal)

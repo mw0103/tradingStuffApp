@@ -946,21 +946,30 @@ public sealed class GapDetectorPostgresTests
         }
     }
 
+    private const int SpyConId = 756733;
+    private const short SpyInstrumentId = 5; // research.instruments seed: SPY, stock, ARCA.
+
+    /// <summary>The first trading date <c>NYSE_EXTENDED</c> asserts anything for; SPY's admission ends here.</summary>
+    private static readonly DateTimeOffset ExtendedCalendarFrom = new(2010, 1, 4, 0, 0, 0, TimeSpan.Zero);
+
     [Fact]
-    public async Task A_series_whose_jobs_all_declare_their_window_unmodelled_is_not_reported_as_reconciled()
+    public async Task A_job_that_declares_part_of_its_own_window_unmodelled_does_not_launder_it_into_the_series()
     {
-        // The second reported defect, reproduced on shipped configuration rather than an invented
-        // fixture: InstrumentCalendars maps SPY to the NYSE regular session and records SPY's real
-        // 04:00-20:00 ET trading window as UNMODELLED, so a useRth=false SPY job reports its whole
-        // window unaudited. (This used to be driven by VIX, whose overnight leg was unmodelled until
-        // it got its own calendar on 2026-08-01. SPY is the remaining shipped instrument with a
-        // genuinely unmodelled window — measured, not assumed: 960 useRth=false 1-minute bars a day
-        // against a 390-minute modelled session.)
-        // Reconcile nevertheless added the entire [From, To) span of any `checked` report to the
-        // audited set — `checked` only means "some expectation unit was evaluated", never "every
-        // instant in this span had one" — so both jobs said "I audited none of this" and the field
-        // documented as the authoritative cross-job answer said the series had no unaudited remainder.
-        // Every pre- and post-market bar that never landed read as covered.
+        // The second reported defect. Reconcile added the entire [From, To) span of any `checked`
+        // report to the audited set — `checked` only means "some expectation unit was evaluated",
+        // never "every instant in this span had one" — so a job could say "I audited none of this"
+        // while the field documented as the authoritative cross-job answer said the series had no
+        // unaudited remainder. Every bar that never landed in that span read as covered.
+        //
+        // THE SUBJECT MOVED, TWICE, AND BOTH MOVES WERE THE POINT. It was VIX, whose overnight leg was
+        // unmodelled until CBOE_VIX_GTH was written; then SPY, whose whole 04:00-20:00 day was
+        // unmodelled until NYSE_EXTENDED was written. What remains of SPY's admission — and the only
+        // one left in the shipped mapping — is the stretch BEFORE 2010-01-04, where IBKR publishes a
+        // weekday fill rather than a schedule and the extended session's open provably sat later in
+        // the day. So the fixture is a SPY job whose window lies inside that stretch. If that
+        // admission is ever retired too, this test has no shipped subject and the guard has to move
+        // to an injectable mapping rather than be deleted: the laundering it catches is a property of
+        // Reconcile, not of any instrument.
         if (ServerConnectionString is not { } server)
         {
             return;
@@ -968,44 +977,115 @@ public sealed class GapDetectorPostgresTests
 
         var connectionString = await PrepareAsync(server);
         var store = StoreFor(connectionString);
-
-        const int spyConId = 756733;
-        const short spyInstrumentId = 5;
-        var now = DateTimeOffset.UtcNow;
+        var from = new DateTimeOffset(2005, 1, 3, 0, 0, 0, TimeSpan.Zero);
 
         await store.EnsureJobAsync(
             new BackfillJobDefinition(
-                "spy-1min-trades-pair", BackfillJobKinds.Historical, spyInstrumentId, "SPY", "TRADES", "1 min",
-                UseRth: false, now.AddDays(-10), now, Priority: 70),
-            spyConId, CancellationToken.None);
+                "spy-1min-trades-premodern", BackfillJobKinds.Historical, SpyInstrumentId, "SPY", "TRADES", "1 min",
+                UseRth: false, from, ExtendedCalendarFrom, Priority: 70),
+            SpyConId, CancellationToken.None);
 
-        await store.EnsureJobAsync(
-            new BackfillJobDefinition(
-                "spy-1min-trades-pair-topup", BackfillJobKinds.TopUp, spyInstrumentId, "SPY", "TRADES", "1 min",
-                UseRth: false, now.AddDays(-10), now.AddYears(5), Priority: 1000),
-            spyConId, CancellationToken.None);
-
-        var detector = DetectorFor(connectionString, topUpLookbackDays: 10);
         var before = DateTimeOffset.UtcNow;
-        var report = await detector.GetReportAsync(null, null, null, CancellationToken.None);
+        var report = await DetectorFor(connectionString).GetReportAsync(
+            null, from, ExtendedCalendarFrom, CancellationToken.None);
 
-        // Both jobs really are `checked` — this is not the weaker no-expectation-units path — and both
-        // state the unmodelled window on themselves.
-        Assert.Equal(2, report.Jobs.Count);
-        Assert.All(report.Jobs, job =>
-        {
-            Assert.Equal(GapCheckStatus.Checked, job.CheckStatus);
-            Assert.True(job.UnitsChecked > 0);
-            Assert.Contains(job.Unaudited, range => range.Reason.StartsWith(GapAuditReasons.NoSessionDefinition));
-            Assert.DoesNotContain(job.Unaudited, range => range.Reason == GapAuditReasons.CallerNarrowedWindow);
-        });
+        var job = Assert.Single(report.Jobs);
+
+        // The job really is `checked` and really did evaluate expectation units — this is not the
+        // weaker no-expectation-units path, which Reconcile ignores for a different reason. The NYSE
+        // regular session covers all of 2005-2010, so there are thousands of real units here.
+        Assert.Equal(GapCheckStatus.Checked, job.CheckStatus);
+        Assert.True(job.UnitsChecked > 0);
+
+        // ...and it declares an unmodelled range that lies INSIDE its own audited window. That is what
+        // makes laundering possible at all: a caller-narrowed or in-progress range sits outside
+        // [From, To) and would be caught by the outer claimed-minus-audited subtraction anyway.
+        var admission = Assert.Single(
+            job.Unaudited, range => range.Reason.StartsWith(GapAuditReasons.NoSessionDefinition));
+
+        Assert.True(admission.From >= job.From && admission.To <= job.To, "the admission must be inside the audited window");
+        Assert.Equal(from, admission.From);
+        Assert.Equal(ExtendedCalendarFrom, admission.To);
 
         var series = Assert.Single(report.Series);
 
         Assert.False(series.Reconciled);
-        Assert.NotEmpty(series.Unaudited);
+
+        // The assertion that actually distinguishes the fix from the defect: the series' own unaudited
+        // set has to COVER the span the job disclaimed. Without the inner subtraction the series would
+        // still be unreconciled (its claim runs to `now`, past this window) while reporting the whole
+        // 2005-2010 stretch as audited — a smaller, wrong remainder that reads healthier.
+        Assert.Empty(GapArithmetic.Subtract(
+            [new GapArithmetic.Span(admission.From, admission.To)],
+            series.Unaudited.Select(range => new GapArithmetic.Span(range.From, range.To))));
 
         AssertJobsAndSeriesAgree(report, before.AddMinutes(-new GapOptions().InProgressGraceMinutes));
+    }
+
+    [Fact]
+    public async Task A_modern_spy_pair_audits_its_extended_window_and_reconciles()
+    {
+        // The regression test for NYSE_EXTENDED, and the control for the test above. Before that
+        // calendar existed this exact fixture reported an unmodelled range over its whole window and
+        // could never reconcile — 570 minutes a day of real pre- and post-market data measured against
+        // nothing. It must now reconcile, AND it must be genuinely auditing the extended window rather
+        // than having quietly lost the expectation: a tree that maps SPY to the regular session alone
+        // also reconciles here, so reconciling is not by itself evidence of anything.
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var connectionString = await PrepareAsync(server);
+        var store = StoreFor(connectionString);
+        var now = DateTimeOffset.UtcNow;
+
+        await store.EnsureJobAsync(
+            new BackfillJobDefinition(
+                "spy-1min-trades-pair", BackfillJobKinds.Historical, SpyInstrumentId, "SPY", "TRADES", "1 min",
+                UseRth: false, now.AddDays(-10), now, Priority: 70),
+            SpyConId, CancellationToken.None);
+
+        await store.EnsureJobAsync(
+            new BackfillJobDefinition(
+                "spy-1min-trades-pair-topup", BackfillJobKinds.TopUp, SpyInstrumentId, "SPY", "TRADES", "1 min",
+                UseRth: false, now.AddDays(-10), now.AddYears(5), Priority: 1000),
+            SpyConId, CancellationToken.None);
+
+        var report = await DetectorFor(connectionString, topUpLookbackDays: 10)
+            .GetReportAsync(null, null, null, CancellationToken.None);
+
+        Assert.Equal(2, report.Jobs.Count);
+        Assert.All(report.Jobs, job =>
+        {
+            Assert.Equal(GapCheckStatus.Checked, job.CheckStatus);
+
+            // The bounded admission ends in 2010 and these windows are ten days old, so it must not
+            // reach them. An unbounded admission — the shape SPY carried before — would appear here
+            // and make this series permanently unreconciled.
+            Assert.DoesNotContain(job.Unaudited, range => range.Reason.StartsWith(GapAuditReasons.NoSessionDefinition));
+        });
+
+        var series = Assert.Single(report.Series);
+
+        Assert.Empty(series.Unaudited);
+        Assert.True(series.Reconciled, "a modern SPY pair covering its own claim must reconcile");
+
+        // And the extended expectation is really being checked. A useRth=false SPY job gets TWO units
+        // per trading date — the 390-minute NYSE regular session and the 960-minute NYSE_EXTENDED one
+        // — so the historical job's unit count must be an even number strictly greater than the number
+        // of trading dates in its window. Asserting `> 0` would pass against an RTH-only mapping,
+        // which is the false green this test exists to avoid.
+        var historical = report.Jobs.Single(job => job.JobName == "spy-1min-trades-pair");
+        var tradingDates = new SessionClock()
+            .SessionsBetween("NYSE", DateOnly.FromDateTime(historical.From!.Value.UtcDateTime),
+                DateOnly.FromDateTime(historical.To!.Value.UtcDateTime))
+            .Count;
+
+        Assert.True(
+            historical.UnitsChecked > tradingDates,
+            $"{historical.UnitsChecked} unit(s) over {tradingDates} trading date(s) — the extended " +
+            "session is not being audited, so SPY is mapped to the regular session alone.");
     }
 
     [Fact]
