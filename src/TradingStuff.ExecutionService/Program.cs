@@ -15,14 +15,7 @@ builder.Services.AddSingleton<IExecutionEventPublisher>(sp => sp.GetRequiredServ
 builder.Services.AddSingleton<IPublishedExecutionEventStore>(sp => sp.GetRequiredService<InMemoryExecutionEventPublisher>());
 builder.Services.AddScoped<ExecutionWorkflow>();
 
-builder.Services.AddHttpClient<IRiskClient, HttpRiskClient>((sp, client) =>
-{
-    ServiceClientConfiguration.ConfigureInternalClient(
-        client,
-        sp.GetRequiredService<IConfiguration>(),
-        "RiskService:BaseUrl",
-        "http://riskservice");
-});
+builder.Services.AddRiskClient();
 
 builder.Services.AddHttpClient<IMarketDataClient, HttpMarketDataClient>((sp, client) =>
 {
@@ -94,6 +87,11 @@ builder.Services.AddSingleton<IOrderRouter>(sp =>
     return sp.GetRequiredService<IbkrOrderRouter>();
 });
 
+// Checked here rather than inside either factory above: both are resolved lazily on the first
+// request, so a mismatch would surface as a failed order on a service that had been reporting
+// healthy for hours. Startup is the only moment at which refusing costs nothing.
+ExecutionSafetyConfiguration.EnsureRouterAndPortfolioAgree(builder.Configuration);
+
 var app = builder.Build();
 
 app.UseAuthentication();
@@ -121,6 +119,21 @@ app.MapPost("/orders", async (
                 title: "Portfolio data is unavailable, so the order was not evaluated.",
                 detail: exception.Message,
                 statusCode: StatusCodes.Status503ServiceUnavailable);
+        }
+        catch (OrderRoutingFailedException exception)
+        {
+            // Deliberately not phrased as "the order failed". The record was persisted before
+            // routing precisely so this case has an id to hand back, and the caller's next move is
+            // to reconcile it — not to resubmit blind and not to assume nothing was placed.
+            return Results.Problem(
+                title: "The order was routed and no outcome came back; it may be live at the venue.",
+                detail: exception.Message,
+                statusCode: StatusCodes.Status502BadGateway,
+                extensions: new Dictionary<string, object?>
+                {
+                    ["orderId"] = exception.OrderId,
+                    ["correlationId"] = exception.CorrelationId
+                });
         }
     })
     .RequireAuthorization();
@@ -155,8 +168,21 @@ app.MapPost("/orders/{orderId:guid}/cancel", async (
         ExecutionWorkflow workflow,
         CancellationToken cancellationToken) =>
     {
-        var order = await workflow.CancelAsync(orderId, request, cancellationToken);
-        return order is null ? Results.NotFound() : Results.Ok(order);
+        try
+        {
+            var order = await workflow.CancelAsync(orderId, request, cancellationToken);
+            return order is null ? Results.NotFound() : Results.Ok(order);
+        }
+        catch (OrderCancelFailedException exception)
+        {
+            // The one answer this endpoint must never give by accident is "cancelled". A 200 with an
+            // unchanged order would be read as success by anything that does not diff the status.
+            return Results.Problem(
+                title: "The order was NOT confirmed cancelled and may still be working at the venue.",
+                detail: exception.Message,
+                statusCode: StatusCodes.Status502BadGateway,
+                extensions: new Dictionary<string, object?> { ["orderId"] = exception.OrderId });
+        }
     })
     .RequireAuthorization();
 
@@ -166,8 +192,23 @@ app.MapPost("/orders/{orderId:guid}/replace", async (
         ExecutionWorkflow workflow,
         CancellationToken cancellationToken) =>
     {
-        var order = await workflow.ReplaceAsync(orderId, request, cancellationToken);
-        return order is null ? Results.NotFound() : Results.Ok(order);
+        try
+        {
+            var order = await workflow.ReplaceAsync(orderId, request, cancellationToken);
+            return order is null ? Results.NotFound() : Results.Ok(order);
+        }
+        catch (ReplaceNotSupportedException exception)
+        {
+            return Results.Problem(
+                title: "This venue's orders cannot be replaced in place.",
+                detail: exception.Message,
+                statusCode: StatusCodes.Status409Conflict,
+                extensions: new Dictionary<string, object?>
+                {
+                    ["orderId"] = exception.OrderId,
+                    ["router"] = exception.RouterName
+                });
+        }
     })
     .RequireAuthorization();
 

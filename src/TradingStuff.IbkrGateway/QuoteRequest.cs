@@ -149,9 +149,23 @@ internal sealed class QuoteRequest : ITickSink
     }
 
     /// <summary>
+    /// The suffix appended to <see cref="QuoteSnapshot.Source"/> when the snapshot settled without
+    /// TWS having sent every field.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="QuoteSnapshot"/>'s shape is fixed, and it has no room for a "fields missing" flag,
+    /// so the source string carries it. Consumers that must fail closed on a fabricated quote —
+    /// pre-trade risk, in particular — test for this suffix rather than trying to infer
+    /// incompleteness from the values, which cannot be done: a deep out-of-the-money option with a
+    /// real bid of zero and a live ask is a perfectly good quote and is deliberately NOT marked.
+    /// The discriminator is "TWS never sent the field", never "the value is zero".
+    /// </remarks>
+    public const string PartialSourceSuffix = "-partial";
+
+    /// <summary>
     /// Completes with whatever has arrived so far. Illiquid series can legitimately never publish a
-    /// full set, so a partial snapshot beats hanging — the missing fields surface as zeroes and the
-    /// caller can see them on the snapshot.
+    /// full set, so a partial snapshot beats hanging — the missing fields surface as zeroes, and the
+    /// source string says so.
     /// </summary>
     public void CompletePartial() => Complete();
 
@@ -182,6 +196,11 @@ internal sealed class QuoteRequest : ITickSink
             var bid = _bid ?? 0m;
             var ask = _ask ?? 0m;
 
+            // Nullness, not value: a field is missing only when TWS never sent a usable one. That
+            // covers both "no tick arrived before the timeout" and "the tick arrived carrying TWS's
+            // no-quote marker (-1) or its unset sentinel", both of which TryConvertPrice rejects.
+            var missingFields = _bid is null || _ask is null || (_requireGreeks && _greeks is null);
+
             _completion.TrySetResult(new QuoteSnapshot(
                 Guid.NewGuid(),
                 _contract,
@@ -190,9 +209,17 @@ internal sealed class QuoteRequest : ITickSink
                 _last ?? (bid > 0m && ask > 0m ? decimal.Round((bid + ask) / 2m, 4) : 0m),
                 _greeks ?? new OptionGreeks(0m, 0m, 0m, 0m),
                 DateTimeOffset.UtcNow,
-                _source));
+                missingFields ? _source + PartialSourceSuffix : _source));
         }
     }
+
+    /// <summary>True when a snapshot's source marks it as having settled with fields missing.</summary>
+    /// <remarks>
+    /// The read side of <see cref="PartialSourceSuffix"/>, kept here so the two halves of the
+    /// convention cannot drift apart.
+    /// </remarks>
+    internal static bool IsPartial(QuoteSnapshot quote) =>
+        quote.Source.EndsWith(PartialSourceSuffix, StringComparison.Ordinal);
 
     /// <summary>
     /// Converts a TWS price tick, rejecting its "unavailable" markers. Unset numeric fields arrive as

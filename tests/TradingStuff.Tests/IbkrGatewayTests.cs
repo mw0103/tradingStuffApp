@@ -137,6 +137,107 @@ public sealed class IbkrGatewayTests
         Assert.Equal(0m, quote.Ask);
     }
 
+    // ---- partial quotes are distinguishable from real ones -------------------------------------
+    //
+    // A settled-on-timeout quote fabricates the fields TWS never sent: bid and ask default to 0 and
+    // the Greeks to a zero vector. Those are plausible values, not obviously-missing ones, so a
+    // consumer cannot tell them apart from a real quote by looking at the numbers — and the pre-trade
+    // risk path reads exactly those numbers. QuoteSnapshot's shape is fixed, so the source string
+    // carries the distinction.
+
+    [Fact]
+    public async Task A_quote_settled_by_timeout_is_marked_partial()
+    {
+        var request = new QuoteRequest(SampleContract, "ibkr-delayed");
+        request.ApplyPrice(TickType.BID, 1.95d);
+
+        request.CompletePartial();
+
+        var quote = await request.Task;
+        Assert.Equal("ibkr-delayed" + QuoteRequest.PartialSourceSuffix, quote.Source);
+        Assert.True(QuoteRequest.IsPartial(quote));
+    }
+
+    [Fact]
+    public async Task A_fully_assembled_quote_is_not_marked_partial()
+    {
+        var request = new QuoteRequest(SampleContract, "ibkr-delayed");
+
+        request.ApplyPrice(TickType.BID, 1.95d);
+        request.ApplyPrice(TickType.ASK, 2.05d);
+        request.ApplyOptionComputation(TickType.MODEL_OPTION, 0.20d, 0.55d, 0.02d, 0.09d, -0.03d, 100d);
+
+        var quote = await request.Task;
+        Assert.Equal("ibkr-delayed", quote.Source);
+        Assert.False(QuoteRequest.IsPartial(quote));
+    }
+
+    [Fact]
+    public async Task A_real_zero_bid_is_not_a_partial_quote()
+    {
+        // Deep out-of-the-money series genuinely trade 0.00 bid against a live ask. The
+        // discriminator is "TWS never sent the field", never "the value is zero" — marking these
+        // partial would make every consumer that fails closed refuse perfectly good quotes.
+        var request = new QuoteRequest(SampleContract, "ibkr-delayed");
+
+        request.ApplyPrice(TickType.BID, 0d);
+        request.ApplyPrice(TickType.ASK, 0.05d);
+        request.ApplyOptionComputation(TickType.MODEL_OPTION, 0.85d, 0.01d, 0.001d, 0.02d, -0.004d, 100d);
+
+        var quote = await request.Task;
+        Assert.Equal(0m, quote.Bid);
+        Assert.Equal("ibkr-delayed", quote.Source);
+        Assert.False(QuoteRequest.IsPartial(quote));
+    }
+
+    [Fact]
+    public async Task A_quote_whose_bid_arrived_only_as_the_no_quote_marker_is_partial()
+    {
+        // TWS reports "there is no bid" as -1, which TryConvertPrice rejects — so the field was
+        // never received and the 0 in the snapshot is fabricated, unlike the case above.
+        var request = new QuoteRequest(SampleContract, "ibkr-delayed");
+
+        request.ApplyPrice(TickType.BID, -1d);
+        request.ApplyPrice(TickType.ASK, 0.05d);
+        request.ApplyOptionComputation(TickType.MODEL_OPTION, 0.85d, 0.01d, 0.001d, 0.02d, -0.004d, 100d);
+        request.CompletePartial();
+
+        var quote = await request.Task;
+        Assert.Equal(0m, quote.Bid);
+        Assert.True(QuoteRequest.IsPartial(quote));
+    }
+
+    [Fact]
+    public async Task A_quote_with_a_full_book_but_no_greeks_is_partial()
+    {
+        // Zeroed Greeks are the most dangerous fabrication of the three: a zero delta reads as a
+        // position with no directional exposure at all.
+        var request = new QuoteRequest(SampleContract, "ibkr-delayed");
+
+        request.ApplyPrice(TickType.BID, 1.95d);
+        request.ApplyPrice(TickType.ASK, 2.05d);
+        request.CompletePartial();
+
+        var quote = await request.Task;
+        Assert.Equal(1.95m, quote.Bid);
+        Assert.Equal(0m, quote.Greeks.Delta);
+        Assert.True(QuoteRequest.IsPartial(quote));
+    }
+
+    [Fact]
+    public async Task A_non_option_quote_is_not_partial_merely_for_having_no_greeks()
+    {
+        // requireGreeks:false is the underlying-quote path, where no option computation tick will
+        // ever arrive. Marking it partial would condemn every one of them.
+        var request = new QuoteRequest(SampleContract, "ibkr-delayed", requireGreeks: false);
+
+        request.ApplyPrice(TickType.BID, 1.95d);
+        request.ApplyPrice(TickType.ASK, 2.05d);
+
+        var quote = await request.Task;
+        Assert.False(QuoteRequest.IsPartial(quote));
+    }
+
     [Fact]
     public async Task Spot_request_completes_without_option_computations()
     {

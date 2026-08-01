@@ -1,0 +1,35 @@
+-- 010: record what a migration actually contained, not just its name.
+--
+-- MigrationRunner proved a migration had run by recording its file NAME (migration 001's
+-- research.schema_migrations). A migration file edited after it shipped in one environment — a hand
+-- patch, a rebase that touched an already-applied file, a merge that silently reintroduced an old
+-- version — leaves that environment's schema permanently different from every other environment that
+-- later applies the CURRENT text under the same name. Both report "applied". Nothing before this
+-- migration could tell the two apart.
+--
+-- The fix needs a checksum of each migration's SQL text, compared at startup — but the comparison
+-- cannot live in SQL. "Does the checksum on this row match the checksum of the file currently
+-- embedded in the assembly" needs the CURRENT file's content, which only MigrationRunner's own code
+-- has; the database only ever sees what a migration hands it. This file only adds the column;
+-- MigrationRunner.ApplyAsync computes checksums, does the comparing, and — because only it can — also
+-- does the backfill below.
+--
+-- Existing ledgers predate this column, exactly as migration 006's rows predated closed_by, and the
+-- same ordering lesson applies: an already-applied row must be made to satisfy the new invariant
+-- BEFORE anything treats the invariant as already true, or the declaration fails against the very
+-- rows it is meant to protect. Unlike 006, though, that backfill cannot be a same-transaction UPDATE
+-- in this file: it needs each migration's CURRENTLY embedded text, which plain SQL has no access to.
+-- So MigrationRunner.ApplyAsync performs it, on the first pass after this column exists, sourced from
+-- whatever the assembly embeds right now for each already-applied name — and only once every applied
+-- row has a real baseline does a checksum comparison mean anything. A mismatch found after that
+-- baseline is established is a genuine divergence (the file changed on disk since the ledger last saw
+-- it) and is reported as a loud, named startup failure rather than silently re-applied or ignored.
+--
+-- ADD COLUMN IF NOT EXISTS, not a bare ADD COLUMN: a brand-new database defines this column directly
+-- on the bootstrap CREATE TABLE (see MigrationRunner.ApplyAsync) precisely so that migrations 001-009
+-- can record a real checksum on their very first application there, before this file ever runs. On
+-- such a database this ALTER is a no-op — it exists so research.schema_migrations still carries an
+-- explicit, documented entry for when and why the column was introduced, rather than the column
+-- silently predating every migration that reads as having been "added" by one.
+ALTER TABLE research.schema_migrations
+    ADD COLUMN IF NOT EXISTS checksum text;

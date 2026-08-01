@@ -344,6 +344,53 @@ public sealed class PacingGovernorTests
     }
 
     [Fact]
+    public async Task Disposing_a_pre_reset_lease_does_not_release_a_line_acquired_after_the_reset()
+    {
+        // The sharp end of the same problem. Clamping at zero stops the ledger going negative, but
+        // it does nothing about a stale lease decrementing counts that belong to subscriptions
+        // re-issued since the reset — an execution quote parked in its timeout across a reconnect,
+        // or a subscription lease being torn down. Each one silently raises the effective cap by
+        // one against a real TWS limit of 100 lines.
+        var (governor, _) = Create(new IbkrPacingOptions { LineCap = 4, ExecutionReservedLines = 0 });
+
+        var stale = await governor.AcquireLineAsync(LineClass.Execution, CancellationToken.None).WaitAsync(RealWait);
+        var staleResearch = await governor.AcquireLineAsync(LineClass.Research, CancellationToken.None).WaitAsync(RealWait);
+
+        governor.ResetLineLedgerForReconnect();
+
+        // Re-established after the reconnect: these DO correspond to real TWS subscriptions.
+        await governor.AcquireLineAsync(LineClass.Execution, CancellationToken.None).WaitAsync(RealWait);
+        await governor.AcquireLineAsync(LineClass.Execution, CancellationToken.None).WaitAsync(RealWait);
+        await governor.AcquireLineAsync(LineClass.Research, CancellationToken.None).WaitAsync(RealWait);
+
+        stale.Dispose();
+        staleResearch.Dispose();
+
+        var budget = governor.GetLineBudget();
+        Assert.Equal(2, budget.ExecutionInUse);
+        Assert.Equal(1, budget.ResearchInUse);
+
+        // And the cap is still the cap: one more fits, a fifth does not.
+        await governor.AcquireLineAsync(LineClass.Execution, CancellationToken.None).WaitAsync(RealWait);
+        Assert.Equal(4, governor.GetLineBudget().ExecutionInUse + governor.GetLineBudget().ResearchInUse);
+    }
+
+    [Fact]
+    public async Task A_lease_taken_after_a_reset_still_releases_normally()
+    {
+        // The other half of the epoch check: only leases from a SUPERSEDED ledger are ignored.
+        var (governor, _) = Create(new IbkrPacingOptions { LineCap = 2, ExecutionReservedLines = 0 });
+
+        governor.ResetLineLedgerForReconnect();
+
+        var lease = await governor.AcquireLineAsync(LineClass.Execution, CancellationToken.None).WaitAsync(RealWait);
+        Assert.Equal(1, governor.GetLineBudget().ExecutionInUse);
+
+        lease.Dispose();
+        Assert.Equal(0, governor.GetLineBudget().ExecutionInUse);
+    }
+
+    [Fact]
     public async Task Double_dispose_releases_a_line_only_once()
     {
         var (governor, _) = Create(new IbkrPacingOptions { LineCap = 2, ExecutionReservedLines = 0 });

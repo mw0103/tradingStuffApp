@@ -30,19 +30,32 @@ public enum LineClass
 }
 
 /// <summary>A held market-data line. Dispose (or pass back through the socket) to release it.</summary>
+/// <remarks>
+/// A lease carries the ledger epoch it was issued against.
+/// <see cref="IbkrPacingGovernor.ResetLineLedgerForReconnect"/> zeroes the ledger because a fresh
+/// <c>EClientSocket</c> holds zero real TWS lines, which already accounts for every lease
+/// outstanding at that moment. A pre-reset lease disposing afterwards must therefore NOT decrement
+/// again: the counts it would reduce belong to subscriptions re-issued after the reset, and
+/// dropping them lets the governor admit more lines than TWS is actually carrying — the failure
+/// that clamping at zero looks like it prevents but does not.
+/// </remarks>
 public sealed class LineLease : IDisposable
 {
     private IbkrPacingGovernor? _owner;
 
-    internal LineLease(IbkrPacingGovernor owner, LineClass lineClass)
+    internal LineLease(IbkrPacingGovernor owner, LineClass lineClass, int epoch)
     {
         _owner = owner;
         Class = lineClass;
+        Epoch = epoch;
     }
 
     public LineClass Class { get; }
 
-    public void Dispose() => Interlocked.Exchange(ref _owner, null)?.ReleaseLine(Class);
+    /// <summary>The ledger generation this lease was counted against.</summary>
+    internal int Epoch { get; }
+
+    public void Dispose() => Interlocked.Exchange(ref _owner, null)?.ReleaseLine(Class, Epoch);
 }
 
 /// <summary>
@@ -122,9 +135,11 @@ public sealed class IbkrPacingGovernor
     private readonly Dictionary<string, DateTimeOffset> _identicalRequests = [];
     private readonly Dictionary<string, Queue<DateTimeOffset>> _contractWindows = [];
 
-    // Line ledger.
+    // Line ledger. The epoch increments on every reconnect reset so leases issued against a
+    // superseded ledger cannot decrement the current one.
     private int _executionLines;
     private int _researchLines;
+    private int _lineEpoch;
     private readonly List<LineWaiter> _lineWaiters = [];
 
     private readonly Histogram<double> _waitHistogram;
@@ -368,7 +383,7 @@ public sealed class IbkrPacingGovernor
         {
             if (TryAcquireLineLocked(lineClass))
             {
-                return new LineLease(this, lineClass);
+                return new LineLease(this, lineClass, _lineEpoch);
             }
 
             completion = new TaskCompletionSource<LineLease>(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -413,14 +428,22 @@ public sealed class IbkrPacingGovernor
     /// invalidated — a fresh <c>EClientSocket</c> after a reconnect holds zero real TWS lines
     /// regardless of what this ledger thought a moment ago, and TWS's 1101 notice ("connectivity
     /// restored, data lost") says the same for a socket that never dropped. Call ONLY from the
-    /// reconnect/replay path; any <see cref="LineLease"/> issued before the reset still decrements
-    /// on <see cref="Dispose"/>, which the existing clamp-at-zero in <see cref="ReleaseLine"/>
-    /// already tolerates safely.
+    /// reconnect/replay path.
     /// </summary>
     /// <remarks>
+    /// <para>
+    /// Zeroing the counts already accounts for every lease outstanding at this instant, so the
+    /// epoch is bumped too and <see cref="ReleaseLine"/> ignores any later dispose of a pre-reset
+    /// lease. Without that, a lease still in flight across the reset — an execution quote parked in
+    /// its timeout, a subscription lease being torn down — decrements counts that belong to
+    /// re-issued subscriptions, and the governor silently admits more lines than TWS is carrying.
+    /// Clamping at zero only stops the count going negative; it does not stop it going wrong.
+    /// </para>
+    /// <para>
     /// Deliberately does not attempt to re-grant queued waiters against the freed capacity —
     /// leaving them queued is safe (they will simply wait slightly longer) and reconnect is rare
     /// enough that the added complexity is not worth it for a first cut.
+    /// </para>
     /// </remarks>
     public void ResetLineLedgerForReconnect()
     {
@@ -428,6 +451,7 @@ public sealed class IbkrPacingGovernor
         {
             _executionLines = 0;
             _researchLines = 0;
+            _lineEpoch++;
         }
     }
 
@@ -458,12 +482,27 @@ public sealed class IbkrPacingGovernor
         return true;
     }
 
-    internal void ReleaseLine(LineClass lineClass)
+    internal void ReleaseLine(LineClass lineClass, int epoch)
     {
         LineWaiter? granted = null;
+        LineLease? grantedLease = null;
 
         lock (_gate)
         {
+            if (epoch != _lineEpoch)
+            {
+                // A lease from a superseded ledger. ResetLineLedgerForReconnect already released
+                // every line it was holding; decrementing again would take one that belongs to a
+                // subscription re-issued since.
+                _logger.LogDebug(
+                    "Ignoring the release of a {Class} line from ledger epoch {Epoch}; the ledger is now at {Current}.",
+                    lineClass,
+                    epoch,
+                    _lineEpoch);
+
+                return;
+            }
+
             if (lineClass == LineClass.Execution)
             {
                 _executionLines = Math.Max(0, _executionLines - 1);
@@ -478,17 +517,20 @@ public sealed class IbkrPacingGovernor
                 if (TryAcquireLineLocked(_lineWaiters[index].Class))
                 {
                     granted = _lineWaiters[index];
+                    grantedLease = new LineLease(this, granted.Class, _lineEpoch);
                     _lineWaiters.RemoveAt(index);
                     break;
                 }
             }
         }
 
-        if (granted is not null && !granted.Completion.TrySetResult(new LineLease(this, granted.Class)))
+        if (granted is not null && !granted.Completion.TrySetResult(grantedLease!))
         {
             // The waiter timed out and cancelled its completion source after we counted the line
-            // for it: give the line back, which also wakes the next eligible waiter.
-            ReleaseLine(granted.Class);
+            // for it: give the line back, which also wakes the next eligible waiter. The lease's
+            // own epoch is used, so a reset landing in this window discards it rather than
+            // double-releasing.
+            ReleaseLine(grantedLease!.Class, grantedLease.Epoch);
         }
     }
 

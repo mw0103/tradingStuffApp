@@ -21,13 +21,42 @@ public static class RiskLimitFactory
                 Decimal(configuration, "RiskLimits:MaxAbsVega", defaults.MaxAbsGreeks.Vega)));
     }
 
-    private static decimal Decimal(IConfiguration configuration, string key, decimal fallback) =>
-        decimal.TryParse(configuration[key], NumberStyles.Number, CultureInfo.InvariantCulture, out var value)
-            ? value
-            : fallback;
+    /// <summary>
+    /// A configured decimal limit, or <paramref name="fallback"/> when the key is not set at all.
+    /// </summary>
+    /// <remarks>
+    /// A key that is set but unreadable throws instead of falling back, and the service does not
+    /// start. The fallbacks are <see cref="RiskLimits.DevelopmentDefaults"/> — the loosest limits in
+    /// the system — so quietly substituting them for a mistyped production value ("2.5k", "$250", a
+    /// stray unit) raises the ceiling the operator was trying to lower, and nothing in any response
+    /// says which limits are actually in force.
+    /// </remarks>
+    private static decimal Decimal(IConfiguration configuration, string key, decimal fallback)
+    {
+        if (configuration[key] is not { } configured)
+        {
+            return fallback;
+        }
 
-    private static int Int(IConfiguration configuration, string key, int fallback) =>
-        int.TryParse(configuration[key], NumberStyles.Integer, CultureInfo.InvariantCulture, out var value)
+        return decimal.TryParse(configured, NumberStyles.Number, CultureInfo.InvariantCulture, out var value)
             ? value
-            : fallback;
+            : throw Unreadable(key, configured);
+    }
+
+    /// <inheritdoc cref="Decimal"/>
+    private static int Int(IConfiguration configuration, string key, int fallback)
+    {
+        if (configuration[key] is not { } configured)
+        {
+            return fallback;
+        }
+
+        return int.TryParse(configured, NumberStyles.Integer, CultureInfo.InvariantCulture, out var value)
+            ? value
+            : throw Unreadable(key, configured);
+    }
+
+    private static InvalidOperationException Unreadable(string key, string configured) =>
+        new($"Risk limit '{key}' is set to '{configured}', which is not a number. " +
+            "A risk limit that is set wrongly is not defaulted — correct it or unset it.");
 }

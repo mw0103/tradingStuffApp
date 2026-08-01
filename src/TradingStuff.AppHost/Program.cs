@@ -43,10 +43,21 @@ var keycloak = builder.AddContainer("keycloak", "quay.io/keycloak/keycloak", "26
 
 // Sole owner of the TWS socket. A TWS connection is single-owner per client id, so no other
 // service may connect directly — they all go through this one over internal HTTP.
+//
+// Deliberately NOT WithExternalHttpEndpoints(): every caller of this endpoint is another project in
+// this same AppHost graph (.WithReference(ibkrGateway) below resolves it whether or not it is marked
+// external — internal service discovery does not need the flag). Marking it external buys nothing
+// for that internal traffic and costs two things: it puts the order-placement surface one click away
+// in the Aspire dashboard's resource list, and it is the exact flag that becomes real public ingress
+// the moment this AppHost is ever published to a target that honours it (Azure Container Apps, App
+// Service). On this host `aspire start` binds every project's Kestrel endpoint to loopback regardless
+// of this flag (verified: `ss -tlnp` shows the gateway's port bound to 127.0.0.1/[::1] only, external
+// or not) — but that is a property of today's local orchestrator, not a guarantee this AppHost can
+// rely on, and it does nothing about the publish-time exposure. Least privilege: the one component
+// that owns the TWS socket and places real orders gets no more reach than it needs.
 var ibkrGateway = builder.AddProject(
         "ibkrgateway",
         "../TradingStuff.IbkrGateway/TradingStuff.IbkrGateway.csproj")
-    .WithExternalHttpEndpoints()
     .WithEnvironment("Authentication__DevelopmentToken", devInternalToken)
     .WithEnvironment("IBKR__Host", ibkrHost)
     .WithEnvironment("IBKR__Port", ibkrPort)

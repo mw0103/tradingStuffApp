@@ -11,4 +11,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
 
+  <ItemGroup>
+    <!-- The cover check is defence in depth behind the leg-quantity guard, so it is unreachable
+         through Evaluate with the quantities that would break it. Internal keeps it directly
+         testable rather than untested. -->
+    <InternalsVisibleTo Include="TradingStuff.Tests" />
+  </ItemGroup>
+
 </Project>

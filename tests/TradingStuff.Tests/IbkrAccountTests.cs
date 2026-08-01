@@ -1,6 +1,10 @@
+using System.Diagnostics.Metrics;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using TradingStuff.Contracts;
 using TradingStuff.ExecutionService;
 using TradingStuff.IbkrGateway;
+using TradingStuff.IbkrGateway.Pacing;
 using IbContract = IBApi.Contract;
 
 namespace TradingStuff.Tests;
@@ -242,6 +246,96 @@ public sealed class IbkrAccountTests
             greeks: null);
 
         Assert.Equal(0m, snapshot.AveragePrice);
+    }
+
+    // ---- the P&L stream ------------------------------------------------------------------------
+
+    [Fact]
+    public void A_live_pnl_stream_reports_its_latest_value()
+    {
+        var pnl = new PnLSubscription();
+        pnl.Apply(dailyPnL: -1250.75d, unrealizedPnL: -900d, realizedPnL: -350.75d);
+
+        Assert.Equal(-1250.75m, IbkrAccountClient.ReadableDailyPnL(pnl)?.DailyPnL);
+    }
+
+    [Fact]
+    public void A_faulted_pnl_stream_reports_nothing_rather_than_its_last_value()
+    {
+        // A TWS error against the P&L request id faults the subscription and the registry drops it,
+        // so nothing ever overwrites Latest again. Serving that frozen figure while the snapshot
+        // claims DailyPnLAvailable=true is worse than reporting no figure at all: MAX_DAILY_LOSS
+        // would then evaluate the account's P&L as of the moment TWS stopped talking, for the rest
+        // of the connection, and nothing anywhere would say so.
+        var pnl = new PnLSubscription();
+        pnl.Apply(dailyPnL: -1250.75d, unrealizedPnL: -900d, realizedPnL: -350.75d);
+
+        pnl.Fail(new IbkrRequestException(322, "stream died"));
+
+        Assert.Null(IbkrAccountClient.ReadableDailyPnL(pnl));
+    }
+
+    [Fact]
+    public void No_pnl_stream_reports_nothing()
+    {
+        Assert.Null(IbkrAccountClient.ReadableDailyPnL(null));
+    }
+
+    // ---- account stream request ids ------------------------------------------------------------
+
+    [Fact]
+    public void The_account_stream_request_ids_are_allocated_once_and_never_move()
+    {
+        // Measured against TWS 223: it permits exactly two account-summary requests per API client
+        // and counts DISTINCT REQUEST IDS, not live subscriptions. cancelAccountSummary does not
+        // free a slot — five cancel-then-resubscribe-with-a-fresh-id cycles still failed on the
+        // third with error 322 — but re-issuing on an id TWS has already seen works indefinitely.
+        // So a rebuild reusing these ids is the entire mechanism keeping portfolio reads alive
+        // across more than one rebuild in a session, and there is no way to observe it failing
+        // without a live socket. Hence this test.
+        var client = CreateAccountClient();
+
+        var first = client.EnsureStreamRequestIds();
+        var second = client.EnsureStreamRequestIds();
+
+        Assert.Equal(first, second);
+        Assert.Equal(3, new[] { first.Summary, first.Positions, first.Pnl }.Distinct().Count());
+    }
+
+    /// <summary>An account client with every real collaborator, minus the socket.</summary>
+    private static IbkrAccountClient CreateAccountClient()
+    {
+        var options = Options.Create(new IbkrOptions());
+        var registry = new IbkrRequestRegistry();
+        var tracker = new IbkrOrderTracker(NullLogger<IbkrOrderTracker>.Instance);
+        var wrapper = new IbkrClientWrapper(registry, tracker, NullLogger<IbkrClientWrapper>.Instance);
+
+        var governor = new IbkrPacingGovernor(
+            options,
+            TimeProvider.System,
+            new AccountTestMeterFactory(),
+            NullLogger<IbkrPacingGovernor>.Instance);
+
+        var connection = new IbkrConnection(
+            options, registry, wrapper, governor, NullLogger<IbkrConnection>.Instance);
+
+        var socket = new PacedSocket(connection, governor, NullLogger<PacedSocket>.Instance);
+
+        return new IbkrAccountClient(
+            connection,
+            socket,
+            new IbkrMarketDataClient(connection, socket, options, NullLogger<IbkrMarketDataClient>.Instance),
+            options,
+            NullLogger<IbkrAccountClient>.Instance);
+    }
+
+    private sealed class AccountTestMeterFactory : IMeterFactory
+    {
+        public Meter Create(MeterOptions options) => new(options);
+
+        public void Dispose()
+        {
+        }
     }
 
     // ---- provider selection -------------------------------------------------------------------
