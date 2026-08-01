@@ -6,6 +6,7 @@ using Microsoft.Extensions.Http.Resilience;
 using Microsoft.Extensions.Logging;
 using TradingStuff.Contracts;
 using TradingStuff.ExecutionService;
+using TradingStuff.MarketDataService;
 using TradingStuff.RiskService;
 
 namespace TradingStuff.Tests;
@@ -410,6 +411,55 @@ public sealed class OrderLifecycleSafetyTests
     public void Combinations_that_cannot_transmit_a_mischecked_order_start(string? router, string? portfolioSource) =>
         ExecutionSafetyConfiguration.EnsureRouterAndPortfolioAgree(Configuration(router, portfolioSource));
 
+    // ---- and the third setting, which the pair above cannot see ---------------------------------
+
+    [Theory]
+    [InlineData("ibkr", "ibkr")]          // the exact value that caused the live incident
+    [InlineData("ibkr", null)]
+    [InlineData("ibkr", "deterministic")]
+    [InlineData("IBKR", "ibkr-liv")]
+    public void Transmitting_real_orders_against_generated_quotes_refuses_to_start(string? router, string? marketDataSource)
+    {
+        // Demonstrated live on 2026-08-01: MarketData:Source="ibkr" is not a recognised value, so
+        // MarketDataService degraded to the deterministic generator while the router kept
+        // transmitting. A 10-lot SPY vertical was approved against synthetic bid 27.34 / ask 28.46
+        // on a Saturday — the real market was 0/0 — and rested at TWS.
+        //
+        // UNPRICEABLE_LEG does not catch this: it refuses quotes it cannot price, and the generator
+        // emits confident, well-formed, entirely fictional ones.
+        var configuration = MarketDataConfiguration(router, marketDataSource);
+
+        var failure = Assert.Throws<InvalidOperationException>(
+            () => ExecutionSafetyConfiguration.EnsureRouterAndMarketDataAgree(configuration));
+
+        Assert.Contains("MarketData__Source=ibkr-live", failure.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("ibkr", "ibkr-live")]
+    [InlineData("ibkr", "ibkr-delayed")]
+    [InlineData("ibkr", "IBKR-LIVE")]
+    [InlineData("paper", "ibkr-deterministic-paper-feed")]
+    [InlineData(null, null)]
+    public void Combinations_that_cannot_transmit_against_generated_quotes_start(string? router, string? marketDataSource) =>
+        ExecutionSafetyConfiguration.EnsureRouterAndMarketDataAgree(MarketDataConfiguration(router, marketDataSource));
+
+    [Fact]
+    public void The_guards_accepted_values_are_the_ones_MarketDataService_actually_recognises()
+    {
+        // ExecutionService cannot reference MarketDataService, so the guard duplicates two strings.
+        // This pins them to the real constants: renaming a source without updating the guard would
+        // otherwise silently disarm it — the guard would reject every valid configuration, someone
+        // would "fix" it by loosening it, and the hole reopens.
+        Assert.Equal("ibkr-live", MarketDataSources.IbkrLive);
+        Assert.Equal("ibkr-delayed", MarketDataSources.IbkrDelayed);
+
+        // And the safe default must NOT be accepted by the guard.
+        Assert.Throws<InvalidOperationException>(() =>
+            ExecutionSafetyConfiguration.EnsureRouterAndMarketDataAgree(
+                MarketDataConfiguration("ibkr", MarketDataSources.DeterministicPaperFeed)));
+    }
+
     // ---- risk evaluation is not a repeatable request --------------------------------------------
 
     [Fact]
@@ -446,6 +496,16 @@ public sealed class OrderLifecycleSafetyTests
             {
                 ["Execution:Router"] = router,
                 ["Portfolio:Source"] = portfolioSource,
+                ["RiskService:BaseUrl"] = "http://riskservice"
+            })
+            .Build();
+
+    private static IConfiguration MarketDataConfiguration(string? router, string? marketDataSource) =>
+        new ConfigurationBuilder()
+            .AddInMemoryCollection(new Dictionary<string, string?>
+            {
+                ["Execution:Router"] = router,
+                ["MarketData:Source"] = marketDataSource,
                 ["RiskService:BaseUrl"] = "http://riskservice"
             })
             .Build();

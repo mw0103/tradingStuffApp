@@ -690,6 +690,61 @@ the new ExecutionService cancel path end-to-end (markets closed — queued for t
 with the multi-lot BAG semantics pin); crossed quotes are still priced (locked/crossed markets are
 legitimately common); Market orders carry no slippage model.
 
+### Live verification of the Phase 0 fixes, and one new defect it exposed (2026-08-01, Saturday)
+
+Ran the Phase 0 fixes against live paper TWS with the full service chain (gateway + MarketData +
+Risk + Execution, `Execution:Router=ibkr`). A closed market is the ideal condition for this: SPY
+options quote 0/0, which is exactly what previously produced $0 max-loss approvals.
+
+**The critical fix is confirmed end to end.** The same 10-lot SPY vertical from the review finding,
+submitted through ExecutionService against genuine 0/0 quotes, is now **rejected** and nothing
+reaches the broker:
+
+```
+status 3 (RiskRejected), decision 1 (Rejected), open orders at TWS: []
+UNPRICEABLE_LEG  Leg 0 (SPY 2026-08-03 742 Call) — no bid to sell it into
+UNPRICEABLE_LEG  Leg 1 (SPY 2026-08-03 740 Call) — no offer to buy it against
+```
+
+Note the messages are per SIDE, not per quote — the short leg fails on a missing bid, the long leg
+on a missing ask. That is the stricter rule the fix agent argued for over the weaker
+`Bid<=0 && Ask<=0` spec, working as reasoned. Also confirmed live: `-partial` source marking
+(`ibkr-live-partial` on 0/0 quotes), the 18-code `GET /risk/breach-codes` surface, and the
+router/portfolio cross-check refusing to start on `ibkr` + `development`.
+
+**NEW DEFECT, found by making the mistake rather than by reading code (now fixed).**
+`MarketData:Source` was set to `"ibkr"` — plausible, and not one of the recognised values
+(`ibkr-live` / `ibkr-delayed`). MarketDataService degraded to the deterministic generator, exactly
+as its fail-safe default intends, while `Execution:Router=ibkr` kept transmitting. A 10-lot SPY
+vertical was approved against **synthetic quotes of bid 27.34 / ask 28.46 on a Saturday**, when the
+real market for that contract was 0/0, and the order rested at TWS as a live paper order
+(ibkrOrderId 13). Risk had checked numbers that were invented.
+
+This is the identical shape to the router/portfolio pair the review already fixed — each setting is
+fail-safe alone, the combination is not — and the guard was written for two of the three settings
+that must agree. Critically, **`UNPRICEABLE_LEG` does not catch it**: that guard refuses quotes it
+cannot price, and the deterministic feed emits confident, well-formed, entirely fictional ones.
+Fail-safe degradation plus fail-closed pricing still leaves the hole, because neither component can
+see that the *other* one changed meaning. Fixed with `EnsureRouterAndMarketDataAgree` beside its
+sibling; the exact incident configuration now refuses to start. Negative control: 5 tests fail with
+the guard reverted. A further test pins the guard's duplicated strings to `MarketDataSources`'
+real constants, so a rename cannot silently disarm it.
+
+**Deferred item #43, partially closed.** The ExecutionService cancel path was exercised against a
+real resting broker order (the one placed by the incident above). It works: the cancel reached TWS,
+`/ibkr/orders/open` went to `[]`, and the recorded event is honest — *"Cancel requested. IBKR order
+13 reports PreSubmitted"* — refusing to claim `Cancelled` on a status TWS had not yet acknowledged.
+
+**But it is incomplete, in the safe direction.** TWS confirmed `Cancelled` seconds later and
+ExecutionService's record is still `Submitted`, permanently: nothing reconciles the record after the
+cancel call returns. The original defect said *dead* about a *working* order (dangerous); this says
+*maybe-working* about a *dead* one (safe, but wrong). Closing it needs either open-order
+reconciliation or the gateway pushing status to ExecutionService — real work, and moot until the
+in-memory store is replaced, since a restart loses the record anyway. Recorded, not built.
+
+**Still genuinely blocked on a live market:** the multi-lot BAG fill-semantics pin (needs an actual
+multi-lot fill) and the cancel *happy path* on a filled-or-fillable order.
+
 **Post-merge confirmation (2026-08-01):** `Category=RequiresTws` run clean against live paper TWS,
 5/5 — `TRADING_TEST_TWS=127.0.0.1:7497`. The two tests that matter most here are the account-feed
 regression pins: `Re_issuing_the_same_account_summary_id_works_indefinitely` and
