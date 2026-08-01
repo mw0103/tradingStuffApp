@@ -690,6 +690,16 @@ the new ExecutionService cancel path end-to-end (markets closed — queued for t
 with the multi-lot BAG semantics pin); crossed quotes are still priced (locked/crossed markets are
 legitimately common); Market orders carry no slippage model.
 
+**Post-merge confirmation (2026-08-01):** `Category=RequiresTws` run clean against live paper TWS,
+5/5 — `TRADING_TEST_TWS=127.0.0.1:7497`. The two tests that matter most here are the account-feed
+regression pins: `Re_issuing_the_same_account_summary_id_works_indefinitely` and
+`A_third_account_summary_id_is_refused_even_after_cancelling_the_previous_one` — together they hold
+the fact TWS itself disproved during the review (cancelling a summary subscription does not free
+its slot; reusing the same request id is what works) in place against anyone re-"fixing" it back to
+the plausible-but-wrong cancel-then-reissue approach. Still open, unchanged: the ExecutionService
+cancel path and the multi-lot BAG semantics pin both need a live order round trip, which no test in
+this run exercises.
+
 ## Left
 
 Milestone 2 (research platform — sequenced in `docs/plans/ibkr-edge-research-roadmap.md`):
