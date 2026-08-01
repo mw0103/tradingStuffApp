@@ -10,9 +10,9 @@
       "progress"
     ],
     "thresholds": {
-      "high": 90,
-      "low": 80,
-      "break": 0
+      "high": 92,
+      "low": 90,
+      "break": 90
     },
     "mutation-level": "Standard",
     "concurrency": 16
