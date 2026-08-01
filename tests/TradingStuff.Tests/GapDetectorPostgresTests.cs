@@ -35,6 +35,7 @@ namespace TradingStuff.Tests;
 /// </para>
 /// </remarks>
 [Trait("Category", "RequiresPostgres")]
+[Collection(PostgresCollection.Name)]
 public sealed class GapDetectorPostgresTests
 {
     private const int SpxConId = 416904;
@@ -53,7 +54,7 @@ public sealed class GapDetectorPostgresTests
     private static async Task<string> PrepareAsync(string server)
     {
         var database = $"trading_test_{Guid.NewGuid():N}";
-        var connectionString = $"{server.TrimEnd(';')};Database={database}";
+        var connectionString = PostgresCollection.ConnectionString(server, database);
 
         var runner = new MigrationRunner(ConfigurationFor(connectionString), NullLogger<MigrationRunner>.Instance);
         await runner.ApplyOnceAsync(connectionString, CancellationToken.None);

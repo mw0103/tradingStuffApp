@@ -35,6 +35,7 @@ namespace TradingStuff.Tests;
 /// </para>
 /// </remarks>
 [Trait("Category", "RequiresTws")]
+[Collection(PostgresCollection.Name)]
 public sealed class LiveTwsSubscriptionManagerTests
 {
     private const int SpxIndexConId = 416904; // verified live; SPX index, CBOE
@@ -91,7 +92,7 @@ public sealed class LiveTwsSubscriptionManagerTests
         // A paper port, always. 7496/4001 are live money and nothing here may reach them.
         Assert.True(endpoint.Port is 7497 or 4002, $"refusing to run against non-paper port {endpoint.Port}");
 
-        var connectionString = $"{server.TrimEnd(';')};Database=trading_test_{Guid.NewGuid():N}";
+        var connectionString = PostgresCollection.FreshDatabase(server);
         var configuration = new ConfigurationBuilder()
             .AddInMemoryCollection(new Dictionary<string, string?> { ["ConnectionStrings:trading"] = connectionString })
             .Build();

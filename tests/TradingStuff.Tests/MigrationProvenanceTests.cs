@@ -7,6 +7,7 @@ using TradingStuff.ResearchService.Persistence;
 namespace TradingStuff.Tests;
 
 /// <summary>Health reporting that needs no database.</summary>
+[Collection(PostgresCollection.Name)]
 public sealed class MigrationHealthCheckTests
 {
     private static async Task<HealthCheckResult> CheckAsync(MigrationRunner runner) =>
@@ -48,6 +49,7 @@ public sealed class MigrationHealthCheckTests
 /// off as a measurement of what actually ran.
 /// </summary>
 [Trait("Category", "RequiresPostgres")]
+[Collection(PostgresCollection.Name)]
 public sealed class MigrationProvenancePostgresTests
 {
     private static string? ServerConnectionString =>
@@ -56,7 +58,7 @@ public sealed class MigrationProvenancePostgresTests
     private static (string ConnectionString, MigrationRunner Runner) Prepare(string server)
     {
         var database = $"trading_test_{Guid.NewGuid():N}";
-        var connectionString = $"{server.TrimEnd(';')};Database={database}";
+        var connectionString = PostgresCollection.ConnectionString(server, database);
 
         var configuration = new ConfigurationBuilder()
             .AddInMemoryCollection(new Dictionary<string, string?>

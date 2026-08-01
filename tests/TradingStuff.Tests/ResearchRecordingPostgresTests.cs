@@ -15,6 +15,7 @@ namespace TradingStuff.Tests;
 /// connection string — see <see cref="OrderIdStorePostgresTests"/> for the same convention.
 /// </summary>
 [Trait("Category", "RequiresPostgres")]
+[Collection(PostgresCollection.Name)]
 public sealed class ResearchRecordingPostgresTests
 {
     private static string? ServerConnectionString => Environment.GetEnvironmentVariable("TRADING_TEST_POSTGRES");
@@ -22,7 +23,7 @@ public sealed class ResearchRecordingPostgresTests
     private static async Task<string> PrepareAsync(string server)
     {
         var database = $"trading_test_{Guid.NewGuid():N}";
-        var connectionString = $"{server.TrimEnd(';')};Database={database}";
+        var connectionString = PostgresCollection.ConnectionString(server, database);
 
         var configuration = new ConfigurationBuilder()
             .AddInMemoryCollection(new Dictionary<string, string?> { ["ConnectionStrings:trading"] = connectionString })

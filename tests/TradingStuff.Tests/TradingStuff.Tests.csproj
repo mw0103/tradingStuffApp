@@ -1,4 +1,4 @@
-﻿<Project Sdk="Microsoft.NET.Sdk">
+<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <TargetFramework>net10.0</TargetFramework>
@@ -28,6 +28,7 @@
     <ProjectReference Include="..\..\src\TradingStuff.IbkrGateway\TradingStuff.IbkrGateway.csproj" />
     <ProjectReference Include="..\..\src\TradingStuff.ResearchContracts\TradingStuff.ResearchContracts.csproj" />
     <ProjectReference Include="..\..\src\TradingStuff.ResearchService\TradingStuff.ResearchService.csproj" />
+    <ProjectReference Include="..\..\src\TradingStuff.Volatility\TradingStuff.Volatility.csproj" />
   </ItemGroup>
 
 </Project>

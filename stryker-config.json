@@ -1,0 +1,20 @@
+{
+  "stryker-config": {
+    "project": "TradingStuff.Volatility.csproj",
+    "test-projects": [
+      "tests/TradingStuff.Tests/TradingStuff.Tests.csproj"
+    ],
+    "reporters": [
+      "html",
+      "json",
+      "progress"
+    ],
+    "thresholds": {
+      "high": 92,
+      "low": 90,
+      "break": 90
+    },
+    "mutation-level": "Standard",
+    "concurrency": 16
+  }
+}

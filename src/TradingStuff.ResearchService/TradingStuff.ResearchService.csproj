@@ -3,6 +3,7 @@
   <ItemGroup>
     <ProjectReference Include="..\TradingStuff.Contracts\TradingStuff.Contracts.csproj" />
     <ProjectReference Include="..\TradingStuff.ResearchContracts\TradingStuff.ResearchContracts.csproj" />
+    <ProjectReference Include="..\TradingStuff.Volatility\TradingStuff.Volatility.csproj" />
     <ProjectReference Include="..\TradingStuff.ServiceDefaults\TradingStuff.ServiceDefaults.csproj" />
   </ItemGroup>
 

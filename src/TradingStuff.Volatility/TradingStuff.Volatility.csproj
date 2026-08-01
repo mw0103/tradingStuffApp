@@ -1,0 +1,38 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Realized-volatility and model-free implied-variance estimators. Pure computation: no ASP.NET
+    host, no database, no broker socket. ResearchService adapts persisted bars into these types;
+    nothing here reaches back out, which is what keeps the estimators testable without TWS,
+    Postgres, or a running ThetaData Terminal.
+  -->
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <RootNamespace>TradingStuff.Volatility</RootNamespace>
+    <AssemblyName>TradingStuff.Volatility</AssemblyName>
+    <IsPackable>false</IsPackable>
+
+    <!--
+      Ported from the TradingBotIBKR TradingMLModel project, where it was verified by 294 checks.
+      The port changed namespaces only; the numerics are byte-for-byte the reviewed code. Nullable
+      annotation and a rewrite into this repo's C# 13 idiom (file-scoped namespaces, primary
+      constructors, collection expressions) are deliberately deferred so that the tests carried
+      across prove behaviour was preserved rather than merely re-asserted against rewritten code.
+    -->
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- ISessionClock. Session boundaries, trading dates and half days are the platform's
+         to answer, not this library's; see RealizedVolatilitySeriesBuilder. -->
+    <ProjectReference Include="..\TradingStuff.ResearchContracts\TradingStuff.ResearchContracts.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Subsampling offsets and estimator internals are worth testing directly. -->
+    <InternalsVisibleTo Include="TradingStuff.Tests" />
+  </ItemGroup>
+
+</Project>

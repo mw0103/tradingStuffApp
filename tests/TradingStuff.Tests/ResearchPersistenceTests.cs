@@ -6,6 +6,7 @@ using TradingStuff.ResearchService.Persistence;
 namespace TradingStuff.Tests;
 
 /// <summary>Pure unit coverage of the migration set — no database required.</summary>
+[Collection(PostgresCollection.Name)]
 public sealed class MigrationSetTests
 {
     [Fact]
@@ -69,6 +70,7 @@ public sealed class MigrationSetTests
 /// each run uses a fresh database so reruns are independent.
 /// </summary>
 [Trait("Category", "RequiresPostgres")]
+[Collection(PostgresCollection.Name)]
 public sealed class OrderIdStorePostgresTests
 {
     private static string? ServerConnectionString =>
@@ -77,7 +79,7 @@ public sealed class OrderIdStorePostgresTests
     private static async Task<(string ConnectionString, MigrationRunner Runner)> PrepareAsync(string server)
     {
         var database = $"trading_test_{Guid.NewGuid():N}";
-        var connectionString = $"{server.TrimEnd(';')};Database={database}";
+        var connectionString = PostgresCollection.ConnectionString(server, database);
 
         var configuration = new ConfigurationBuilder()
             .AddInMemoryCollection(new Dictionary<string, string?>
@@ -358,6 +360,7 @@ public sealed class OrderIdStorePostgresTests
 /// retried forever.
 /// </summary>
 [Trait("Category", "RequiresPostgres")]
+[Collection(PostgresCollection.Name)]
 public sealed class MigrationChecksumPostgresTests
 {
     private static string? ServerConnectionString =>
@@ -366,7 +369,7 @@ public sealed class MigrationChecksumPostgresTests
     private static (string ConnectionString, MigrationRunner Runner) Prepare(string server)
     {
         var database = $"trading_test_{Guid.NewGuid():N}";
-        var connectionString = $"{server.TrimEnd(';')};Database={database}";
+        var connectionString = PostgresCollection.ConnectionString(server, database);
 
         var configuration = new ConfigurationBuilder()
             .AddInMemoryCollection(new Dictionary<string, string?>
