@@ -181,7 +181,31 @@ namespace TradingStuff.Volatility
             }
 
             var denominator = Math.Sqrt(varianceLeft * varianceRight);
-            return denominator > 0.0 ? covariance / denominator : 0.0;
+
+            // Scaled rather than compared against zero, for the reason given on RSquared.
+            return denominator > DegenerateSumOfSquares(left) ? covariance / denominator : 0.0;
+        }
+
+        /// <summary>
+        /// Threshold below which a sum of squared deviations is indistinguishable from zero.
+        /// </summary>
+        /// <remarks>
+        /// A constant series does not produce exactly zero here. Summing n identical doubles
+        /// and dividing by n need not return the original value, so each deviation carries a
+        /// one-ulp residue and the total lands just above zero. A bare <c>&gt; 0.0</c> guard
+        /// then passes and the ratio built on it explodes - which is how a flat target
+        /// produced an R-squared around -5e16 rather than the zero the guard intended.
+        /// </remarks>
+        private static double DegenerateSumOfSquares(IReadOnlyList<double> values)
+        {
+            double scale = 0.0;
+            for (int i = 0; i < values.Count; i++)
+            {
+                var magnitude = Math.Abs(values[i]);
+                if (magnitude > scale) scale = magnitude;
+            }
+
+            return 1e-20 * values.Count * Math.Max(1.0, scale * scale);
         }
 
         private static double StandardDeviation(IReadOnlyList<double> values, double mean)
@@ -212,7 +236,12 @@ namespace TradingStuff.Volatility
                 totalSumSquares += deviation * deviation;
             }
 
-            return totalSumSquares > 0.0 ? 1.0 - (residualSumSquares / totalSumSquares) : 0.0;
+            // A target with no variation carries no explainable variance, so R squared is
+            // undefined and reported as zero. The comparison is against a scaled tolerance
+            // rather than against zero - see DegenerateSumOfSquares.
+            return totalSumSquares > DegenerateSumOfSquares(targets)
+                ? 1.0 - (residualSumSquares / totalSumSquares)
+                : 0.0;
         }
     }
 }

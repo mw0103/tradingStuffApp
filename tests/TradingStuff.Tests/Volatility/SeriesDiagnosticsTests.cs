@@ -70,22 +70,37 @@ public class SeriesDiagnosticsTests
     }
 
     [Fact]
-    public void ANegativeVarianceCurrentlyCrashesTheDiagnostic()
+    public void ANegativeVarianceIsReportedRatherThanCrashing()
     {
-        // KNOWN DEFECT, pinned rather than endorsed. Summarize exists to surface data faults
-        // before anything is trained on the series, but the outlier scan reads
-        // AnnualizedVolatility on every session, and that rejects a negative variance — so a
-        // single bad row throws instead of being reported as a zero-variance session.
-        //
-        // The builder cannot produce a negative (variance is a sum of squares scaled by a
-        // factor floored at 1), but TotalVariance is a public setter on a DTO that is loaded
-        // from storage, which is exactly how a fault would arrive. Fixing it means making the
-        // outlier scan tolerate what ZeroVarianceSessions already counts.
-        Assert.Throws<ArgumentOutOfRangeException>(() => SeriesDiagnostics.Summarize([Day(Start, -1e-4)]));
+        // Summarize exists to surface data faults before anything is trained on the series,
+        // so it must survive one. The outlier scan skips non-positive sessions, which are
+        // already accounted for by ZeroVarianceSessions; annualizing one would throw.
+        var d = SeriesDiagnostics.Summarize([Day(Start, -1e-4), Day(Start.AddDays(1), 1e-4)]);
 
-        // The count itself is correct; only the outlier scan is fragile.
-        Assert.Equal(0, SeriesDiagnostics.Summarize([Day(Start, 0.0)]).CompleteSessions);
-        Assert.Equal(1, SeriesDiagnostics.Summarize([Day(Start, 0.0)]).ZeroVarianceSessions);
+        Assert.Equal(2, d.TotalSessions);
+        Assert.Equal(1, d.ZeroVarianceSessions);
+        Assert.Equal(1, d.CompleteSessions);
+        Assert.Empty(d.Outliers);
+    }
+
+    [Fact]
+    public void ANegativeVarianceDoesNotHideRealOutliers()
+    {
+        // Skipping the bad row must not skip the scan: a genuine outlier alongside it is
+        // still flagged.
+        var d = SeriesDiagnostics.Summarize([Day(Start, -1e-4), DayAtVol(Start.AddDays(1), 9.0)]);
+
+        Assert.Single(d.Outliers);
+        Assert.Equal(Start.AddDays(1), d.Outliers[0].Date);
+    }
+
+    [Fact]
+    public void AZeroVarianceSessionIsCountedButNotComplete()
+    {
+        var d = SeriesDiagnostics.Summarize([Day(Start, 0.0)]);
+
+        Assert.Equal(0, d.CompleteSessions);
+        Assert.Equal(1, d.ZeroVarianceSessions);
     }
 
     [Fact]

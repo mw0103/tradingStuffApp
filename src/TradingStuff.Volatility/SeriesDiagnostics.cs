@@ -94,8 +94,14 @@ namespace TradingStuff.Volatility
                 MeanAnnualizedVolatility = volatilities.Count > 0 ? volatilities.Average() : 0.0,
                 MinAnnualizedVolatility = volatilities.Count > 0 ? volatilities[0] : 0.0,
                 MaxAnnualizedVolatility = volatilities.Count > 0 ? volatilities[volatilities.Count - 1] : 0.0,
+                // Restricted to sessions with positive variance. A zero or negative variance
+                // is already reported by ZeroVarianceSessions, and annualizing one throws -
+                // which would crash the very summary that exists to surface such faults. The
+                // builder cannot emit a negative, but TotalVariance is a settable property on
+                // a row loaded from storage, which is exactly how one would arrive.
                 Outliers = ordered
-                    .Where(d => d.AnnualizedVolatility > implausibleAnnualizedVolatility)
+                    .Where(d => d.TotalVariance > 0.0
+                                && d.AnnualizedVolatility > implausibleAnnualizedVolatility)
                     .OrderByDescending(d => d.AnnualizedVolatility)
                     .ToList()
             };

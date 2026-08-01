@@ -260,22 +260,35 @@ public class VolatilityComparisonTests
     }
 
     [Fact]
-    public void AFlatTargetProducesADegenerateButFiniteRSquared()
+    public void AFlatTargetProducesAZeroRSquared()
     {
         var source = Series(10, i => 1e-4 * (1.0 + i * 0.1));
         var target = Series(10, _ => 1e-4, symbol: "SPX");
 
         var result = VolatilityComparison.Compare(source, target);
 
-        // RSquared guards on `totalSumSquares > 0.0` intending to return 0 here, but a
-        // constant target does not give exactly zero total sum of squares: Average() leaves
-        // a one-ulp residue, the guard passes, and the ratio explodes. The number is
-        // meaningless either way — what matters is that it is finite rather than NaN, so a
-        // downstream summary prints obvious garbage instead of silently poisoning a
-        // comparison. Worth tightening the guard to a tolerance.
+        // A constant target has no variance to explain, so R squared is undefined and
+        // reported as zero. The guard is against a scaled tolerance rather than zero: summing
+        // n identical doubles and dividing by n need not return the original value, so the
+        // total sum of squares lands fractionally above zero and a bare `> 0.0` test would
+        // pass and blow the ratio up to around -5e16.
+        Assert.Equal(0.0, result.CalibrationRSquared);
         Assert.False(double.IsNaN(result.CalibrationRSquared));
-        Assert.True(double.IsFinite(result.CalibrationRSquared));
-        Assert.True(result.CalibrationRSquared <= 0.0);
+    }
+
+    [Fact]
+    public void RealVariationIsStillMeasuredAfterTheDegeneracyGuard()
+    {
+        // The tolerance must not swallow a genuine relationship: variation this small is
+        // still many orders of magnitude above the residue it is meant to reject.
+        var source = Series(40, i => 1e-4 * (1.0 + i * 1e-6));
+        var target = Enumerable.Range(0, 40)
+            .Select(i => Day(Start.AddDays(i), 1e-4 * (1.0 + i * 1e-6) * 1.2, symbol: "SPX")).ToList();
+
+        var result = VolatilityComparison.Compare(source, target);
+
+        Assert.True(result.CalibrationRSquared > 0.5);
+        Assert.True(result.LogVarianceCorrelation > 0.5);
     }
 
     // ---------- divergences ----------
