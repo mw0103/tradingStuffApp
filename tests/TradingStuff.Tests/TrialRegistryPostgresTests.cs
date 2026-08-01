@@ -16,6 +16,7 @@ namespace TradingStuff.Tests;
 /// can be rewritten after results are seen is evidence of nothing. The ordinal assignment is here
 /// for the same reason, since it depends on a serializable read the database performs.
 /// </remarks>
+[Collection(PostgresCollection.Name)]
 public sealed class TrialRegistryPostgresTests
 {
     private static string? ServerConnectionString => Environment.GetEnvironmentVariable("TRADING_TEST_POSTGRES");
@@ -38,7 +39,7 @@ public sealed class TrialRegistryPostgresTests
     private static async Task<NpgsqlDataSource> FreshDatabaseAsync(string server)
     {
         var database = $"trading_test_{Guid.NewGuid():N}";
-        var connectionString = $"{server.TrimEnd(';')};Database={database}";
+        var connectionString = PostgresCollection.ConnectionString(server, database);
 
         var configuration = new ConfigurationBuilder()
             .AddInMemoryCollection(new Dictionary<string, string?> { ["ConnectionStrings:trading"] = connectionString })

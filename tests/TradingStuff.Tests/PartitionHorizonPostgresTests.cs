@@ -32,6 +32,7 @@ namespace TradingStuff.Tests;
 /// </para>
 /// </remarks>
 [Trait("Category", "RequiresPostgres")]
+[Collection(PostgresCollection.Name)]
 public sealed class PartitionHorizonPostgresTests
 {
     private const string PartitionHorizonMigration = "012_partition_horizon.sql";
@@ -61,7 +62,7 @@ public sealed class PartitionHorizonPostgresTests
     private static async Task<string> PrepareAsync(string server, string? skipMigration)
     {
         var database = $"trading_test_{Guid.NewGuid():N}";
-        var connectionString = $"{server.TrimEnd(';')};Database={database}";
+        var connectionString = PostgresCollection.ConnectionString(server, database);
 
         var runner = new MigrationRunner(
             ConfigurationFor(connectionString), NullLogger<MigrationRunner>.Instance);
@@ -264,7 +265,7 @@ public sealed class PartitionHorizonPostgresTests
         }
 
         var database = $"trading_test_{Guid.NewGuid():N}";
-        var connectionString = $"{server.TrimEnd(';')};Database={database}";
+        var connectionString = PostgresCollection.ConnectionString(server, database);
 
         await using (var maintenance = new NpgsqlConnection($"{server.TrimEnd(';')};Database=postgres"))
         {

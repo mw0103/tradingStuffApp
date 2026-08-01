@@ -19,6 +19,7 @@ namespace TradingStuff.Tests;
 /// <c>docker run -d --name pg-2d -e POSTGRES_PASSWORD=postgres -p 5451:5432 postgres:17</c>.
 /// </remarks>
 [Trait("Category", "RequiresPostgres")]
+[Collection(PostgresCollection.Name)]
 public sealed class BackfillCoordinatorPostgresTests
 {
     private const int SpxConId = 416904;
@@ -31,7 +32,7 @@ public sealed class BackfillCoordinatorPostgresTests
     private static async Task<string> PrepareAsync(string server)
     {
         var database = $"trading_test_{Guid.NewGuid():N}";
-        var connectionString = $"{server.TrimEnd(';')};Database={database}";
+        var connectionString = PostgresCollection.ConnectionString(server, database);
 
         var runner = new MigrationRunner(ConfigurationFor(connectionString), NullLogger<MigrationRunner>.Instance);
         await runner.ApplyOnceAsync(connectionString, CancellationToken.None);

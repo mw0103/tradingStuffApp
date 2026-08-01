@@ -14,6 +14,7 @@ namespace TradingStuff.Tests;
 /// string, matching <see cref="BackfillPostgresTests"/>.
 /// </summary>
 [Trait("Category", "RequiresPostgres")]
+[Collection(PostgresCollection.Name)]
 public sealed class SessionCalendarPostgresTests
 {
     private const string Nyse = "NYSE";
@@ -25,7 +26,7 @@ public sealed class SessionCalendarPostgresTests
     private static async Task<(string ConnectionString, SessionCalendarService Service)> PrepareAsync(string server)
     {
         var database = $"trading_test_{Guid.NewGuid():N}";
-        var connectionString = $"{server.TrimEnd(';')};Database={database}";
+        var connectionString = PostgresCollection.ConnectionString(server, database);
 
         var configuration = new ConfigurationBuilder()
             .AddInMemoryCollection(new Dictionary<string, string?> { ["ConnectionStrings:trading"] = connectionString })

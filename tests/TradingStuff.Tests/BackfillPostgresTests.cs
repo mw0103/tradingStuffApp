@@ -12,6 +12,7 @@ namespace TradingStuff.Tests;
 /// string — see <see cref="ResearchRecordingPostgresTests"/> for the same convention.
 /// </summary>
 [Trait("Category", "RequiresPostgres")]
+[Collection(PostgresCollection.Name)]
 public sealed class BackfillPostgresTests
 {
     private static string? ServerConnectionString => Environment.GetEnvironmentVariable("TRADING_TEST_POSTGRES");
@@ -19,7 +20,7 @@ public sealed class BackfillPostgresTests
     private static async Task<(string ConnectionString, MigrationRunner Runner)> PrepareAsync(string server)
     {
         var database = $"trading_test_{Guid.NewGuid():N}";
-        var connectionString = $"{server.TrimEnd(';')};Database={database}";
+        var connectionString = PostgresCollection.ConnectionString(server, database);
 
         var configuration = new ConfigurationBuilder()
             .AddInMemoryCollection(new Dictionary<string, string?> { ["ConnectionStrings:trading"] = connectionString })
