@@ -10,6 +10,7 @@
     <Project Path="src/TradingStuff.ResearchService/TradingStuff.ResearchService.csproj" />
     <Project Path="src/TradingStuff.RiskService/TradingStuff.RiskService.csproj" />
     <Project Path="src/TradingStuff.ServiceDefaults/TradingStuff.ServiceDefaults.csproj" />
+    <Project Path="src/TradingStuff.Volatility/TradingStuff.Volatility.csproj" />
   </Folder>
   <Folder Name="/tests/">
     <Project Path="tests/TradingStuff.Tests/TradingStuff.Tests.csproj" />
