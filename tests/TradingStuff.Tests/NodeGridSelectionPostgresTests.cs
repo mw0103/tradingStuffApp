@@ -24,6 +24,7 @@ namespace TradingStuff.Tests;
 /// selector: after a pass, how many distinct contracts is the 54-node grid actually recording?
 /// </remarks>
 [Trait("Category", "RequiresPostgres")]
+[Collection(PostgresCollection.Name)]
 public sealed class NodeGridSelectionPostgresTests
 {
     private const decimal Spot = 7437.63m;
@@ -35,7 +36,7 @@ public sealed class NodeGridSelectionPostgresTests
     private static async Task<string> PrepareAsync(string server)
     {
         var database = $"trading_test_{Guid.NewGuid():N}";
-        var connectionString = $"{server.TrimEnd(';')};Database={database}";
+        var connectionString = PostgresCollection.ConnectionString(server, database);
 
         var configuration = new ConfigurationBuilder()
             .AddInMemoryCollection(new Dictionary<string, string?> { ["ConnectionStrings:trading"] = connectionString })

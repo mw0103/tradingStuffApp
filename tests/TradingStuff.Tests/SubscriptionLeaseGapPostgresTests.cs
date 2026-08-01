@@ -23,6 +23,7 @@ namespace TradingStuff.Tests;
 /// 80 immortal gaps from one afternoon's restarts).
 /// </remarks>
 [Trait("Category", "RequiresPostgres")]
+[Collection(PostgresCollection.Name)]
 public sealed class SubscriptionLeaseGapPostgresTests
 {
     private static readonly TimeSpan TestTimeout = TimeSpan.FromSeconds(15);
@@ -39,7 +40,7 @@ public sealed class SubscriptionLeaseGapPostgresTests
     private static string? ServerConnectionString => Environment.GetEnvironmentVariable("TRADING_TEST_POSTGRES");
 
     private static string ConnectionStringFor(string server) =>
-        $"{server.TrimEnd(';')};Database=trading_test_{Guid.NewGuid():N}";
+        PostgresCollection.FreshDatabase(server);
 
     private static Task MigrateAsync(string connectionString) =>
         new MigrationRunner(ConfigurationFor(connectionString), NullLogger<MigrationRunner>.Instance)
