@@ -4,11 +4,18 @@ namespace TradingStuff.Volatility
 {
     /// <summary>
     /// Numeric-friendly intraday bar used by the realized volatility estimators.
-    /// Deliberately decoupled from the EF entities so the estimator core never
-    /// deals with decimal, nullable columns or persistence concerns.
+    /// Deliberately decoupled from persistence types so the estimator core never
+    /// deals with decimal, nullable columns or storage concerns.
     /// </summary>
+    /// <remarks>
+    /// <see cref="Timestamp"/> is a UTC instant, per the platform's UTC-canonical doctrine.
+    /// An exchange-local wall-clock time here would be silently wrong rather than loudly
+    /// wrong: the session filter would still match something, just the wrong hours of the
+    /// wrong day.
+    /// </remarks>
     public struct IntradayBar
     {
+        /// <summary>The bar's instant, in UTC.</summary>
         public DateTime Timestamp { get; }
         public double Open { get; }
         public double High { get; }
@@ -16,8 +23,18 @@ namespace TradingStuff.Volatility
         public double Close { get; }
         public long Volume { get; }
 
+        /// <param name="timestamp">
+        /// The bar's instant, in UTC. <see cref="DateTimeKind.Unspecified"/> is accepted and
+        /// read as UTC; <see cref="DateTimeKind.Local"/> is rejected, because a local
+        /// timestamp is the one mistake that produces a plausible series from the wrong hours.
+        /// </param>
         public IntradayBar(DateTime timestamp, double open, double high, double low, double close, long volume = 0L)
         {
+            if (timestamp.Kind == DateTimeKind.Local)
+                throw new ArgumentException(
+                    "Bar timestamps are UTC instants. A local time here would select the wrong " +
+                    "session without failing.", "timestamp");
+
             Timestamp = timestamp;
             Open = open;
             High = high;

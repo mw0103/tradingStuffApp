@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using TradingStuff.ResearchContracts;
 
 namespace TradingStuff.Volatility
 {
@@ -27,15 +28,21 @@ namespace TradingStuff.Volatility
     /// </summary>
     public static class VolatilityPresets
     {
+        /// <summary>SPY is NYSE-listed; its sessions follow that calendar.</summary>
+        public const string SpyCalendar = "NYSE";
+
+        /// <summary>SPX is a Cboe index; its regular session is the Cboe index RTH calendar.</summary>
+        public const string SpxCalendar = "CBOE_INDEX_RTH";
+
         /// <summary>
         /// SPY from one-minute bars. Ex-dividend dates are deliberately left empty:
         /// populate <see cref="RealizedVolatilityOptions.ExDividends"/> from the
         /// distribution history before comparing against SPX, or the four quarterly gaps
         /// will show up as volatility that the index does not have.
         /// </summary>
-        public static void Spy(out SessionProfile session, out RealizedVolatilityOptions options)
+        public static void Spy(out SessionQualityPolicy policy, out RealizedVolatilityOptions options)
         {
-            session = SessionProfile.UsEquity();
+            policy = SessionQualityPolicy.UsEquity();
             options = new RealizedVolatilityOptions
             {
                 SourceBarMinutes = 1,
@@ -53,9 +60,9 @@ namespace TradingStuff.Volatility
         /// entirely a jump in the constituents' prices. Scaling is still the right
         /// treatment, since an option on the index prices calendar time either way.
         /// </summary>
-        public static void Spx(out SessionProfile session, out RealizedVolatilityOptions options)
+        public static void Spx(out SessionQualityPolicy policy, out RealizedVolatilityOptions options)
         {
-            session = SessionProfile.SpxIndex();
+            policy = SessionQualityPolicy.SpxIndex();
             options = new RealizedVolatilityOptions
             {
                 SourceBarMinutes = 1,
@@ -71,12 +78,13 @@ namespace TradingStuff.Volatility
         /// Builds a SPY series with a supplied distribution history applied.
         /// </summary>
         public static List<RealizedVolatilityDay> BuildSpy(
+            ISessionClock clock,
             IEnumerable<IntradayBar> bars,
             IDictionary<DateTime, double> exDividends = null)
         {
-            SessionProfile session;
+            SessionQualityPolicy policy;
             RealizedVolatilityOptions options;
-            Spy(out session, out options);
+            Spy(out policy, out options);
 
             if (exDividends != null)
             {
@@ -86,16 +94,16 @@ namespace TradingStuff.Volatility
                 }
             }
 
-            return new RealizedVolatilitySeriesBuilder(session, options).Build("SPY", bars);
+            return new RealizedVolatilitySeriesBuilder(clock, SpyCalendar, policy, options).Build("SPY", bars);
         }
 
-        public static List<RealizedVolatilityDay> BuildSpx(IEnumerable<IntradayBar> bars)
+        public static List<RealizedVolatilityDay> BuildSpx(ISessionClock clock, IEnumerable<IntradayBar> bars)
         {
-            SessionProfile session;
+            SessionQualityPolicy policy;
             RealizedVolatilityOptions options;
-            Spx(out session, out options);
+            Spx(out policy, out options);
 
-            return new RealizedVolatilitySeriesBuilder(session, options).Build("SPX", bars);
+            return new RealizedVolatilitySeriesBuilder(clock, SpxCalendar, policy, options).Build("SPX", bars);
         }
     }
 }

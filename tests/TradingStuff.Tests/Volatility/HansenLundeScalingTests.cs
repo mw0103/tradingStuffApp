@@ -14,20 +14,8 @@ namespace TradingStuff.Tests.Volatility;
 /// </remarks>
 public class HansenLundeScalingTests
 {
-    private static readonly DateTime Day1 = new(2024, 3, 4);
+    private static readonly DateOnly Day1 = new(2024, 3, 4);
     private const int MinimumCalibrationDays = 20;
-
-    private static List<IntradayBar> Session(DateTime day, double baseline, double amplitude, int minutes)
-    {
-        var open = day.Date.AddHours(9).AddMinutes(30);
-        return Enumerable.Range(0, minutes + 1)
-            .Select(i =>
-            {
-                var p = baseline + (i % 7) * amplitude;
-                return new IntradayBar(open.AddMinutes(i), p, p, p, p, 100);
-            })
-            .ToList();
-    }
 
     private static RealizedVolatilityOptions Options(int window = 252) => new()
     {
@@ -37,9 +25,6 @@ public class HansenLundeScalingTests
         OvernightPolicy = OvernightPolicy.HansenLundeScaling,
         OvernightScalingWindow = window,
     };
-
-    private static List<RealizedVolatilityDay> Build(IEnumerable<IntradayBar> bars, RealizedVolatilityOptions options) =>
-        new RealizedVolatilitySeriesBuilder(SessionProfile.UsEquity(), options).Build("SPY", bars);
 
     /// <summary>Recomputes the factor the implementation should have applied to day <paramref name="i"/>.</summary>
     private static double? ExpectedScale(List<RealizedVolatilityDay> days, int i, int window)
@@ -66,10 +51,8 @@ public class HansenLundeScalingTests
     }
 
     /// <summary>A series with a persistent overnight gap, so close-to-close exceeds intraday.</summary>
-    private static List<IntradayBar> GappySeries(int sessions, int minutes = 390) =>
-        Enumerable.Range(0, sessions)
-            .SelectMany(i => Session(Day1.AddDays(i), 100.0 * Math.Pow(1.01, i), 0.05, minutes))
-            .ToList();
+    private static List<IntradayBar> GappySeries(int sessions) =>
+        SessionBars.Series(sessions, i => 100.0 * Math.Pow(1.01, i), amplitude: 0.05);
 
     // ---------- the factor itself ----------
 
@@ -77,7 +60,7 @@ public class HansenLundeScalingTests
     public void TheAppliedFactorMatchesTheTrailingWindowDefinition()
     {
         const int window = 25;
-        var days = Build(GappySeries(60), Options(window));
+        var days = SessionBars.Build(GappySeries(60), Options(window));
 
         var scaled = 0;
         for (int i = 0; i < days.Count; i++)
@@ -100,8 +83,8 @@ public class HansenLundeScalingTests
         // short one to have dropped sessions the long one still sees.
         var bars = GappySeries(80);
 
-        var shortWindow = Build(bars, Options(25));
-        var longWindow = Build(bars, Options(252));
+        var shortWindow = SessionBars.Build(bars, Options(25));
+        var longWindow = SessionBars.Build(bars, Options(252));
 
         Assert.Equal(shortWindow.Count, longWindow.Count);
         Assert.NotEqual(shortWindow[^1].TotalVariance, longWindow[^1].TotalVariance, 12);
@@ -111,7 +94,7 @@ public class HansenLundeScalingTests
     public void TheFactorUsesOnlyPriorSessionsNotTheCurrentOne()
     {
         const int window = 30;
-        var days = Build(GappySeries(60), Options(window));
+        var days = SessionBars.Build(GappySeries(60), Options(window));
 
         // Recomputing with an inclusive window (j <= i) must disagree, which is what proves
         // the implementation is not quietly including the day it is scaling.
@@ -137,10 +120,8 @@ public class HansenLundeScalingTests
     [Fact]
     public void ScalingBeginsOnlyAfterTwentyUsableSessions()
     {
-        var days = Build(GappySeries(40), Options());
+        var days = SessionBars.Build(GappySeries(40), Options());
 
-        // Day i has i prior sessions, but the first carries no overnight return, so day i has
-        // i-1 usable priors. The calibrated branch therefore opens at i = 21.
         for (int i = 0; i < days.Count; i++)
         {
             var fallback = days[i].IntradayVariance
@@ -160,7 +141,7 @@ public class HansenLundeScalingTests
     [Fact]
     public void TheWarmUpFallbackIsIntradayPlusTheSquaredOvernightMove()
     {
-        var days = Build(GappySeries(10), Options());
+        var days = SessionBars.Build(GappySeries(10), Options());
 
         // Ten sessions is short of the calibration minimum, so every day takes the fallback.
         Assert.All(days, d => Assert.Equal(
@@ -177,11 +158,13 @@ public class HansenLundeScalingTests
     {
         const int window = 252;
         // Every fifth session is thin, so it never reaches MinimumReturnsPerDay.
-        var bars = Enumerable.Range(0, 60)
-            .SelectMany(i => Session(Day1.AddDays(i), 100.0 * Math.Pow(1.01, i), 0.05, i % 5 == 0 ? 10 : 390))
+        var dates = SessionBars.TradingDates(60);
+        var bars = dates
+            .SelectMany((d, i) => SessionBars.Wiggly(
+                d, 100.0 * Math.Pow(1.01, i), 0.05, minutes: i % 5 == 0 ? 10 : null))
             .ToList();
 
-        var days = Build(bars, Options(window));
+        var days = SessionBars.Build(bars, Options(window));
 
         Assert.Contains(days, d => !d.IsComplete);
 
@@ -202,11 +185,7 @@ public class HansenLundeScalingTests
     {
         // Identical baseline every session, so the close-to-close move is tiny while intraday
         // variance is substantial: the raw ratio is far below one.
-        var bars = Enumerable.Range(0, 60)
-            .SelectMany(i => Session(Day1.AddDays(i), 100.0, 0.25, 390))
-            .ToList();
-
-        var days = Build(bars, Options());
+        var days = SessionBars.Build(SessionBars.Series(60, _ => 100.0, amplitude: 0.25), Options());
         var late = days[^1];
 
         // The overnight session adds variance; a factor below one would mean the trailing
@@ -220,11 +199,8 @@ public class HansenLundeScalingTests
     {
         // Large close-to-open moves against a quiet intraday session, so the trailing ratio
         // of close-to-close to intraday variance is unambiguously above one.
-        var bars = Enumerable.Range(0, 60)
-            .SelectMany(i => Session(Day1.AddDays(i), 100.0 * Math.Pow(1.05, i), 0.01, 390))
-            .ToList();
-
-        var days = Build(bars, Options());
+        var days = SessionBars.Build(
+            SessionBars.Series(60, i => 100.0 * Math.Pow(1.05, i), amplitude: 0.01), Options());
         var late = days[^1];
 
         Assert.True(late.TotalVariance > late.IntradayVariance,
@@ -236,16 +212,14 @@ public class HansenLundeScalingTests
     [Fact]
     public void CompletenessTurnsOnTheMinimumReturnCount()
     {
-        var session = SessionProfile.UsEquity();
-        session.MinimumReturnsPerDay = 20;
+        var policy = SessionQualityPolicy.UsEquity();
+        policy.MinimumReturnsPerDay = 20;
         var options = Options();
         options.OvernightPolicy = OvernightPolicy.Exclude;
 
-        // Sampling every five minutes: 100 minutes gives ~20 returns, 60 gives ~12.
-        var enough = new RealizedVolatilitySeriesBuilder(session, options)
-            .Build("SPY", Session(Day1, 100.0, 0.25, 105));
-        var tooFew = new RealizedVolatilitySeriesBuilder(session, options)
-            .Build("SPY", Session(Day1, 100.0, 0.25, 60));
+        // Sampling every five minutes: ~105 minutes gives 20+ returns, 60 gives about 12.
+        var enough = SessionBars.Build(SessionBars.Wiggly(Day1, minutes: 105), options, policy);
+        var tooFew = SessionBars.Build(SessionBars.Wiggly(Day1, minutes: 60), options, policy);
 
         Assert.True(enough[0].ReturnCount >= 20);
         Assert.True(enough[0].IsComplete);
@@ -258,43 +232,56 @@ public class HansenLundeScalingTests
     {
         var options = Options();
         options.OvernightPolicy = OvernightPolicy.Exclude;
-        var session = SessionProfile.UsEquity();
+        var policy = SessionQualityPolicy.UsEquity();
 
-        // A dense first hour then a long hole: plenty of returns, but most grid points
-        // reuse the previous bar. The count alone cannot catch this, which is the point.
-        var open = Day1.Date.AddHours(9).AddMinutes(30);
+        // A dense first hour then a long hole: plenty of returns, but most grid points reuse
+        // the previous bar. The return count alone cannot catch this, which is the point.
+        var session = SessionBars.Regular(Day1)!;
         var bars = Enumerable.Range(0, 60)
-            .Select(i => new IntradayBar(open.AddMinutes(i), 100.0 + (i % 7) * 0.25, 100, 100, 100.0 + (i % 7) * 0.25, 1))
+            .Select(i =>
+            {
+                var p = 100.0 + (i % 7) * 0.25;
+                return new IntradayBar(session.OpenUtc.AddMinutes(i).UtcDateTime, p, p, p, p, 1);
+            })
             .ToList();
-        bars.Add(new IntradayBar(open.AddMinutes(380), 101.0, 101.0, 101.0, 101.0, 1));
+        bars.Add(new IntradayBar(session.CloseUtc.AddMinutes(-1).UtcDateTime, 101.0, 101.0, 101.0, 101.0, 1));
 
-        var days = new RealizedVolatilitySeriesBuilder(session, options).Build("SPY", bars);
+        var days = SessionBars.Build(bars, options, policy);
 
         Assert.True(days[0].StaleSamples > 0);
-        Assert.True((double)days[0].StaleSamples / days[0].ReturnCount > session.MaximumStaleSampleFraction);
+        Assert.True((double)days[0].StaleSamples / days[0].ReturnCount > policy.MaximumStaleSampleFraction);
         Assert.False(days[0].IsComplete);
     }
 
     [Fact]
-    public void TheShortSessionToleranceIsAStrictThreshold()
+    public void TheStaleFractionThresholdIsInclusive()
     {
         var options = Options();
         options.OvernightPolicy = OvernightPolicy.Exclude;
-        var session = SessionProfile.UsEquity();
-        session.ShortSessionToleranceMinutes = 60;
 
-        // Bars are stamped bar-start, so a session of n minutes has its last close at
-        // n+1: dropping k minutes leaves a shortfall of k-1 against the scheduled close.
-        // k = 59 -> 58 minutes short, inside the tolerance.
-        var inside = new RealizedVolatilitySeriesBuilder(session, options)
-            .Build("SPY", Session(Day1, 100.0, 0.25, 390 - 59));
-        // k = 62 -> 61 minutes short, past it. The comparison is strict, so 60 exactly
-        // would still count as a normal session.
-        var outside = new RealizedVolatilitySeriesBuilder(session, options)
-            .Build("SPY", Session(Day1, 100.0, 0.25, 390 - 62));
+        // A permissive threshold accepts a session a strict one rejects, so the comparison is
+        // load-bearing rather than decorative.
+        var session = SessionBars.Regular(Day1)!;
+        var bars = Enumerable.Range(0, 60)
+            .Select(i =>
+            {
+                var p = 100.0 + (i % 7) * 0.25;
+                return new IntradayBar(session.OpenUtc.AddMinutes(i).UtcDateTime, p, p, p, p, 1);
+            })
+            .ToList();
+        bars.Add(new IntradayBar(session.CloseUtc.AddMinutes(-1).UtcDateTime, 101.0, 101.0, 101.0, 101.0, 1));
 
-        Assert.False(inside[0].IsShortSession);
-        Assert.True(outside[0].IsShortSession);
+        var strict = SessionBars.Build(bars, options, new SessionQualityPolicy
+        {
+            SkipMinutesAfterOpen = 1, MinimumReturnsPerDay = 1, MaximumStaleSampleFraction = 0.01,
+        });
+        var permissive = SessionBars.Build(bars, options, new SessionQualityPolicy
+        {
+            SkipMinutesAfterOpen = 1, MinimumReturnsPerDay = 1, MaximumStaleSampleFraction = 1.0,
+        });
+
+        Assert.False(strict[0].IsComplete);
+        Assert.True(permissive[0].IsComplete);
     }
 
     // ---------- subsampling ----------
@@ -309,10 +296,10 @@ public class HansenLundeScalingTests
         var subsampled = Options();
         subsampled.OvernightPolicy = OvernightPolicy.Exclude;
 
-        var bars = Session(Day1, 100.0, 0.25, 390);
+        var bars = SessionBars.Wiggly(Day1);
 
-        var one = Build(bars, single);
-        var many = Build(bars, subsampled);
+        var one = SessionBars.Build(bars, single);
+        var many = SessionBars.Build(bars, subsampled);
 
         Assert.Equal(1, single.SubsampleGridCount);
         Assert.Equal(5, subsampled.SubsampleGridCount);
@@ -326,14 +313,16 @@ public class HansenLundeScalingTests
     public void ArgumentFailuresNameTheParameterAtFault()
     {
         var options = new RealizedVolatilityOptions();
+        var policy = SessionQualityPolicy.UsEquity();
 
-        Assert.Equal("session",
-            Assert.Throws<ArgumentNullException>(() => new RealizedVolatilitySeriesBuilder(null!, options)).ParamName);
-        Assert.Equal("options",
-            Assert.Throws<ArgumentNullException>(() =>
-                new RealizedVolatilitySeriesBuilder(SessionProfile.UsEquity(), null!)).ParamName);
-        Assert.Equal("bars",
-            Assert.Throws<ArgumentNullException>(() =>
-                new RealizedVolatilitySeriesBuilder(SessionProfile.UsEquity(), options).Build("SPY", null!)).ParamName);
+        Assert.Equal("clock", Assert.Throws<ArgumentNullException>(() =>
+            new RealizedVolatilitySeriesBuilder(null!, SessionBars.Nyse, policy, options)).ParamName);
+        Assert.Equal("policy", Assert.Throws<ArgumentNullException>(() =>
+            new RealizedVolatilitySeriesBuilder(SessionBars.Clock, SessionBars.Nyse, null!, options)).ParamName);
+        Assert.Equal("options", Assert.Throws<ArgumentNullException>(() =>
+            new RealizedVolatilitySeriesBuilder(SessionBars.Clock, SessionBars.Nyse, policy, null!)).ParamName);
+        Assert.Equal("bars", Assert.Throws<ArgumentNullException>(() =>
+            new RealizedVolatilitySeriesBuilder(SessionBars.Clock, SessionBars.Nyse, policy, options)
+                .Build("SPY", null!)).ParamName);
     }
 }

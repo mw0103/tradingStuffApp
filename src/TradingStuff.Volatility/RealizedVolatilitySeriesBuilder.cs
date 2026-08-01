@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using TradingStuff.ResearchContracts;
 
 namespace TradingStuff.Volatility
 {
@@ -11,18 +12,52 @@ namespace TradingStuff.Volatility
     /// unfiltered extended-hours prints all produce realized variance that looks
     /// plausible and is wrong, and none of them announce themselves downstream.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Session boundaries, trading dates and half days all come from <see cref="ISessionClock"/>.
+    /// This class performs no timezone conversion and holds no wall-clock times, per the
+    /// UTC-canonical doctrine: bar timestamps are UTC instants, and which session an instant
+    /// belongs to is the clock's question to answer.
+    /// </para>
+    /// <para>
+    /// That is a correctness matter, not a tidiness one. The estimator's own notion of a
+    /// session could not see a holiday, and inferred a half day from how early the last bar
+    /// arrived - which reads a genuine early close and a feed that stopped reporting as the
+    /// same thing. The clock knows the difference.
+    /// </para>
+    /// </remarks>
     public class RealizedVolatilitySeriesBuilder
     {
-        private readonly SessionProfile _session;
+        private const string RegularTradingHours = "RTH";
+
+        private readonly ISessionClock _clock;
+        private readonly string _calendar;
+        private readonly SessionQualityPolicy _policy;
         private readonly RealizedVolatilityOptions _options;
 
-        public RealizedVolatilitySeriesBuilder(SessionProfile session, RealizedVolatilityOptions options)
+        /// <param name="clock">The platform's session authority.</param>
+        /// <param name="calendar">
+        /// Calendar key to attribute trading dates with. Use the RTH key: it answers correctly
+        /// for every instant, whereas a GTH key hands a midday instant to the following
+        /// session's trading date.
+        /// </param>
+        public RealizedVolatilitySeriesBuilder(
+            ISessionClock clock,
+            string calendar,
+            SessionQualityPolicy policy,
+            RealizedVolatilityOptions options)
         {
-            if (session == null) throw new ArgumentNullException("session");
+            if (clock == null) throw new ArgumentNullException("clock");
+            if (string.IsNullOrWhiteSpace(calendar)) throw new ArgumentException("A calendar key is required.", "calendar");
+            if (policy == null) throw new ArgumentNullException("policy");
             if (options == null) throw new ArgumentNullException("options");
+
+            policy.Validate();
             options.Validate();
 
-            _session = session;
+            _clock = clock;
+            _calendar = calendar;
+            _policy = policy;
             _options = options;
         }
 
@@ -72,35 +107,94 @@ namespace TradingStuff.Volatility
             return deduplicated;
         }
 
-        private IEnumerable<KeyValuePair<DateTime, List<IntradayBar>>> GroupIntoSessions(List<IntradayBar> bars)
+        /// <summary>
+        /// Buckets bars into the regular session of the trading date the clock assigns them,
+        /// discarding anything outside it.
+        /// </summary>
+        /// <remarks>
+        /// Bars on a holiday are attributed forward to the next trading date and then fall
+        /// outside that session's window, so they are dropped rather than folded into a
+        /// neighbouring day - which is what a calendar-date bucketing would have done.
+        /// </remarks>
+        private IEnumerable<KeyValuePair<TradingSession, List<IntradayBar>>> GroupIntoSessions(
+            List<IntradayBar> bars)
         {
-            DateTime? currentDate = null;
-            var current = new List<IntradayBar>();
+            TradingSession current = null;
+            var members = new List<IntradayBar>();
 
             foreach (var bar in bars)
             {
-                if (!_session.IsInRegularSession(bar.Timestamp)) continue;
+                var session = RegularSessionFor(bar.Timestamp);
+                if (session == null) continue;
+                if (!IsInsideSession(session, bar.Timestamp)) continue;
 
-                var date = bar.Timestamp.Date;
-                if (currentDate.HasValue && date != currentDate.Value)
+                if (current != null && session.TradingDate != current.TradingDate)
                 {
-                    yield return new KeyValuePair<DateTime, List<IntradayBar>>(currentDate.Value, current);
-                    current = new List<IntradayBar>();
+                    if (members.Count > 0)
+                        yield return new KeyValuePair<TradingSession, List<IntradayBar>>(current, members);
+                    members = new List<IntradayBar>();
                 }
 
-                currentDate = date;
-                current.Add(bar);
+                current = session;
+                members.Add(bar);
             }
 
-            if (currentDate.HasValue && current.Count > 0)
+            if (current != null && members.Count > 0)
             {
-                yield return new KeyValuePair<DateTime, List<IntradayBar>>(currentDate.Value, current);
+                yield return new KeyValuePair<TradingSession, List<IntradayBar>>(current, members);
             }
+        }
+
+        /// <summary>The regular session containing this instant, if any.</summary>
+        /// <remarks>
+        /// The search spans a few trading dates either side of the attributed one rather than
+        /// just the attributed date itself. An instant exactly at a close belongs to no
+        /// session under the clock's half-open rule, so it is attributed forward to the next
+        /// trading date - but for a bar-end feed that instant is the previous session's final
+        /// bar, and the closing move is a material share of daily variance. Looking back
+        /// recovers it without asking the clock to change its convention.
+        /// </remarks>
+        private TradingSession RegularSessionFor(DateTime instantUtc)
+        {
+            var instant = new DateTimeOffset(DateTime.SpecifyKind(instantUtc, DateTimeKind.Utc));
+            var tradingDate = _clock.TradingDateOf(_calendar, instant);
+
+            foreach (var session in _clock.SessionsBetween(_calendar, tradingDate.AddDays(-4), tradingDate))
+            {
+                // A calendar can carry both an overnight and a regular row for one trading
+                // date; realized variance is defined over the regular session.
+                if (session.Label != RegularTradingHours) continue;
+
+                if (instant >= session.OpenUtc && instant <= session.CloseUtc) return session;
+            }
+
+            return null;
+        }
+
+        /// <summary>
+        /// Whether a bar falls in the part of the session the estimator uses: from the open
+        /// plus the configured skip, through the close inclusive.
+        /// </summary>
+        /// <remarks>
+        /// The close is inclusive here although <c>SessionAt</c> treats sessions as half-open.
+        /// The closing print is a material share of daily variance and dropping it would bias
+        /// every session low; the half-open rule exists to stop two sessions claiming one
+        /// instant, which is not a risk inside a single session's own window.
+        /// </remarks>
+        private bool IsInsideSession(TradingSession session, DateTime instantUtc)
+        {
+            var instant = new DateTimeOffset(DateTime.SpecifyKind(instantUtc, DateTimeKind.Utc));
+            return instant >= EffectiveOpen(session) && instant <= session.CloseUtc;
+        }
+
+        private DateTimeOffset EffectiveOpen(TradingSession session)
+        {
+            return session.OpenUtc.AddMinutes(_policy.SkipMinutesAfterOpen);
         }
 
         private RealizedVolatilityDay BuildSession(
             string symbol,
-            DateTime date,
+            TradingSession session,
             List<IntradayBar> sessionBars,
             double previousSessionClose)
         {
@@ -111,8 +205,8 @@ namespace TradingStuff.Volatility
             BarResampler.ToCloseSeries(sessionBars, _options.TimestampConvention, _options.SourceBarMinutes,
                 out closeTimes, out closePrices);
 
-            var gridStart = date.Add(_session.EffectiveOpen);
-            var gridEnd = date.Add(_session.RegularClose);
+            var gridStart = EffectiveOpen(session).UtcDateTime;
+            var gridEnd = session.CloseUtc.UtcDateTime;
 
             var grids = new List<RealizedMoments>();
             var staleSamples = 0;
@@ -138,14 +232,10 @@ namespace TradingStuff.Volatility
             // which is itself averaged across grids.
             var meanStaleSamples = (int)Math.Round((double)staleSamples / grids.Count);
 
-            var sessionOpen = closePrices[0];
-            var sessionClose = closePrices[closePrices.Count - 1];
-            var lastBarTime = closeTimes[closeTimes.Count - 1];
-
             var day = new RealizedVolatilityDay
             {
                 Symbol = symbol,
-                Date = date,
+                Date = session.TradingDate.ToDateTime(TimeOnly.MinValue),
                 IntradayVariance = moments.RealizedVariance,
                 TotalVariance = moments.RealizedVariance,
                 BipowerVariation = moments.BipowerVariation,
@@ -155,11 +245,15 @@ namespace TradingStuff.Volatility
                 RealizedQuarticity = moments.RealizedQuarticity,
                 ReturnCount = moments.ReturnCount,
                 StaleSamples = meanStaleSamples,
-                SessionOpen = sessionOpen,
-                SessionClose = sessionClose,
+                SessionOpen = closePrices[0],
+                SessionClose = closePrices[closePrices.Count - 1],
                 FirstBarTime = closeTimes[0],
-                LastBarTime = lastBarTime,
-                IsShortSession = IsShortSession(date, lastBarTime),
+                LastBarTime = closeTimes[closeTimes.Count - 1],
+
+                // The calendar says so, rather than the data being asked to imply it. A feed
+                // that stops early is an incomplete session, not a half day, and the two want
+                // different handling downstream.
+                IsShortSession = session.IsHalfDay,
                 IsComplete = IsComplete(moments.ReturnCount, meanStaleSamples)
             };
 
@@ -174,19 +268,10 @@ namespace TradingStuff.Volatility
         /// </summary>
         private bool IsComplete(int returnCount, int staleSamples)
         {
-            if (returnCount < _session.MinimumReturnsPerDay) return false;
+            if (returnCount < _policy.MinimumReturnsPerDay) return false;
 
             var staleFraction = (double)staleSamples / returnCount;
-            return staleFraction <= _session.MaximumStaleSampleFraction;
-        }
-
-        private bool IsShortSession(DateTime date, DateTime lastBarTime)
-        {
-            if (_session.KnownShortSessions.Contains(date.Date)) return true;
-
-            var scheduledClose = date.Add(_session.RegularClose);
-            var shortfall = (scheduledClose - lastBarTime).TotalMinutes;
-            return shortfall > _session.ShortSessionToleranceMinutes;
+            return staleFraction <= _policy.MaximumStaleSampleFraction;
         }
 
         private void ApplyOvernightReturn(RealizedVolatilityDay day, double previousSessionClose)
