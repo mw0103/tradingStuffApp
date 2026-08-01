@@ -61,7 +61,7 @@ public sealed record InstrumentCalendarMapping(
 /// for every instrument: <c>CoverageOptions.Calendars</c> defaults to the Cboe pair for every conId
 /// it measures, and gap detection carried its own private copy of the same idea. That is wrong in
 /// both directions at once. SPY is NYSE-calendared and neither SPX nor VIX updates through the NYSE
-/// day; and — the finding that motivated this file — the Cboe GTH session is a 780-minute
+/// day; and — the finding that motivated this file — the Cboe GTH session is a thirteen-hour
 /// <b>index-option</b> window, which was being used as the expectation for VIX <b>index</b> bars.
 /// Every correct, complete VIX overnight session therefore reported <c>succeeded_but_absent</c>, and
 /// a report that cries wolf on every session of an instrument trains its operator to stop reading
@@ -102,47 +102,65 @@ public static class InstrumentCalendars
             [new("CBOE_INDEX_RTH", "RTH"), new("CBOE_INDEX_GTH", "GTH")],
             []),
 
-        // The SPX INDEX level, by contrast, is a computed value, and the capability matrix records
-        // it published through the Cboe GTH window alongside the options. RTH is the only session
-        // this platform's SPX jobs actually request (they are useRth=true), so the GTH entry only
-        // matters if a useRth=false SPX job is ever added.
+        // The SPX INDEX level is a completely different session from the options written on it, and
+        // conflating them was costing 100% of SPX RTH sessions. The index is computed from the cash
+        // market and stops when the cash market does — 08:30-15:00 CT, 390 minutes — while the
+        // options trade fifteen minutes longer. Measured 2026-08-01 off live TWS: SPX IND (conId
+        // 416904) reports tradingHours 0830-1500 US/Central, five consecutive useRth=true 1-minute
+        // sessions returned exactly 390 bars each (08:30..14:59 CT), never 405, and the platform's
+        // own seeded SPX jobs were therefore computing 405 expected against 390 landed and returning
+        // succeeded_but_absent on every single session. See CBOE_SPX_RTH.
+        //
+        // There is also NO overnight leg, and the entry claiming one cited the capability matrix,
+        // which says the opposite ("index computed RTH only", "1-min bars RTH only"). Confirmed on
+        // the wire: a useRth=false "2 D" request returns 780 bars = 2 x 390, all inside the day
+        // window, with a single 1,051-minute overnight gap and not one GTH bar. A justifying comment
+        // that cites a source saying the reverse is worse than no comment.
         ("SPX", "index") => new(
-            [new("CBOE_INDEX_RTH", "RTH"), new("CBOE_INDEX_GTH", "GTH")],
+            [new("CBOE_SPX_RTH", "RTH")],
             []),
 
-        // VIX is where the shared default was actively wrong. CBOE_INDEX_GTH describes the index
-        // OPTION session — 19:15 CT the prior day through 08:15 CT, 780 minutes — and VIX index
-        // values are not published across it. Expecting 780 minutes where roughly 360 exist reported
+        // VIX is where the shared default was first found to be actively wrong. CBOE_INDEX_GTH
+        // describes the index OPTION session — 19:15 CT the prior day through 08:25 CT — and VIX
+        // index values are not published across it. Expecting that window over VIX bars reported
         // every correct VIX overnight session as succeeded_but_absent.
         //
-        // RUNTIME-VERIFIED against the paper account on 2026-07-31: a useRth=false 1-minute TRADES
-        // request for trading date 2026-07-30 returned 810 bars, the earliest at 02:15 CT and the
-        // latest at 15:59 CT, with one internal gap from 08:14 to 08:30 CT. So VIX index bars are
-        // two legs — an overnight 02:15-08:14 CT and a day 08:30-15:59 CT — and NEITHER matches
-        // CBOE_INDEX_GTH's 19:15-08:15 window.
+        // The first fix removed the wrong calendar and declared the overnight window unmodelled,
+        // because one day's bars are not a published schedule. That was right on the evidence then
+        // and is wrong now, in two ways: the venue's own schedule is available (below), and an
+        // unmodelled window makes the VIX series report as never-reconciled forever, which is the
+        // same permanently-red gate this project has now written into STATE.md three times.
         //
-        // Two consequences, deliberately different:
-        //  * The overnight leg is listed as UNMODELLED rather than approximated. Writing a
-        //    "CBOE_VIX_GTH 02:15-08:15" calendar is the complete fix, but it belongs in
-        //    exchange-calendars.json — the auditable source of truth every downstream artifact is
-        //    validated against — and one day's observation is not a published schedule. Until it is
-        //    entered there, the honest answer is that VIX's overnight bars are not audited, which
-        //    consumers report explicitly. The previous behaviour asserted a window that does not
-        //    exist; the behaviour before that said nothing at all.
-        //  * The day leg runs to 15:59 CT, past CBOE_INDEX_RTH's 15:15 close, so the RTH expectation
-        //    is a strict SUBSET of what actually lands (405 minutes expected against ~450 present).
-        //    That errs toward under-flagging, which is the safe direction for an expectation: it can
-        //    miss a shortfall, but it cannot manufacture one.
+        // MEASURED 2026-08-01 off live TWS, read-only. VIX IND (conId 13455763) reports tradingHours
+        // and liquidHours as TWO legs, 0215-0815 and 0830-1600 US/Central. IBKR's published schedule
+        // (reqHistoricalData whatToShow=SCHEDULE) returns both legs on all 752 trading dates over
+        // 2023-08-02..2026-07-31, with the overnight leg unshortened on half days and the day leg at
+        // 12:15 CT on them. Cross-checked against real bars rather than trusted: 810 1-minute bars a
+        // day = 360 overnight (02:15..08:14 CT) + 450 day (08:30..15:59 CT). Both legs now have real
+        // calendars, so nothing about VIX is unmodelled any more.
         ("VIX", "index") => new(
-            [new("CBOE_INDEX_RTH", "RTH")],
-            [new(
-                "VIX 1-minute bars run 02:15-08:14 CT overnight (runtime-verified 2026-07-31), far short " +
-                "of the 19:15-08:15 CT CBOE_INDEX_GTH option session, and no calendar describes that " +
-                "window. Overnight VIX bars are therefore NOT audited — their absence would not be reported.")]),
+            [new("CBOE_VIX_RTH", "RTH"), new("CBOE_VIX_GTH", "GTH")],
+            []),
 
         // SPY is NYSE/ARCA cash equities, not Cboe. Nothing about its session resembles the index
         // pair, and the shared default had it measured against Cboe hours.
-        ("SPY", "stock") => new([new("NYSE", "RTH")], []),
+        //
+        // SPY does trade outside the NYSE regular session, and that window is declared unmodelled
+        // rather than left silent. MEASURED 2026-08-01 off live TWS: SPY reports tradingHours
+        // 0400-2000 US/Eastern against liquidHours 0930-1600, and a useRth=false 1-minute TRADES
+        // request returns 960 bars a day running 04:00..19:59 ET — 570 minutes a day that the NYSE
+        // calendar's 390-minute session does not describe. Latent today because both shipped SPY jobs
+        // are useRth=true, exactly as the SPX index GTH claim was latent; the difference is that here
+        // the extra data provably EXISTS, so an expectation-free window is a real audit hole and gets
+        // named. Writing an NYSE_EXTENDED calendar is the complete fix and belongs in
+        // exchange-calendars.json alongside the rest.
+        ("SPY", "stock") => new(
+            [new("NYSE", "RTH")],
+            [new(
+                "SPY trades 04:00-20:00 ET while the NYSE calendar models only the 09:30-16:00 ET " +
+                "regular session (runtime-verified 2026-08-01: 960 useRth=false 1-minute bars a day, " +
+                "04:00..19:59 ET). Pre- and post-market SPY bars are therefore NOT audited — their " +
+                "absence would not be reported.")]),
 
         // CME_ES carries both labels under one key, with the Globex GTH row NESTING the RTH row for
         // the same trading date. A consumer that adds the two together double-counts the overlap;

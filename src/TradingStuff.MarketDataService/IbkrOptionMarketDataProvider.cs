@@ -62,7 +62,10 @@ public sealed class IbkrOptionMarketDataProvider(
 
         if (strikeWindow is { } window)
         {
-            query.Add($"window={window}");
+            // strikeHalfCount, not window: the gateway also accepts a moneyness half-width now, and
+            // an unqualified "window" is exactly the ambiguity that let a caller pass 20 meaning
+            // ±20% and silently receive the 41 strikes nearest spot.
+            query.Add($"strikeHalfCount={window}");
         }
 
         if (!string.IsNullOrWhiteSpace(tradingClass))
@@ -77,9 +80,37 @@ public sealed class IbkrOptionMarketDataProvider(
             path += "?" + string.Join('&', query);
         }
 
-        return await httpClient.GetFromJsonAsync<IReadOnlyList<OptionContract>>(path, cancellationToken)
-               ?? [];
+        // The gateway answers with the window AND how it was cut (see its OptionChainResult): a
+        // window that could not be centred on spot comes back empty with a reason rather than as a
+        // full, healthy-looking strike list. This service's own contract is just the contracts, so
+        // the reason is logged here and not propagated further.
+        var result = await httpClient.GetFromJsonAsync<GatewayChainResult>(path, cancellationToken);
+
+        if (result is null)
+        {
+            return [];
+        }
+
+        if (!result.SpotCentred)
+        {
+            logger.LogWarning(
+                "The gateway could not produce a chain window for {Underlying}: {Reason}",
+                underlying,
+                result.Unavailable ?? "(no reason given)");
+        }
+
+        return result.Contracts ?? [];
     }
+
+    /// <summary>Matched by property name against the gateway's <c>OptionChainResult</c>.</summary>
+    private sealed record GatewayChainResult(
+        IReadOnlyList<OptionContract>? Contracts,
+        bool SpotCentred,
+        decimal? ReferencePrice,
+        DateOnly? Expiration,
+        decimal? WindowLow,
+        decimal? WindowHigh,
+        string? Unavailable);
 
     /// <summary>The gateway's own view of its TWS socket, for the status endpoint.</summary>
     public async Task<JsonElement?> GetGatewayStatusAsync(CancellationToken cancellationToken)

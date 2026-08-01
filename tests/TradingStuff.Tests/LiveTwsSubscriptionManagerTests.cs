@@ -147,9 +147,38 @@ public sealed class LiveTwsSubscriptionManagerTests
             await Task.Delay(TimeSpan.FromSeconds(8));
             Assert.Equal(0, await GapCountAsync(connectionString, scope));
 
-            // The reconnect path, on a socket that never dropped — the same thing TWS's 1101 notice
-            // makes the manager do. The old ticker's registration must go with it: exactly one
-            // in-flight sink before and after, never two.
+            // A replay with NO ledger reset in front of it, which is a genuinely different broker
+            // interaction and has to come FIRST: after a reset the displaced lease is stale-epoch
+            // and releasing it is a no-op, so running these passes afterwards would prove nothing.
+            // Here the reqMktData being displaced is one TWS is still streaming, and the manager
+            // now sends a real cancelMktData for it — a call site that did not exist before, since
+            // the displaced subscription used to be abandoned outright, leaking a TWS line and a
+            // ledger line per re-issue.
+            //
+            // Three passes rather than one because a leak of one line per pass sits inside the
+            // 90-line cap for a long time: "the count stayed at 1" only means something once it has
+            // had several chances not to. Verified to be a live check rather than a vacuous one:
+            // with the displaced lease dropped instead of released, this fails on the first pass
+            // with ResearchInUse = 2.
+            //
+            // Two broker facts here that no fake socket can answer — that TWS accepts the cancel of
+            // a live ticker interleaved with a fresh reqMktData for the same conId, and that doing
+            // so does not disturb the replacement (checked by the gap count below, since an error
+            // against the live ticker would fault its sink and write a row).
+            for (var pass = 0; pass < 3; pass++)
+            {
+                await manager.ReplayAsync(CancellationToken.None);
+
+                Assert.Equal(1, governor.GetLineBudget().ResearchInUse);
+                Assert.Equal(1, registry.InFlightCount);
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(5));
+            Assert.Equal(0, await GapCountAsync(connectionString, scope));
+
+            // And now the reconnect path, on a socket that never dropped — the same thing TWS's
+            // 1101 notice makes the manager do. The old ticker's registration must go with it:
+            // exactly one in-flight sink before and after, never two.
             governor.ResetLineLedgerForReconnect();
             await manager.ReplayAsync(CancellationToken.None);
 

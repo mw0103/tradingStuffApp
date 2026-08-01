@@ -25,7 +25,11 @@ public enum SessionBoundary
 /// Phase 4 leakage firewall's feature cutoffs are all expressed in the sessions and trading dates
 /// this class produces, and none of them can detect that a boundary is wrong — a wrong session is
 /// simply believed. Everything here is therefore deliberately boring: holidays that are statutory
-/// formulas are computed, and everything an exchange *decided* is read from checked-in data.
+/// formulas are computed, and everything an exchange *decided* is read from checked-in data. That
+/// includes the direction people forget — a venue trading a SHORTENED session on a day the holiday
+/// rules call it closed. CME equity index does exactly that on nearly every US holiday, and modelling
+/// those days as closures deleted a 1,140-minute session and pushed every observation inside it onto
+/// the following trading date. See <c>partialSessionSets</c> in the JSON.
 /// </para>
 /// <para>
 /// <b>DST doctrine.</b> <see cref="TimeZoneInfo"/> does the conversion; this class only decides what
@@ -65,7 +69,7 @@ public sealed class SessionGenerator(ExchangeCalendarSet data)
     /// stale one. A unit test asserts this equals the JSON's own <c>generatorVersion</c>, so the two
     /// cannot drift.
     /// </summary>
-    public const short GeneratorVersion = 1;
+    public const short GeneratorVersion = 2;
 
     /// <summary>Sessions generated but not yet persisted carry this id.</summary>
     public const long UnpersistedSessionId = 0;
@@ -132,6 +136,17 @@ public sealed class SessionGenerator(ExchangeCalendarSet data)
         return Rules(definition.Venue, date.Year).Closures.TryGetValue(date, out var closure) ? closure : null;
     }
 
+    /// <summary>
+    /// The shortened session the venue traded on <paramref name="date"/> despite its rules calling the
+    /// day closed, or null if <paramref name="date"/> is an ordinary trading day or a real closure.
+    /// </summary>
+    public PartialSessionEntry? PartialSession(string calendar, DateOnly date)
+    {
+        var definition = Data.Calendar(calendar);
+
+        return date >= definition.EffectiveFrom ? Rules(definition.Venue, date.Year).PartialSessionOn(date) : null;
+    }
+
     private TradingSession[] ForYear(string calendar, int year) =>
         _byYear.GetOrAdd((calendar, year), key => Build(key.Calendar, key.Year));
 
@@ -154,8 +169,26 @@ public sealed class SessionGenerator(ExchangeCalendarSet data)
 
             var early = rules.EarlyCloseOn(date);
 
+            // A partial session is a date the rules call closed on which the venue in fact traded a
+            // shortened session — nearly every US holiday, for CME equity index. It overrides both
+            // the normal close and the early-close rules, and it names which sessions ran: on a
+            // shortened Globex holiday there is no 08:30-15:15 regular session at all, and a Good
+            // Friday closing at 08:15 CT would otherwise generate an RTH row of negative length.
+            var partial = rules.PartialSessionOn(date);
+            var emitted = 0;
+
             foreach (var template in definition.Sessions)
             {
+                if (!template.AppliesOn(date))
+                {
+                    continue;
+                }
+
+                if (partial is not null && !partial.Sessions.Contains(template.Label, StringComparer.Ordinal))
+                {
+                    continue;
+                }
+
                 var openLocalDate = date.AddDays(template.OpenDayOffset);
 
                 // An overnight session is suppressed when the venue does not open that evening at
@@ -166,10 +199,14 @@ public sealed class SessionGenerator(ExchangeCalendarSet data)
                     continue;
                 }
 
-                var isHalfDay = early is not null && template.AppliesEarlyClose;
+                var isHalfDay = partial is not null || (early is not null && template.AppliesEarlyClose);
                 var closeTime = template.Close;
 
-                if (isHalfDay)
+                if (partial is not null)
+                {
+                    closeTime = partial.Close;
+                }
+                else if (isHalfDay)
                 {
                     closeTime = early!.Value.Time
                                 ?? template.EarlyClose
@@ -193,6 +230,19 @@ public sealed class SessionGenerator(ExchangeCalendarSet data)
 
                 sessions.Add(new TradingSession(
                     UnpersistedSessionId, calendar, date, openUtc, closeUtc, template.Label, isHalfDay));
+                emitted++;
+            }
+
+            // A partial-session date that produces nothing is the absent-row failure this platform
+            // keeps rediscovering: the day silently reverts to "closed", which shrinks every
+            // denominator and renders as health. Only reachable by naming a label the calendar does
+            // not define, so fail at generation naming both.
+            if (partial is not null && emitted == 0)
+            {
+                throw new InvalidOperationException(
+                    $"Calendar '{calendar}' has a partial session on {date:yyyy-MM-dd} listing " +
+                    $"[{string.Join(", ", partial.Sessions)}], but no session template matched — the day " +
+                    "would silently generate as closed.");
             }
         }
 
@@ -291,6 +341,8 @@ public sealed class SessionGenerator(ExchangeCalendarSet data)
     {
         private FrozenSet<DateOnly> _holidays = FrozenSet<DateOnly>.Empty;
         private FrozenDictionary<DateOnly, EarlyClose> _earlyCloses = FrozenDictionary<DateOnly, EarlyClose>.Empty;
+        private FrozenDictionary<DateOnly, PartialSessionEntry> _partials =
+            FrozenDictionary<DateOnly, PartialSessionEntry>.Empty;
 
         public FrozenDictionary<DateOnly, ClosureEntry> Closures { get; private set; } =
             FrozenDictionary<DateOnly, ClosureEntry>.Empty;
@@ -302,6 +354,7 @@ public sealed class SessionGenerator(ExchangeCalendarSet data)
             var earlyCloseRules = data.EarlyCloseRules(venue.EarlyCloseRuleSet);
             var closures = data.Closures(venue.ClosureSet);
             var unscheduledEarly = data.UnscheduledEarlyCloses(venue.UnscheduledEarlyCloseSet);
+            var partials = data.PartialSessions(venue.PartialSessionSet);
 
             // Neighbouring years are evaluated too: an observance rule can move a holiday across a
             // year boundary (a Jan 1 shifted back to Dec 31, say). Cheap, and it removes a whole
@@ -384,21 +437,58 @@ public sealed class SessionGenerator(ExchangeCalendarSet data)
                 }
             }
 
+            // A partial-session entry only ever REOPENS a day the rules close. One naming a date that
+            // is already a trading day, or a weekend, is an operator error in the reference data —
+            // and a silent one, because the entry's close would then quietly shorten a normal session
+            // or manufacture a Saturday. Reject it here, so a mis-projected future holiday date (the
+            // unverified 2027 entries are hand-computed observance dates) fails loudly the first time
+            // anything generates that year.
+            var thisYear = new Dictionary<DateOnly, PartialSessionEntry>();
+
+            foreach (var (date, entry) in partials)
+            {
+                if (date.Year != year)
+                {
+                    continue;
+                }
+
+                if (date.DayOfWeek is DayOfWeek.Saturday or DayOfWeek.Sunday)
+                {
+                    throw new InvalidOperationException(
+                        $"Venue '{venueName}' has a partial session on {date:yyyy-MM-dd}, a " +
+                        $"{date.DayOfWeek}. Partial sessions reopen closed weekdays; they cannot " +
+                        "manufacture a weekend session.");
+                }
+
+                if (!holidays.Contains(date) && !closures.ContainsKey(date))
+                {
+                    throw new InvalidOperationException(
+                        $"Venue '{venueName}' has a partial session on {date:yyyy-MM-dd}, which is " +
+                        "already an ordinary trading day. Use an unscheduled early close for a day the " +
+                        "venue opened normally and closed early.");
+                }
+
+                thisYear[date] = entry;
+            }
+
             return new YearRules
             {
                 _holidays = holidays.ToFrozenSet(),
                 _earlyCloses = earlyCloses.ToFrozenDictionary(),
+                _partials = thisYear.ToFrozenDictionary(),
                 Closures = closures,
             };
         }
 
         public bool IsTradingDay(DateOnly date) =>
             date.DayOfWeek is not (DayOfWeek.Saturday or DayOfWeek.Sunday)
-            && !_holidays.Contains(date)
-            && !Closures.ContainsKey(date);
+            && (_partials.ContainsKey(date) || (!_holidays.Contains(date) && !Closures.ContainsKey(date)));
 
         public EarlyClose? EarlyCloseOn(DateOnly date) =>
             _earlyCloses.TryGetValue(date, out var early) ? early : null;
+
+        public PartialSessionEntry? PartialSessionOn(DateOnly date) =>
+            _partials.TryGetValue(date, out var partial) ? partial : null;
 
         private static bool Applies(int? fromYear, int? toYear, int year) =>
             (fromYear is null || year >= fromYear) && (toYear is null || year <= toYear);

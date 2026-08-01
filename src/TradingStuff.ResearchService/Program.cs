@@ -12,8 +12,34 @@ var builder = WebApplication.CreateBuilder(args);
 
 builder.AddServiceDefaults();
 
+// These two hosted services start back to back and then run CONCURRENTLY — a BackgroundService whose
+// ExecuteAsync awaits does not block the ones registered after it — so registration order buys
+// nothing here and must not be mistaken for sequencing. The maintainer used to race migrations on a
+// cold start, fail its whole first sweep against tables that did not exist yet, and drop into its
+// 1-minute failure retry; by the time the second sweep ran, the recorder had already put ticks for
+// TODAY into the DEFAULT partition, which Postgres then permanently refuses to give a real partition.
+//
+// Do NOT "fix" that by making the maintainer wait on this MigrationRunner instance. The recorder that
+// writes those ticks lives in the IbkrGateway process, which is deliberately designed to outlive this
+// one, so any in-process ordering rule is only true when the two happen to start together — the case
+// that was never the problem. The guarantee lives in the schema instead (migration 012 creates a
+// 14-day partition horizon at migration time), and the maintainer now gates itself on the tables
+// existing, which is a fact about the database rather than about this process's startup.
 builder.Services.AddSingleton<MigrationRunner>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<MigrationRunner>());
+
+// A service with no schema must not answer /health with 200. MigrationHealthCheck existed, was
+// tested, and was registered nowhere — so it reported nothing at all, which is the same defect it
+// was written to fix, one level up.
+builder.Services.AddHealthChecks().AddCheck<MigrationHealthCheck>("migrations");
+
+// Defence in depth, and it only makes sense WITH the health check above. The default
+// BackgroundServiceExceptionBehavior is StopHost, so any single background service faulting takes
+// the whole host down with it — PartitionMaintainer included, whose death is not benign (a row
+// landing in a DEFAULT partition permanently blocks that date's real partition). Ignore keeps the
+// rest of the host alive; the health check is what stops "alive" being mistaken for "working".
+builder.Services.Configure<HostOptions>(
+    options => options.BackgroundServiceExceptionBehavior = BackgroundServiceExceptionBehavior.Ignore);
 builder.Services.AddSingleton<PartitionMaintainer>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<PartitionMaintainer>());
 
@@ -26,6 +52,19 @@ builder.Services.AddHostedService(sp => sp.GetRequiredService<PartitionMaintaine
 // leave TWS still delivering into a socket nobody is waiting on. Kept under HttpClient's own 100s
 // default so the resilience pipeline, not the raw client, is what expires first.
 builder.Services.AddHttpClient<IbkrGatewayClient>((sp, http) =>
+    {
+        var configuration = sp.GetRequiredService<IConfiguration>();
+        ServiceClientConfiguration.ConfigureInternalClient(
+            http, configuration, "IbkrGateway:BaseUrl", "http://localhost:5100");
+    })
+    .DisableAutomaticRetries(TimeSpan.FromSeconds(80));
+
+// A second typed client to the same gateway, for the one caller that must see HOW a chain window was
+// cut rather than only what came back. Kept apart from IbkrGatewayClient because a flattened contract
+// list cannot say "this window is not centred on spot" — IbkrGatewayClient used to have exactly that
+// flattening method and it let a chain the gateway could not centre on spot read as a healthy one all
+// the way into node_assignments. That method is gone now; see OptionChainClient.
+builder.Services.AddHttpClient<OptionChainClient>((sp, http) =>
     {
         var configuration = sp.GetRequiredService<IConfiguration>();
         ServiceClientConfiguration.ConfigureInternalClient(
@@ -117,7 +156,11 @@ app.MapGet("/research/status", (MigrationRunner migrations) =>
 
         return Results.Ok(new
         {
-            migrations = new { state.Status, state.Applied, state.Error },
+            // UnverifiedBaselines is projected deliberately: a checksum backfilled from whatever the
+            // assembly embeds today is an ASSUMPTION about what actually ran, not a measurement of
+            // it, and a count that appears nowhere an operator looks is the same as no count. See
+            // MigrationRunner's provenance remarks and migration 013.
+            migrations = new { state.Status, state.Applied, state.Error, state.UnverifiedBaselines },
         });
     });
 
@@ -197,8 +240,13 @@ app.MapGet("/research/coverage", async (
         return Results.Ok(await coverage.GetCoverageAsync(start, end, cancellationToken));
     });
 
+// The registered grid, not just the assigned rows: what each node was selected FOR, what it is bound
+// to, and the deviation between them. This used to report (node_id, con_id) and nothing else, which
+// is why nine roles per DTE bucket sharing four contracts was invisible from outside the database —
+// every one of those conIds was a live contract with ~100% coverage. Reading `assigned` against
+// `distinctConIds` now answers "is the grid actually 54 contracts?" in one glance.
 app.MapGet("/research/nodes", async (NodeSelector nodeSelector, CancellationToken cancellationToken) =>
-    Results.Ok(await nodeSelector.GetCurrentAssignmentsAsync(cancellationToken)));
+    Results.Ok(await nodeSelector.GetGridReportAsync(cancellationToken)));
 
 // The session calendar, side by side: what the generator produces for a date range, and what
 // research.sessions actually holds for it. Both halves are reported because this is the reference

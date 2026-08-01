@@ -14,15 +14,16 @@ namespace TradingStuff.Tests;
 /// <b>On the oracle.</b> Every minute count asserted below is a published exchange fact, arithmetic
 /// done by hand, and is stated as a literal: NYSE trades 09:30-16:00 ET (390 minutes) and closes
 /// 13:00 on a half day (210); Cboe index options trade 08:30-15:15 CT (405) and close 12:15 on a half
-/// day (225); Cboe GTH runs 19:15 CT the prior evening to 08:15 CT (780); the CME Globex day runs
-/// 17:00 CT the prior evening to 16:00 CT (1,380), truncated to 12:15 CT on a half day (1,155).
+/// day (225); Cboe GTH runs 19:15 CT the prior evening to 08:25 CT (790 — re-measured 2026-08-01,
+/// see ExchangeSessionScheduleTests); the CME Globex day runs 17:00 CT the prior evening to 16:00 CT
+/// (1,380), truncated to 12:15 CT on a half day (1,155) and to 12:00 CT on most US holidays (1,140).
 /// Nothing here re-derives an expectation from a session the code produced, so a wrong calendar entry
 /// or a wrong timezone conversion fails these tests rather than being certified by them.
 /// </para>
 /// <para>
-/// The specific number to watch is 1,185 — one Cboe RTH+GTH recording day. The previous coverage
+/// The specific number to watch is 1,195 — one Cboe RTH+GTH recording day. The previous coverage
 /// denominator was <c>(to - from)</c>, so a trailing-24h report asked for 1,440 minutes of a market
-/// open for 1,185 of them and could not clear the roadmap's 95% acceptance threshold on a flawless
+/// open for 1,195 of them and could not clear the roadmap's 95% acceptance threshold on a flawless
 /// day. That is the defect these tests exist to keep fixed.
 /// </para>
 /// </remarks>
@@ -69,7 +70,7 @@ public sealed class CoverageSessionMinutesTests
     [InlineData(Nyse, 390)]      // 09:30-16:00 ET
     [InlineData(CboeRth, 405)]   // 08:30-15:15 CT — fifteen minutes past the cash close
     [InlineData(CmeEs, 1380)]    // the Globex day, 17:00 CT the prior evening to 16:00 CT (RTH nests inside it)
-    [InlineData(CboeGth, 780)]   // 19:15 CT the prior evening to 08:15 CT
+    [InlineData(CboeGth, 790)]   // 19:15 CT the prior evening to 08:25 CT
     public void A_normal_trading_day_expects_the_published_session_length(string calendar, int minutes) =>
         Assert.Equal(minutes, MinutesOn(Date(2025, 6, 17), calendar));
 
@@ -78,7 +79,7 @@ public sealed class CoverageSessionMinutesTests
     [InlineData(Nyse, 210)]      // 09:30-13:00 ET
     [InlineData(CboeRth, 225)]   // 08:30-12:15 CT
     [InlineData(CmeEs, 1155)]    // 17:00 CT Thursday evening to the 12:15 CT early close
-    [InlineData(CboeGth, 780)]   // unchanged: a GTH session ENDS in the morning, before any early close
+    [InlineData(CboeGth, 790)]   // unchanged: a GTH session ENDS in the morning, before any early close
     public void A_half_day_expects_the_shortened_session_length(string calendar, int minutes)
     {
         var friday = Date(2025, 11, 28);
@@ -92,21 +93,43 @@ public sealed class CoverageSessionMinutesTests
     }
 
     [Theory]
+    // CME is deliberately absent from this list, and the omission is the point: on all four of these
+    // dates Globex equity index traded a shortened session rather than closing (measured off IBKR's
+    // published schedule 2026-08-01 — see ExchangeSessionScheduleTests), except Good Friday 2025-04-18
+    // where it really was shut. Asserting "every calendar expects nothing on a holiday" is what let
+    // CME_ES silently drop a 1,140-minute session per US holiday.
     [InlineData(2025, 11, 27)] // Thanksgiving
     [InlineData(2025, 1, 9)]   // national day of mourning — Jimmy Carter (a closure, not a rule)
     [InlineData(2025, 4, 18)]  // Good Friday
     [InlineData(2025, 6, 19)]  // Juneteenth, an NYSE holiday since 2022
-    public void A_holiday_expects_nothing_at_all(int year, int month, int day)
+    public void A_holiday_expects_nothing_at_all_on_the_equity_calendars(int year, int month, int day)
     {
         var holiday = Date(year, month, day);
 
         // Zero minutes AND zero sessions: a market that was shut must not contribute a denominator,
         // and must not contribute a zero-length one either.
-        foreach (var calendar in new[] { Nyse, CboeRth, CmeEs })
+        foreach (var calendar in new[] { Nyse, CboeRth })
         {
             Assert.Empty(_clock.SessionsBetween(calendar, holiday, holiday));
             Assert.Equal(0, MinutesOn(holiday, calendar));
         }
+    }
+
+    [Theory]
+    // The CME half of the same question, per date rather than as a blanket rule. Good Friday is the
+    // one closure here; the other three are shortened Globex sessions whose denominators must be
+    // present, or a whole recorded day reads as unexpected data.
+    [InlineData(2025, 11, 27, 1140)] // Thanksgiving — 17:00 CT Wednesday to 12:00 CT
+    [InlineData(2025, 1, 9, 930)]    // Jimmy Carter day of mourning — to 08:30 CT
+    [InlineData(2025, 6, 19, 1140)]  // Juneteenth
+    [InlineData(2025, 4, 18, 0)]     // Good Friday 2025 — genuinely shut, no employment report that day
+    public void A_us_holiday_expects_the_shortened_globex_session_cme_actually_trades(
+        int year, int month, int day, int minutes)
+    {
+        var holiday = Date(year, month, day);
+
+        Assert.Equal(minutes, MinutesOn(holiday, CmeEs));
+        Assert.Equal(minutes == 0 ? 0 : 1, _clock.SessionsBetween(CmeEs, holiday, holiday).Count);
     }
 
     [Theory]
@@ -126,19 +149,19 @@ public sealed class CoverageSessionMinutesTests
     // ----------------------------------------------------------------- what the wall clock got wrong
 
     [Fact]
-    public void One_recorded_day_of_spx_is_1185_expected_minutes_not_1440()
+    public void One_recorded_day_of_spx_is_1195_expected_minutes_not_1440()
     {
         // The regression this whole change exists for. 2026-07-31 is a plain Friday: Cboe GTH runs
-        // 00:15-13:15 UTC (780 min) and Cboe RTH 13:30-20:15 UTC (405 min), so a full UTC day of
-        // SPX/SPXW recording ought to produce 1,185 expected minutes. The old denominator was the
-        // window length, 1,440, which put a perfect day at 82% and made the 95% gate unreachable.
+        // 00:15-13:25 UTC (790 min) and Cboe RTH 13:30-20:15 UTC (405 min), so a full UTC day of
+        // SPX/SPXW recording ought to produce 1,195 expected minutes. The old denominator was the
+        // window length, 1,440, which put a perfect day at 83% and made the 95% gate unreachable.
         var day = UtcDay(Date(2026, 7, 31), CboeRth, CboeGth);
 
-        Assert.Equal(1185, SessionMinutes.DistinctMinutes(day));
+        Assert.Equal(1195, SessionMinutes.DistinctMinutes(day));
         Assert.Equal(2, day.Count);
 
         Assert.Equal(Utc(2026, 7, 31, 0, 15), day[0].MeasuredFromUtc);
-        Assert.Equal(Utc(2026, 7, 31, 13, 15), day[0].MeasuredToUtc);
+        Assert.Equal(Utc(2026, 7, 31, 13, 25), day[0].MeasuredToUtc);
         Assert.Equal("GTH", day[0].Label);
 
         Assert.Equal(Utc(2026, 7, 31, 13, 30), day[1].MeasuredFromUtc);
@@ -292,12 +315,14 @@ public sealed class CoverageSessionMinutesTests
     [Fact]
     public void Intersect_minutes_is_zero_when_the_sub_interval_falls_outside_every_session()
     {
-        // Between the 08:15 CT GTH close and the 08:30 CT RTH open the Cboe index book is shut. A
-        // node "assigned" only across that gap contributed nothing that ought to have been recorded,
-        // so its denominator is zero — not a sliver of the (non-existent) session.
+        // Between the 08:25 CT GTH close and the 08:30 CT RTH open the Cboe index book is shut — a
+        // five-minute gap, not the fifteen this test used to assume: the GTH close was re-measured at
+        // 08:25 CT on 2026-08-01 (see ExchangeSessionScheduleTests). A node "assigned" only across
+        // that gap contributed nothing that ought to have been recorded, so its denominator is zero —
+        // not a sliver of the (non-existent) session.
         var day = UtcDay(Date(2026, 7, 31), CboeRth, CboeGth);
 
-        Assert.Equal(0, SessionMinutes.IntersectMinutes(day, Utc(2026, 7, 31, 13, 16), Utc(2026, 7, 31, 13, 29)));
+        Assert.Equal(0, SessionMinutes.IntersectMinutes(day, Utc(2026, 7, 31, 13, 26), Utc(2026, 7, 31, 13, 29)));
     }
 
     [Fact]

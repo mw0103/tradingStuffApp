@@ -226,9 +226,18 @@ public sealed class SessionCalendarPostgresTests
         var thanksgivingWeek = await service.GetPersistedAsync(
             CmeEs, Date(2025, 11, 24), Date(2025, 11, 28), CancellationToken.None);
 
-        // Mon-Wed and Friday trade; Thanksgiving Thursday does not. Two rows per trading date.
-        Assert.Equal(8, thanksgivingWeek.Count);
-        Assert.DoesNotContain(thanksgivingWeek, session => session.TradingDate == Date(2025, 11, 27));
+        // Mon-Wed and Friday trade normally, two rows each. Thanksgiving Thursday carries ONE row:
+        // Globex equity index trades a shortened session (17:00 CT Wednesday to 12:00 CT) rather
+        // than closing, and there is no regular session inside it. This test asserted the Thursday
+        // was absent entirely, which was the defect — nine rows, not eight.
+        Assert.Equal(9, thanksgivingWeek.Count);
+
+        var thanksgiving = thanksgivingWeek.Where(session => session.TradingDate == Date(2025, 11, 27)).ToArray();
+        var shortened = Assert.Single(thanksgiving);
+        Assert.Equal("GTH", shortened.Label);
+        Assert.Equal(Utc(2025, 11, 26, 23, 0), shortened.OpenUtc);
+        Assert.Equal(Utc(2025, 11, 27, 18, 0), shortened.CloseUtc);
+        Assert.True(shortened.IsHalfDay);
 
         var friday = thanksgivingWeek.Where(session => session.TradingDate == Date(2025, 11, 28)).ToArray();
         Assert.Equal(2, friday.Length);

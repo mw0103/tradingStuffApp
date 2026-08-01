@@ -22,9 +22,15 @@ public sealed class OptionChainProviderTests
         {
             LastRequestUri = request.RequestUri;
 
+            // The gateway answers with a window AND how it was cut, not a bare contract array —
+            // see its OptionChainResult. A caller that cannot tell a spot-centred window from a
+            // degraded one is the shape that cost a node grid.
             return Task.FromResult(new HttpResponseMessage(HttpStatusCode.OK)
             {
-                Content = new StringContent("[]", System.Text.Encoding.UTF8, "application/json"),
+                Content = new StringContent(
+                    """{"contracts":[],"spotCentred":true,"referencePrice":100.0,"expiration":"2026-08-26","windowLow":90.0,"windowHigh":110.0,"unavailable":null}""",
+                    System.Text.Encoding.UTF8,
+                    "application/json"),
             });
         }
     }
@@ -47,7 +53,12 @@ public sealed class OptionChainProviderTests
         var uri = Assert.IsType<Uri>(handler.LastRequestUri);
         Assert.Equal("/ibkr/options/chains/SPX", uri.AbsolutePath);
         Assert.Contains("expiration=2026-08-26", uri.Query);
-        Assert.Contains("window=4", uri.Query);
+        // strikeHalfCount, not window. The old name was the ambiguity itself: the gateway reads the
+        // number as a half-COUNT of strikes while a caller selecting by moneyness read it as a
+        // fraction of spot, so `window: 20` meant ±1.3% of SPX to one end and ±20% to the other and
+        // neither end complained. The gateway now takes strikeHalfCount or moneynessHalfWidth, and
+        // this assertion pins that this hop forwards the unambiguous name.
+        Assert.Contains("strikeHalfCount=4", uri.Query);
         Assert.Contains("tradingClass=SPXW", uri.Query);
     }
 

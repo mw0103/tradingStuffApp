@@ -146,7 +146,7 @@ public sealed class OrderIdStorePostgresTests
                 internalOrderId, 101, "DUTEST", "PendingSubmit", CancellationToken.None);
             Assert.IsType<OrderMappingResult.Recorded>(recorded);
 
-            await store.TryUpdateStatusAsync(101, "Filled", 987654321, CancellationToken.None);
+            await store.TryUpdateStatusAsync(101, "Filled", 987654321, true, CancellationToken.None);
         }
 
         // A NEW store instance — the restart. The in-memory tracker is empty, but the map is not.
@@ -185,7 +185,7 @@ public sealed class OrderIdStorePostgresTests
             internalOrderId, 302, "DUTEST", "PendingSubmit", CancellationToken.None));
 
         // Once the status has moved past the recorded sentinel, the guarded delete must refuse.
-        await store.TryUpdateStatusAsync(302, "Submitted", 0, CancellationToken.None);
+        await store.TryUpdateStatusAsync(302, "Submitted", 0, false, CancellationToken.None);
         Assert.False(await store.TryDeleteNeverTransmittedAsync(
             internalOrderId, 302, "PendingSubmit", CancellationToken.None));
     }
@@ -259,6 +259,95 @@ public sealed class OrderIdStorePostgresTests
             Guid.NewGuid(), 1, null, "PendingSubmit", CancellationToken.None);
 
         Assert.IsType<OrderMappingResult.Unavailable>(result);
+    }
+
+    // ---- perm_id provenance (migration 014) ----------------------------------------------------
+    // perm_id is the only order identifier that survives a reconnect or a gateway restart, so a null
+    // one means the row cannot be matched at the broker. It used to be written as NULLIF(permId, 0),
+    // which made "TWS never reported one" and "we had one and lost it" the same column value — on
+    // exactly the orders (rejected, cancelled) whose fate most needs resolving.
+
+    [Fact]
+    public async Task A_terminal_order_TWS_never_gave_a_permId_records_that_as_the_conclusion()
+    {
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var (connectionString, _) = await PrepareAsync(server);
+        using var store = CreateStore(connectionString);
+
+        Assert.IsType<OrderMappingResult.Recorded>(await store.TryRecordPlacementAsync(
+            Guid.NewGuid(), 601, "DUTEST", "PendingSubmit", CancellationToken.None));
+
+        // A rejection: verified live on the paper account, TWS errors 110 and 201 deliver an `error`
+        // callback and nothing else — no openOrder, no orderStatus, so no permId exists to record.
+        await store.TryUpdateStatusAsync(601, "Error110", 0, true, CancellationToken.None);
+
+        Assert.Equal(("never_reported", true), await ReadPermIdStateAsync(connectionString, 601));
+    }
+
+    [Fact]
+    public async Task An_order_with_no_outcome_yet_is_not_called_a_missing_permId()
+    {
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var (connectionString, _) = await PrepareAsync(server);
+        using var store = CreateStore(connectionString);
+
+        Assert.IsType<OrderMappingResult.Recorded>(await store.TryRecordPlacementAsync(
+            Guid.NewGuid(), 602, "DUTEST", "PendingSubmit", CancellationToken.None));
+
+        // A resting limit order. Nothing is missing yet; the permId simply has not arrived.
+        await store.TryUpdateStatusAsync(602, "PreSubmitted", 0, false, CancellationToken.None);
+
+        Assert.Equal(("pending", true), await ReadPermIdStateAsync(connectionString, 602));
+    }
+
+    [Fact]
+    public async Task A_recorded_permId_is_never_erased_by_a_later_update_without_one()
+    {
+        if (ServerConnectionString is not { } server)
+        {
+            return;
+        }
+
+        var (connectionString, _) = await PrepareAsync(server);
+        using var store = CreateStore(connectionString);
+
+        Assert.IsType<OrderMappingResult.Recorded>(await store.TryRecordPlacementAsync(
+            Guid.NewGuid(), 603, "DUTEST", "PendingSubmit", CancellationToken.None));
+
+        await store.TryUpdateStatusAsync(603, "PreSubmitted", 681713841L, false, CancellationToken.None);
+
+        // A cancel of an order this process no longer holds state for reports permId 0. The old
+        // NULLIF wrote the column unconditionally, so this erased the one field that cannot be
+        // recovered from anywhere else afterwards.
+        await store.TryUpdateStatusAsync(603, "Cancelled", 0, true, CancellationToken.None);
+
+        Assert.Equal(("assigned", false), await ReadPermIdStateAsync(connectionString, 603));
+    }
+
+    /// <summary>The row's perm_id_state, and whether perm_id itself is null.</summary>
+    private static async Task<(string State, bool PermIdIsNull)> ReadPermIdStateAsync(
+        string connectionString, int ibkrOrderId)
+    {
+        await using var connection = new Npgsql.NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+
+        await using var command = new Npgsql.NpgsqlCommand(
+            "SELECT perm_id_state, perm_id IS NULL FROM gateway.ibkr_order_map WHERE ibkr_order_id = $1",
+            connection);
+        command.Parameters.AddWithValue(ibkrOrderId);
+
+        await using var reader = await command.ExecuteReaderAsync();
+        Assert.True(await reader.ReadAsync(), $"no order-map row for broker order {ibkrOrderId}");
+
+        return (reader.GetString(0), reader.GetBoolean(1));
     }
 }
 
@@ -341,8 +430,17 @@ public sealed class MigrationChecksumPostgresTests
 
     // Old ledgers (created before this column existed) must upgrade cleanly: a NULL checksum on an
     // already-applied row is a baseline to establish, not a divergence to reject.
+    //
+    // Note what this test does NOT establish, because it looks like it does. It applies a migration,
+    // NULLs its own checksum, and asserts the same value comes back — with the file unchanged by
+    // construction, so the assertion cannot fail whatever the backfill writes, including the wrong
+    // thing. It says nothing about whether the blessed value is what actually ran. The assertion
+    // added at the end is the part that can fail: the baseline must be recorded as ASSUMED, since
+    // the runner cannot know that this database's copy of the file is the one that ran. The case it
+    // cannot see — a database whose file diverged before the upgrade — is covered by
+    // MigrationProvenancePostgresTests.
     [Fact]
-    public async Task An_old_ledger_row_with_no_checksum_is_backfilled_not_rejected()
+    public async Task An_old_ledger_row_with_no_checksum_is_backfilled_as_an_assumed_baseline()
     {
         if (ServerConnectionString is not { } server)
         {
@@ -363,8 +461,19 @@ public sealed class MigrationChecksumPostgresTests
         await using (var connection = new Npgsql.NpgsqlConnection(connectionString))
         {
             await connection.OpenAsync();
+            // Separate commands: a parameterised statement goes out on the extended protocol, which
+            // cannot carry two statements in one round trip.
+            await using (var drop = new Npgsql.NpgsqlCommand(
+                "ALTER TABLE research.schema_migrations " +
+                "DROP CONSTRAINT IF EXISTS schema_migrations_checksum_provenance",
+                connection))
+            {
+                await drop.ExecuteNonQueryAsync();
+            }
+
             await using var clear = new Npgsql.NpgsqlCommand(
-                "UPDATE research.schema_migrations SET checksum = NULL WHERE name = $1", connection);
+                "UPDATE research.schema_migrations SET checksum = NULL, checksum_source = NULL WHERE name = $1",
+                connection);
             clear.Parameters.AddWithValue(name);
             await clear.ExecuteNonQueryAsync();
         }
@@ -376,12 +485,17 @@ public sealed class MigrationChecksumPostgresTests
         {
             await connection.OpenAsync();
             await using var check = new Npgsql.NpgsqlCommand(
-                "SELECT checksum FROM research.schema_migrations WHERE name = $1", connection);
+                "SELECT checksum, checksum_source FROM research.schema_migrations WHERE name = $1", connection);
             check.Parameters.AddWithValue(name);
-            var backfilled = (string?)await check.ExecuteScalarAsync();
 
-            Assert.Equal(checksum, backfilled);
+            await using var reader = await check.ExecuteReaderAsync();
+            Assert.True(await reader.ReadAsync());
+
+            Assert.Equal(checksum, reader.GetString(0));
+            Assert.Equal(ChecksumProvenance.Assumed, reader.GetString(1));
         }
+
+        Assert.Contains(name, runner.UnverifiedBaselines);
     }
 
     // The observed live failure mode: a migration applied by hand outside the runner leaves its

@@ -283,6 +283,126 @@ public sealed class SubscriptionLeaseLifetimeTests
     }
 
     [Fact]
+    public async Task A_grant_across_a_replay_trigger_does_not_double_charge_the_line_ledger()
+    {
+        // The multi-lease sibling of the test above, and the reason it needs one: with a single
+        // lease there is nothing for a redundant re-issue to double-charge, so that test passes
+        // just as happily against a fix that re-issues the whole book and leaks a line for every
+        // lease it touches. Production scale (57 node leases, the default 90-line cap with 10
+        // reserved for execution) is load-bearing here — below ~23 leases the leak fits inside the
+        // budget and every assertion still passes.
+        //
+        // The interleaving, which is the ordinary two-minute cadence of RecorderOrchestrator
+        // meeting an ordinary 1101:
+        //   thread A  GrantAsync samples _replayEpoch, then parks inside AcquireLineAsync
+        //   thread B  the EReader pump raises SubscriptionsMustReplay: ledger zeroed, epoch bumped,
+        //             pass P1 re-issues all 57 standing leases against the fresh ledger
+        //   thread A  resumes, publishes, joins _leases, re-reads the epoch, sees it moved
+        // Whatever thread A does next runs with a ledger that is NOT zeroed and 57 lines that are
+        // genuinely held. A re-issue that displaces a live LineLease without disposing it therefore
+        // charges a second line for every subscription it replaces, and the 80-line research budget
+        // is gone in one pass.
+        const int standingLeases = 57;
+
+        // Only the acquire timeout is moved off its default: a leak drives later re-issues into
+        // that timeout, and 30s each would put this test in the minutes.
+        var (manager, transport, governor) = Create(new IbkrPacingOptions { AcquireTimeoutSeconds = 1 });
+
+        for (var index = 0; index < standingLeases; index++)
+        {
+            await manager.GrantAsync(Request(1000 + index), CancellationToken.None);
+        }
+
+        Assert.Equal(standingLeases, governor.GetLineBudget().ResearchInUse);
+
+        transport.ParkSubscribe(conId: 2000, occurrence: 1);
+        var grant = manager.GrantAsync(Request(2000), CancellationToken.None);
+        await transport.SubscribeReachedAsync(2000, 1).WaitAsync(TestTimeout);
+
+        governor.ResetLineLedgerForReconnect();
+        await manager.ReplayAsync(CancellationToken.None).WaitAsync(TestTimeout);
+
+        // P1 could not see the parked grant, so it re-issued exactly the 57 it could: one line each
+        // against the zeroed ledger. The parked grant's own line predates the reset and was zeroed
+        // with everything else.
+        Assert.Equal(standingLeases, governor.GetLineBudget().ResearchInUse);
+
+        transport.ResumeSubscribe(2000, 1);
+        await grant.WaitAsync(TestTimeout);
+
+        await SettleSubscribesAsync(transport);
+
+        Assert.True(
+            governor.GetLineBudget().ResearchInUse == standingLeases + 1,
+            $"one line per live lease, but {Describe(transport, governor)}");
+
+        foreach (var lease in manager.ActiveLeases())
+        {
+            Assert.True(await manager.ReleaseAsync(lease.LeaseId, CancellationToken.None));
+        }
+
+        Assert.True(
+            governor.GetLineBudget().ResearchInUse == 0,
+            $"every line handed back, but {Describe(transport, governor)}");
+
+        // Exact pairing rather than a count: it is the difference between "as many lines came back
+        // as went out" and "the subscription TWS is still streaming is the one nobody cancelled".
+        Assert.Equal(
+            transport.Subscribed.Select(call => call.TickerId).Order().ToArray(),
+            transport.Unsubscribed.Order().ToArray());
+
+        Assert.Empty(transport.Registered);
+    }
+
+    [Fact]
+    public async Task A_replay_that_fails_with_no_reconnect_behind_it_keeps_the_line_the_lease_still_holds()
+    {
+        // The failure branch of the same false assumption, and it has to be pinned separately
+        // because the success branch above never reaches it. ForgetLineLease used to drop the
+        // lease's LineLease in RunReplayPassAsync's catch, documented as safe because "the lease's
+        // LineLease predates the reconnect's ResetLineLedgerForReconnect and no longer corresponds
+        // to anything real". A replay pass does not need a reset behind it — ReplayAsync is callable
+        // on its own, and the grant path used to fire one — so on that path the reference dropped
+        // was a CURRENT-epoch line the lease was genuinely holding, over a ticker TWS was genuinely
+        // still streaming. TerminateAsync then found lineLease == null, skipped UnsubscribeAsync,
+        // and neither the line nor the subscription ever came back. Silent: the lease keeps its old
+        // ticker, keeps recording, keeps heartbeating, and still reports healthy.
+        //
+        // Nothing forgets any more. LineLease carries its ledger epoch and ReleaseLine ignores a
+        // superseded one, so retaining the reference is a no-op after a real reset and the correct
+        // release without one — the precondition is enforced where it is knowable instead of
+        // assumed at a call site three removes away.
+
+        // Research cap 2 (cap 3 less the execution reserve), exactly consumed by the two standing
+        // leases, so every re-issue in the pass below runs out its acquire timeout and throws.
+        var (manager, transport, governor) = Create(
+            new IbkrPacingOptions { LineCap = 3, ExecutionReservedLines = 1, AcquireTimeoutSeconds = 1 });
+
+        var first = await manager.GrantAsync(Request(41), CancellationToken.None);
+        var second = await manager.GrantAsync(Request(42), CancellationToken.None);
+        Assert.Equal(2, governor.GetLineBudget().ResearchInUse);
+
+        var originalTickers = transport.Subscribed.Select(call => call.TickerId).Order().ToArray();
+
+        // No ResetLineLedgerForReconnect anywhere: a same-epoch pass, both of whose re-issues fail.
+        await manager.ReplayAsync(CancellationToken.None).WaitAsync(TestTimeout);
+
+        Assert.Equal(2, governor.GetLineBudget().ResearchInUse);
+
+        Assert.True(await manager.ReleaseAsync(first.LeaseId, CancellationToken.None));
+        Assert.True(await manager.ReleaseAsync(second.LeaseId, CancellationToken.None));
+
+        Assert.True(
+            governor.GetLineBudget().ResearchInUse == 0,
+            $"a failed reissue stranded the line its lease still held: {Describe(transport, governor)}");
+
+        // And the subscription, not merely the ledger entry: what TWS is still streaming are the
+        // tickers from the original grants, so those are the ones that have to be cancelled.
+        Assert.Equal(originalTickers, transport.Unsubscribed.Order().ToArray());
+        Assert.Empty(transport.Registered);
+    }
+
+    [Fact]
     public async Task A_lease_granted_with_no_replay_trigger_in_flight_is_not_reissued()
     {
         // The negative half of the test above, and the reason the fix uses an epoch rather than
@@ -310,7 +430,7 @@ public sealed class SubscriptionLeaseLifetimeTests
         // Driven from BeforeReplayGateRelease rather than from concurrency: see that property's
         // remarks — a stress test does not reach this window, and one that pretends to would report
         // the defect as absent.
-        var (manager, transport, _) = Create(new IbkrPacingOptions { LineCap = 10_000 });
+        var (manager, transport, governor) = Create();
 
         await manager.GrantAsync(Request(32), CancellationToken.None);
         var subscribesBeforeReplay = transport.Subscribed.Count;
@@ -332,6 +452,10 @@ public sealed class SubscriptionLeaseLifetimeTests
 
         // Two passes, not one: the straggler was served rather than swallowed.
         Assert.Equal(subscribesBeforeReplay + 2, transport.Subscribed.Count);
+
+        // And two passes cost one line, not three. No reconnect reset happened here, so every line
+        // both passes displaced was a live one.
+        Assert.Equal(1, governor.GetLineBudget().ResearchInUse);
     }
 
     [Fact]
@@ -345,12 +469,17 @@ public sealed class SubscriptionLeaseLifetimeTests
         // trigger arriving in that gap finds the gate held by a loop that has already decided to
         // exit).
         //
-        // A high line cap because a replay deliberately drops the displaced LineLease without
-        // disposing it — correct in production, where ResetLineLedgerForReconnect has already zeroed
-        // the ledger, but across a few hundred synthetic passes it would exhaust the default budget.
-        var (manager, transport, _) = Create(new IbkrPacingOptions { LineCap = 10_000 });
+        // On the DEFAULT line cap, which is now itself an assertion. This test used to run with
+        // LineCap = 10_000 because a replay dropped the displaced LineLease without disposing it,
+        // and a few hundred synthetic passes exhausted the real budget — the leak was seen here,
+        // worked around, and written up in a comment as correct-in-production. It was not: the grant
+        // path re-issued with no ledger reset in front of it, and one pass over 57 leases consumed
+        // the entire research budget (A_grant_across_a_replay_trigger_does_not_double_charge_the_
+        // line_ledger). A test that raises the ceiling to walk past the thing it tripped over is
+        // worse than no test, because it reports the defect as absent.
+        var (manager, transport, governor) = Create();
 
-        await manager.GrantAsync(Request(31), CancellationToken.None);
+        var lease = await manager.GrantAsync(Request(31), CancellationToken.None);
 
         for (var round = 0; round < 40; round++)
         {
@@ -365,10 +494,62 @@ public sealed class SubscriptionLeaseLifetimeTests
             await Task.WhenAll(Enumerable.Range(0, 4).Select(_ => TriggerAsync())).WaitAsync(TestTimeout);
 
             Assert.False(manager.ReplayPassOwed);
+
+            // One lease, one line, however many passes have run. No reconnect reset happens in this
+            // test, so every displaced line is a current-epoch line the ledger really is holding and
+            // a pass that fails to hand it back shows up here immediately rather than 90 passes
+            // later as an acquire timeout.
+            Assert.Equal(1, governor.GetLineBudget().ResearchInUse);
         }
 
-        // Sanity: the passes really did run, so the assertion above was not vacuous.
+        // Sanity: the passes really did run, so the assertions above were not vacuous.
         Assert.True(transport.Subscribed.Count > 40, $"only {transport.Subscribed.Count} subscribes happened");
+
+        // Every subscribe but the live one has already been cancelled by the reissue that displaced
+        // it; releasing the lease accounts for the last.
+        Assert.True(await manager.ReleaseAsync(lease.LeaseId, CancellationToken.None));
+
+        Assert.Equal(0, governor.GetLineBudget().ResearchInUse);
+        Assert.Equal(
+            transport.Subscribed.Select(call => call.TickerId).Order().ToArray(),
+            transport.Unsubscribed.Order().ToArray());
+        Assert.Empty(transport.Registered);
+    }
+
+    private static string Describe(FakeSubscriptionTransport transport, IbkrPacingGovernor governor) =>
+        $"researchInUse={governor.GetLineBudget().ResearchInUse} subscribes={transport.Subscribed.Count} " +
+        $"unsubscribes={transport.Unsubscribed.Count} registeredSinks={transport.Registered.Count}";
+
+    /// <summary>Waits until the transport has been quiet for a moment, or gives up and lets the assertions speak.</summary>
+    /// <remarks>
+    /// The re-issue a grant fires is deliberately not awaited — the caller must not be held behind
+    /// it — so there is no handle to join on, and no count to wait FOR either: a test that waits for
+    /// the number it expects reports a leak as a timeout rather than as the leak it is. Quiescence
+    /// is the only condition that describes both outcomes, and it deliberately does not assert.
+    /// </remarks>
+    private static async Task SettleSubscribesAsync(FakeSubscriptionTransport transport)
+    {
+        var quiet = TimeSpan.FromMilliseconds(400);
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(90);
+        var lastCount = -1;
+        var lastChanged = DateTime.UtcNow;
+
+        while (DateTime.UtcNow < deadline)
+        {
+            var count = transport.Subscribed.Count;
+
+            if (count != lastCount)
+            {
+                lastCount = count;
+                lastChanged = DateTime.UtcNow;
+            }
+            else if (DateTime.UtcNow - lastChanged > quiet)
+            {
+                return;
+            }
+
+            await Task.Delay(TimeSpan.FromMilliseconds(25));
+        }
     }
 
     private static async Task WaitUntilAsync(Func<bool> condition)

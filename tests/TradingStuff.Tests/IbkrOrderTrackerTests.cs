@@ -440,4 +440,234 @@ public sealed class IbkrOrderTrackerTests
         Assert.Null(tracker.Get(999));
         Assert.Empty(tracker.All());
     }
+
+    // ---- permId: the only identifier that survives a reconnect --------------------------------
+    // ApplyError makes an order terminal without touching _permId, because the TWS error callback
+    // carries no permId at all. ApplyStatus then early-returned on an already-terminal order, so the
+    // trailing orderStatus that DOES carry one was discarded — and the order-map write turns a zero
+    // permId into a NULL column. Precisely the orders whose fate is most ambiguous (rejected,
+    // cancelled) were the ones stored without the identifier reconciliation has to key on.
+
+    [Fact]
+    public void A_permId_reported_after_a_rejection_is_still_recorded()
+    {
+        // The live sequence this project has already observed and encoded above: TWS rejects with
+        // 163, then cancels the order, and the Cancelled orderStatus is where the permId arrives.
+        var tracker = TrackedOrder(41, out _);
+
+        tracker.ApplyError(41, 163, "price exceeds the Percentage constraint of 3%");
+        tracker.ApplyOrderStatus(41, "Cancelled", 0m, 1m, 0d, 2035059402L, string.Empty);
+
+        var state = tracker.Get(41)!;
+        Assert.Equal(2035059402L, state.PermId);
+
+        // Still refused, though. Taking the identity off a late callback must not take its status.
+        Assert.Equal(OrderLifecycleStatus.Failed, state.Status);
+        Assert.Equal("Error163", state.RawStatus);
+    }
+
+    [Fact]
+    public void A_permId_first_seen_on_the_open_order_callback_is_recorded()
+    {
+        // Verified live on the paper account: openOrder is the FIRST message TWS sends for an order
+        // it accepts, ahead of the first orderStatus. It was the one order callback carrying a permId
+        // that the tracker never read.
+        //
+        // Driven through IbkrClientWrapper rather than by calling the tracker directly, because the
+        // defect was that nothing routed the callback: a test calling ApplyOpenOrder itself passes
+        // just as happily with the wiring deleted, which makes it a test of the wrong thing.
+        var tracker = TrackedOrder(42, out _);
+        var wrapper = new IbkrClientWrapper(
+            new IbkrRequestRegistry(), tracker, LoggerFactory.Create(_ => { }).CreateLogger<IbkrClientWrapper>());
+
+        wrapper.openOrder(
+            42,
+            new Contract { Symbol = "SPY", SecType = "BAG" },
+            new Order { PermId = 681713841L, Action = "BUY", OrderType = "LMT", TotalQuantity = 1m },
+            new OrderState { Status = "PreSubmitted" });
+
+        Assert.Equal(681713841L, tracker.Get(42)!.PermId);
+    }
+
+    [Fact]
+    public void A_permId_from_an_execution_is_recorded_when_no_status_carried_one()
+    {
+        // execDetails carries it too, which is what recovers the identifier for an order that
+        // partially filled and was then killed by an error before any status reported one.
+        var tracker = TrackedOrder(43, out _);
+
+        tracker.ApplyExecution(
+            Leg(1001),
+            new Execution { OrderId = 43, ExecId = "p1", Shares = 1m, Price = 1.05d, PermId = 555555L });
+
+        Assert.Equal(555555L, tracker.Get(43)!.PermId);
+    }
+
+    [Fact]
+    public void A_recorded_permId_is_never_replaced_by_a_later_zero()
+    {
+        // Zero is IBKR's not-set sentinel, not a value — Execution.PermId is documented as 0 for
+        // trades originating outside IB. Letting one land would erase the real identifier.
+        var tracker = TrackedOrder(44, out _);
+
+        tracker.ApplyOrderStatus(44, "Submitted", 0m, 1m, 0d, 777777L, string.Empty);
+        tracker.ApplyExecution(Leg(1001), new Execution { OrderId = 44, ExecId = "q1", Shares = 1m, Price = 1.0d });
+        tracker.ApplyOpenOrder(44, 0L);
+
+        Assert.Equal(777777L, tracker.Get(44)!.PermId);
+    }
+
+    // ---- the error path can never settle the fills ---------------------------------------------
+    // The fill-settle rewrite made _filled the authoritative total, and its comment argued the
+    // predicate could only ever over-estimate. That holds for the orderStatus path it was reasoning
+    // about and fails for ApplyError, which makes an order terminal without touching _filled: an
+    // order cancelled by TWS 202 after a partial fill matched its executions against the last WORKING
+    // status's quantity and latched FillsSettled on a fill list that was short by everything filled
+    // since. The latch cannot be un-set, so ExecutionService persisted the truncated version.
+
+    [Fact]
+    public async Task A_partial_fill_cancelled_by_TWS_does_not_settle_on_the_stale_total()
+    {
+        var tracker = TrackedOrder(51, out _);
+
+        var settlement = tracker.WaitForSettlementAsync(
+            51, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(5), CancellationToken.None);
+
+        // 3 of 5 spreads have filled, fully reported, and the order is still working.
+        tracker.ApplyOrderStatus(51, "Submitted", 3m, 2m, 1.20d, 100L, string.Empty);
+        tracker.ApplyExecution(Leg(1001), new Execution { OrderId = 51, ExecId = "g1", Shares = 3m, Price = 1.60d });
+        tracker.ApplyCommission(new CommissionAndFeesReport { ExecId = "g1", CommissionAndFees = 2.1d });
+        tracker.ApplyExecution(Leg(1002), new Execution { OrderId = 51, ExecId = "h1", Shares = 3m, Price = 0.40d });
+        tracker.ApplyCommission(new CommissionAndFeesReport { ExecId = "h1", CommissionAndFees = 2.1d });
+
+        // TWS cancels the remainder. This callback carries no quantity, so nothing here can say the
+        // 3 is final — and by the time it arrives, 5 have filled.
+        tracker.ApplyError(51, 202, "Order Canceled - reason:");
+
+        Assert.False(
+            await SettledWithinAsync(settlement),
+            "The error callback reports no quantity, so the fill total it was matched against is a " +
+            "lower bound, not a total.");
+
+        // The terminal orderStatus is the one that does carry a final quantity.
+        tracker.ApplyOrderStatus(51, "Cancelled", 5m, 0m, 1.21d, 100L, string.Empty);
+        tracker.ApplyExecution(Leg(1001), new Execution { OrderId = 51, ExecId = "g2", Shares = 2m, Price = 1.61d });
+        tracker.ApplyCommission(new CommissionAndFeesReport { ExecId = "g2", CommissionAndFees = 1.4d });
+        tracker.ApplyExecution(Leg(1002), new Execution { OrderId = 51, ExecId = "h2", Shares = 2m, Price = 0.41d });
+        tracker.ApplyCommission(new CommissionAndFeesReport { ExecId = "h2", CommissionAndFees = 1.4d });
+
+        var state = await settlement.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(4, state!.Fills.Count);
+        Assert.Equal(10, state.Fills.Sum(fill => fill.Quantity));
+        Assert.Equal(5m, state.Filled);
+        Assert.Equal(7.0m, state.Commission);
+
+        // Absorbing the late quantity must not have revived the order.
+        Assert.Equal(OrderLifecycleStatus.Cancelled, state.Status);
+        Assert.Equal("Error202", state.RawStatus);
+    }
+
+    [Fact]
+    public async Task An_error_ended_order_whose_total_is_never_confirmed_says_so_out_loud()
+    {
+        // The other half: when no terminal orderStatus ever arrives, the order must not quietly
+        // report a fill list as though it were settled. It waits out the grace and warns, and the
+        // warning has to name WHICH kind of incomplete this is — the per-leg figures read "3/3"
+        // because they are measured against an unconfirmed total, which without that sentence looks
+        // exactly like a leg that has finished.
+        var logger = new CollectingLogger();
+        var tracker = new IbkrOrderTracker(logger);
+        tracker.TryTrack(52, Guid.NewGuid(), Guid.NewGuid(), VerticalLegs);
+
+        var settlement = tracker.WaitForSettlementAsync(
+            52, TimeSpan.FromSeconds(5), TimeSpan.FromMilliseconds(150), CancellationToken.None);
+
+        tracker.ApplyOrderStatus(52, "Submitted", 3m, 2m, 1.20d, 100L, string.Empty);
+        tracker.ApplyExecution(Leg(1001), new Execution { OrderId = 52, ExecId = "i1", Shares = 3m, Price = 1.60d });
+        tracker.ApplyCommission(new CommissionAndFeesReport { ExecId = "i1", CommissionAndFees = 2.1d });
+        tracker.ApplyExecution(Leg(1002), new Execution { OrderId = 52, ExecId = "j1", Shares = 3m, Price = 0.40d });
+        tracker.ApplyCommission(new CommissionAndFeesReport { ExecId = "j1", CommissionAndFees = 2.1d });
+
+        tracker.ApplyError(52, 202, "Order Canceled - reason:");
+
+        var state = await settlement.WaitAsync(TimeSpan.FromSeconds(3));
+
+        Assert.Equal(OrderLifecycleStatus.Cancelled, state!.Status);
+        Assert.Contains(
+            logger.Entries,
+            entry => entry.Level == LogLevel.Warning && entry.Message.Contains("NOT CONFIRMED", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public async Task A_rejected_order_with_nothing_filled_still_costs_no_grace()
+    {
+        // The counterweight to the two above: refusing to settle the fill list must not turn every
+        // rejection into a grace timeout. A rejected order has no executions and no filled quantity,
+        // so there is nothing outstanding to wait for. Verified live on the paper account: TWS errors
+        // 110 and 201 produce an error callback and nothing else at all.
+        var tracker = TrackedOrder(53, out _);
+
+        var settlement = tracker.WaitForSettlementAsync(
+            53, TimeSpan.FromSeconds(5), TimeSpan.FromSeconds(30), CancellationToken.None);
+
+        tracker.ApplyError(53, 110, "The price does not conform to the minimum price variation for this contract.");
+
+        var state = await settlement.WaitAsync(TimeSpan.FromSeconds(2));
+
+        Assert.Equal(OrderLifecycleStatus.Failed, state!.Status);
+        Assert.Empty(state.Fills);
+    }
+
+    [Fact]
+    public async Task A_replayed_status_reporting_less_than_is_recorded_cannot_shrink_the_total()
+    {
+        // orderStatus replays after a reconnect, and the late-absorption path above is the only place
+        // a terminal order's quantities can still move. Monotone, so a trailing message carrying an
+        // older figure cannot lower the total the fill list is checked against — which would settle a
+        // short list all over again, by the opposite route.
+        var tracker = TrackedOrder(54, out _);
+
+        var settlement = tracker.WaitForSettlementAsync(
+            54, TimeSpan.FromSeconds(5), TimeSpan.FromMilliseconds(150), CancellationToken.None);
+
+        tracker.ApplyOrderStatus(54, "Filled", 5m, 0m, 1.30d, 101L, string.Empty);
+        tracker.ApplyExecution(Leg(1001), new Execution { OrderId = 54, ExecId = "k1", Shares = 5m, Price = 1.70d });
+        tracker.ApplyCommission(new CommissionAndFeesReport { ExecId = "k1", CommissionAndFees = 3.5d });
+        tracker.ApplyExecution(Leg(1002), new Execution { OrderId = 54, ExecId = "l1", Shares = 2m, Price = 0.40d });
+        tracker.ApplyCommission(new CommissionAndFeesReport { ExecId = "l1", CommissionAndFees = 1.4d });
+
+        // A replay of an earlier, smaller picture of the same order.
+        tracker.ApplyOrderStatus(54, "Submitted", 2m, 3m, 1.28d, 101L, string.Empty);
+
+        var state = await settlement.WaitAsync(TimeSpan.FromSeconds(3));
+
+        Assert.Equal(5m, state!.Filled);
+        Assert.Equal(1.30m, state.AverageFillPrice);
+
+        // Leg 1 is still 3 contracts short of the real total, so the record is returned incomplete
+        // rather than settled against the replayed 2.
+        Assert.Equal(7, state.Fills.Sum(fill => fill.Quantity));
+    }
+
+    /// <summary>
+    /// Captures level and rendered message. The grace-expiry warning exists to be read by an
+    /// operator, so the test asserts on the text rather than on the fact that something was logged.
+    /// </summary>
+    private sealed class CollectingLogger : ILogger<IbkrOrderTracker>
+    {
+        public List<(LogLevel Level, string Message)> Entries { get; } = [];
+
+        public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+
+        public bool IsEnabled(LogLevel logLevel) => true;
+
+        public void Log<TState>(
+            LogLevel logLevel,
+            EventId eventId,
+            TState state,
+            Exception? exception,
+            Func<TState, Exception?, string> formatter) =>
+            Entries.Add((logLevel, formatter(state, exception)));
+    }
 }

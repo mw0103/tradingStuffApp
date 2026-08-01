@@ -201,19 +201,49 @@ public sealed class IbkrMarketDataClient(
     // ---- chains -----------------------------------------------------------------------------
 
     /// <summary>
-    /// Returns a strike window of the chain for one expiration, centred on spot.
+    /// Returns the contracts IBKR actually lists for one expiration, restricted to a window around spot.
     /// </summary>
+    /// <param name="strikeHalfCount">
+    /// Window expressed as a COUNT of strikes each side of spot — <c>20</c> means the 41 strikes
+    /// nearest spot, NOT ±20% and not ±20 anything else. Ignored when
+    /// <paramref name="moneynessHalfWidth"/> is supplied. Null uses <see cref="IbkrOptions.ChainStrikeWindow"/>.
+    /// </param>
+    /// <param name="moneynessHalfWidth">
+    /// Window expressed as a FRACTION of spot — <c>0.20m</c> means <c>spot × [0.80, 1.20]</c>. Wins
+    /// over <paramref name="strikeHalfCount"/> when both are given. This exists because a caller
+    /// selecting strikes by moneyness cannot express its requirement as a strike count: how far
+    /// 41 strikes reaches depends entirely on the local strike increment, which for SPX is 5 points
+    /// near the money — so <c>strikeHalfCount: 20</c> covers ±1.3% of a 7,440 spot, and a caller
+    /// asking for ±15% silently gets the window's edge instead. Measured live 2026-08-01, SPX at
+    /// 7437.63: reaching ±15% needs ~423 strikes each side. Say what you mean instead.
+    /// </param>
     /// <remarks>
-    /// TWS returns expirations and strikes as two independent sets, not a validated cross-product —
-    /// not every (expiry, strike) pair is actually listed. Contracts returned here are therefore
-    /// candidates; resolving one to a conId is what proves it exists.
+    /// Two things about the shape of this, both of which cost real data before they were understood.
+    /// <para>
+    /// <b>The strikes come from <c>reqContractDetails</c>, not <c>reqSecDefOptParams</c>.</b> The
+    /// latter returns expirations and strikes as two independent sets whose cross-product is NOT the
+    /// listed chain — the strike set is the union across every expiration in the class, and a strike
+    /// listed for one expiration is frequently not listed for another. Verified live 2026-08-01:
+    /// SPXW 2026-08-06 P 6620 is in the union and resolves to error 200 (no security definition),
+    /// while 6625 resolves fine; at 2026-09-14 the near-the-money increment is 25 points, so 6990 is
+    /// likewise a phantom. Windowing the union therefore yields contracts that do not exist for
+    /// exactly the far-from-the-money nodes a research grid cares about. One
+    /// <c>reqContractDetails</c> for the whole expiration returns the real ladder WITH conIds
+    /// (476 rows/270 ms … 1004 rows/5.1 s, measured live), which also warms
+    /// <see cref="_optionConIds"/> and makes the caller's subsequent per-contract resolution free —
+    /// so this costs one paced request and saves several.
+    /// </para>
+    /// <para>
+    /// <b>The window is never silently degraded.</b> See <see cref="OptionChainResult"/>.
+    /// </para>
     /// </remarks>
-    public async Task<IReadOnlyList<OptionContract>> GetOptionChainAsync(
+    public async Task<OptionChainResult> GetOptionChainAsync(
         string underlying,
         DateOnly? expiration,
-        int? strikeWindow,
+        int? strikeHalfCount,
         CancellationToken cancellationToken,
-        string? tradingClass = null)
+        string? tradingClass = null,
+        decimal? moneynessHalfWidth = null)
     {
         var symbol = underlying.ToUpperInvariant();
         var definition = await ResolveUnderlyingAsync(symbol, cancellationToken);
@@ -230,7 +260,7 @@ public sealed class IbkrMarketDataClient(
 
         if (segments.Count == 0)
         {
-            return [];
+            return OptionChainResult.NotAvailable($"TWS listed no option chain segments for {symbol}.");
         }
 
         foreach (var candidate in segments)
@@ -267,46 +297,133 @@ public sealed class IbkrMarketDataClient(
 
         if (expirations.Length == 0)
         {
-            return [];
+            return OptionChainResult.NotAvailable($"TWS listed no parseable expirations for {symbol}.");
         }
 
         var target = SelectExpiration(expirations, expiration);
         var spot = await TryGetSpotPriceAsync(symbol, definition, cancellationToken);
-        var window = strikeWindow ?? _options.ChainStrikeWindow;
-
-        var strikes = segment.Strikes
-            .Where(strike => strike > 0d)
-            .Select(strike => (decimal)strike)
-            .Distinct()
-            .OrderBy(strike => strike)
-            .ToArray();
-
-        var selected = spot is null
-            ? strikes
-            : strikes
-                .OrderBy(strike => Math.Abs(strike - spot.Value))
-                .Take((window * 2) + 1)
-                .OrderBy(strike => strike)
-                .ToArray();
 
         if (spot is null)
         {
+            // Refuse, loudly, rather than returning the whole strike list and letting it read as a
+            // window. See OptionChainResult's remarks: the degraded response was indistinguishable
+            // from a healthy one at every caller, which is how it cost a full node grid.
             logger.LogWarning(
-                "No spot price for {Underlying}; returning the full strike list rather than a window.",
+                "No spot price for {Underlying}; refusing to return a chain window that is not centred on spot.",
                 symbol);
+
+            return OptionChainResult.NotAvailable(
+                $"No spot price is available for {symbol}, so no window can be centred on it.", target);
         }
 
-        var multiplier = int.TryParse(segment.Multiplier, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedMultiplier)
-            ? parsedMultiplier
-            : 100;
+        var listed = await ListExpirationAsync(symbol, target, segment, cancellationToken);
 
-        return selected
-            .SelectMany(strike => new[]
+        if (listed.Count == 0)
+        {
+            return OptionChainResult.NotAvailable(
+                $"TWS lists no {segment.TradingClass} contracts for {symbol} expiring {target:yyyy-MM-dd}.", target);
+        }
+
+        var strikes = listed.Select(contract => contract.Strike).Distinct().OrderBy(strike => strike).ToArray();
+
+        var selected = moneynessHalfWidth is { } halfWidth && halfWidth > 0m
+            ? strikes.Where(strike =>
+                strike >= spot.Value * (1m - halfWidth) && strike <= spot.Value * (1m + halfWidth)).ToArray()
+            : strikes
+                .OrderBy(strike => Math.Abs(strike - spot.Value))
+                .Take(((strikeHalfCount ?? _options.ChainStrikeWindow) * 2) + 1)
+                .OrderBy(strike => strike)
+                .ToArray();
+
+        if (selected.Length == 0)
+        {
+            return OptionChainResult.NotAvailable(
+                $"No listed {segment.TradingClass} strike for {symbol} {target:yyyy-MM-dd} falls inside the " +
+                $"requested window around {spot.Value}.", target);
+        }
+
+        var keep = selected.ToHashSet();
+        var contracts = listed.Where(contract => keep.Contains(contract.Strike)).ToArray();
+
+        logger.LogDebug(
+            "Chain window for {Underlying} {TradingClass} {Expiration}: {Contracts} contract(s) over strikes " +
+            "{Low}-{High}, spot {Spot}, from {Listed} listed.",
+            symbol, segment.TradingClass, target, contracts.Length, selected[0], selected[^1], spot.Value, listed.Count);
+
+        return new OptionChainResult(
+            contracts, SpotCentred: true, spot.Value, target, selected[0], selected[^1], Unavailable: null);
+    }
+
+    /// <summary>
+    /// The real listed ladder for one expiration, straight from <c>reqContractDetails</c>, with each
+    /// contract's conId cached on the way past.
+    /// </summary>
+    private async Task<IReadOnlyList<OptionContract>> ListExpirationAsync(
+        string symbol,
+        DateOnly expiration,
+        OptionChainSegment segment,
+        CancellationToken cancellationToken)
+    {
+        IReadOnlyList<ContractDetails> details;
+
+        try
+        {
+            details = await RequestListAsync<ContractDetails>(
+                (requestId, ct) => socket.ReqContractDetailsAsync(requestId, new IbContract
+                {
+                    Symbol = symbol,
+                    SecType = "OPT",
+                    // SMART, not segment.Exchange: the segment is identified by its trading class
+                    // (see SelectChainSegment) and its exchange field is frequently not the one to
+                    // route on. Verified live for both SPX and SPXW.
+                    Exchange = "SMART",
+                    Currency = "USD",
+                    LastTradeDateOrContractMonth = expiration.ToString(ExpirationFormat, CultureInfo.InvariantCulture),
+                    TradingClass = segment.TradingClass,
+                    Multiplier = segment.Multiplier,
+                }, ct),
+                cancellationToken);
+        }
+        catch (IbkrRequestException ex) when (ex.ErrorCode == IbkrErrorCodes.NoSecurityDefinition)
+        {
+            logger.LogWarning(
+                "TWS lists no {TradingClass} contracts for {Symbol} expiring {Expiration}.",
+                segment.TradingClass, symbol, expiration);
+            return [];
+        }
+
+        var contracts = new List<OptionContract>(details.Count);
+
+        foreach (var detail in details)
+        {
+            var ib = detail.Contract;
+
+            if (ib.Strike <= 0d || string.IsNullOrEmpty(ib.Right))
             {
-                BuildContract(symbol, target, strike, OptionRight.Call, multiplier, segment.TradingClass),
-                BuildContract(symbol, target, strike, OptionRight.Put, multiplier, segment.TradingClass),
-            })
-            .ToArray();
+                continue;
+            }
+
+            var right = ib.Right.StartsWith('C') || ib.Right.StartsWith('c') ? OptionRight.Call : OptionRight.Put;
+
+            var listedExpiration = DateOnly.TryParseExact(
+                ib.LastTradeDateOrContractMonth, ExpirationFormat, CultureInfo.InvariantCulture,
+                DateTimeStyles.None, out var parsed) ? parsed : expiration;
+
+            var multiplier = int.TryParse(ib.Multiplier, NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsedMultiplier)
+                ? parsedMultiplier
+                : 100;
+
+            var contract = BuildContract(
+                symbol, listedExpiration, (decimal)ib.Strike, right, multiplier,
+                string.IsNullOrWhiteSpace(ib.TradingClass) ? segment.TradingClass : ib.TradingClass);
+
+            // Free conId resolution: the caller would otherwise spend one paced reqContractDetails
+            // per contract re-asking TWS what it just said.
+            _optionConIds[contract.Key()] = ib.ConId;
+            contracts.Add(contract);
+        }
+
+        return contracts;
     }
 
     // ---- quotes -----------------------------------------------------------------------------
