@@ -1,11 +1,28 @@
 # IBKR edge-research roadmap
 
-Milestone two: evolve TradingStuff into an IBKR-only market-research platform that can discover,
-validate, and — just as importantly — credibly reject trading edge in SPX volatility. Companion
-documents: `docs/research/ibkr-data-capability-matrix.md` (what the data allows; runtime-verified),
+Milestone two: evolve TradingStuff into a market-research platform that can discover, validate,
+and — just as importantly — credibly reject trading edge in SPX volatility. Companion documents:
+`docs/research/ibkr-data-capability-matrix.md` (what the data allows; runtime-verified),
 `docs/research/volatility-forecast-residual-study.md` (the pre-registered first study), and
 `docs/research/literature-evidence-matrix.md` (evidence base and the methodological controls it
 imposes). This roadmap is the architecture and sequencing half.
+
+> **Amended 2026-08-01: no longer IBKR-only.** This document originally said "IBKR-only", and the
+> constraint was load-bearing — it is what makes the capability matrix a complete account of what
+> the platform can know. `TradingStuff.Volatility` now ships a ThetaData client
+> (`ThetaData/ThetaDataClient.cs`) used by the model-free implied-variance half, so the platform
+> depends on a second vendor. Recorded here rather than left as a contradiction between the
+> roadmap and the code.
+>
+> What this costs: the capability matrix no longer bounds what the platform can observe, and any
+> study using implied variance inherits a second availability and licensing dependency that the
+> IBKR-only framing was chosen to avoid. Track A (the volatility-forecast-residual study) is
+> **unaffected** — its features and labels are IBKR-sourced throughout, so its pre-registration
+> still holds without amendment. The exposure is confined to the implied-variance work.
+>
+> The alternative, re-sourcing model-free implied variance from `IbkrGateway` option chains, stays
+> open: the integral, strike selection and constant-maturity interpolation are all vendor-neutral,
+> and only the chain loader would be rewritten.
 
 ## Executive summary
 

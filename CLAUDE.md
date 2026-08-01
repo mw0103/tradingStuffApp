@@ -50,6 +50,12 @@ persist → publish lifecycle events. Routing goes to the simulated engine or IB
   contracts, collection expressions (`[]`), minimal APIs. Match the surrounding style.
 - **All money and prices are `decimal`.** Never `double` outside a broker-adapter boundary
   (`IBApi` is all `double`; convert only there).
+- **Exception: `TradingStuff.Volatility` is `double` throughout.** Realized variance takes
+  logarithms, square roots and sums of squares, none of which `decimal` supports; it would have to
+  be converted at every step, far slower, and no more accurate once a log has been taken. The
+  conversion happens once, at `HistoricalBarAdapter`, which is the boundary in exactly the sense
+  `IBApi` is. Everything upstream of it stays `decimal`. This is not licence for `double`
+  elsewhere: it covers the estimator library and nothing else.
 - **Never key a collection on a whole `OptionContract`.** It is a `record`, so equality covers every
   property and lookups break as soon as one side carries a broker-enriched field. Use
   `contract.Key()` → `OptionContractKey`. Do not add broker metadata like `ConId` to the record —

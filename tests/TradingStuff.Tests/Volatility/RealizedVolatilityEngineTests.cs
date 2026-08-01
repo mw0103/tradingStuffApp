@@ -523,6 +523,41 @@ public class RealizedVolatilityEngineTests
     }
 
     [Fact]
+    public void TheStudyTargetExcludesTheOvernightGap()
+    {
+        VolatilityPresets.Spx(out var premiumPolicy, out var premiumOptions);
+        VolatilityPresets.SpxStudyTarget(out var studyPolicy, out var studyOptions);
+
+        // The premium pipeline prices calendar time, so it folds the close-to-open move in.
+        Assert.Equal(OvernightPolicy.HansenLundeScaling, premiumOptions.OvernightPolicy);
+        // The study's v1 label is session RV only.
+        Assert.Equal(OvernightPolicy.Exclude, studyOptions.OvernightPolicy);
+
+        // Everything else is the same estimator, including the index session policy.
+        Assert.Equal(premiumPolicy.SkipMinutesAfterOpen, studyPolicy.SkipMinutesAfterOpen);
+        Assert.Equal(premiumOptions.SourceBarMinutes, studyOptions.SourceBarMinutes);
+        Assert.Equal(premiumOptions.SamplingMinutes, studyOptions.SamplingMinutes);
+        Assert.Equal(premiumOptions.UseSubsampling, studyOptions.UseSubsampling);
+        Assert.Equal(premiumOptions.TimestampConvention, studyOptions.TimestampConvention);
+    }
+
+    [Fact]
+    public void TheStudyTargetAndThePremiumSeriesDisagreeOnOvernightVariance()
+    {
+        // Not a theoretical difference: the two presets produce different labels from the
+        // same bars, which is exactly why they are separate rather than a changed default.
+        var bars = SessionBars.Series(30, i => 100.0 * Math.Pow(1.01, i), calendar: SessionBars.CboeIndex);
+
+        var premium = VolatilityPresets.BuildSpx(SessionBars.Clock, bars);
+        var study = VolatilityPresets.BuildSpxStudyTarget(SessionBars.Clock, bars);
+
+        Assert.Equal(premium.Count, study.Count);
+        Assert.All(study, d => Assert.Equal(d.IntradayVariance, d.TotalVariance, 15));
+        Assert.Contains(premium.Zip(study), p => p.First.TotalVariance > p.Second.TotalVariance);
+        Assert.Equal("SPX", study[0].Symbol);
+    }
+
+    [Fact]
     public void TheSpyPresetLeavesDistributionsEmptyUnlessSupplied()
     {
         VolatilityPresets.Spy(out _, out var options);
