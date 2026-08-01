@@ -94,6 +94,10 @@ Two documents are worth reading before you write code here, not just when you ge
   something that looks redundant. Several entries exist because the obvious simplification was tried
   and caused an outage.
 
+**`docs/FOLLOWUP.md`** is the deferred-work register: issues found and deliberately not fixed while
+driving to the MVP. Read its first section before running anything — it records live database state
+that exists nowhere in version control and silently reverts on a fresh environment.
+
 Outstanding (from `docs/STATE.md`):
 
 - In-memory order/event stores → Postgres
