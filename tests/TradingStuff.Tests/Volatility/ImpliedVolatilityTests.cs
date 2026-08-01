@@ -358,10 +358,11 @@ namespace TradingStuff.Tests.Volatility
         [Fact]
         public void ChainLoaderParsesQuotesAndCatchesUnitErrors()
         {
-            var loader = new ThetaDataChainLoader();
+            // The v2 shape: a date plus ms_of_day, and strikes in tenths of a cent. Kept as a
+            // regression on the older wire format, which the loader still resolves by name.
+            var loader = new ThetaDataChainLoader(new ThetaDataOptions { StrikeDivisor = 1000.0 });
             var expiration = new DateTime(2024, 4, 5);
 
-            // Strikes in tenths of a cent, as ThetaData quotes them.
             var csv = "ms_of_day,bid,ask,date,strike,right\n"
                     + "56700000,1.25,1.35,20240304,5000000,C\n"
                     + "56700000,2.10,2.20,20240304,5000000,P\n"
@@ -372,7 +373,7 @@ namespace TradingStuff.Tests.Volatility
 
             IsTrue("one slice per observation date", slices.Count == 2);
             IsTrue("quotes are grouped onto their date", slices[0].Quotes.Count == 3);
-            Check("strikes are converted out of tenths of a cent",
+            Check("strikes are converted by the configured divisor",
                 slices[0].Quotes[0].Strike, 5000.0, 1e-9);
             IsTrue("rights are parsed", slices[0].Quotes[0].Right == OptionRight.Call
                                         && slices[0].Quotes[1].Right == OptionRight.Put);
