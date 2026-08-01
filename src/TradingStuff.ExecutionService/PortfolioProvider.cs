@@ -5,6 +5,18 @@ namespace TradingStuff.ExecutionService;
 
 public interface IPortfolioProvider
 {
+    /// <summary>
+    /// Which <see cref="PortfolioSources"/> value this instance actually is.
+    /// </summary>
+    /// <remarks>
+    /// Reported rather than derived from configuration by whoever asks. The two are the same right
+    /// up until they are not — an unrecognised <c>Portfolio:Source</c> resolves the development
+    /// provider while the configuration string still reads like an opt-in — and it is precisely that
+    /// divergence a caller checking coherence needs to see. Mirrors
+    /// <c>IOptionMarketDataProvider.Source</c>, which exists for the same reason.
+    /// </remarks>
+    string Source { get; }
+
     Task<PortfolioSnapshot> GetPortfolioAsync(string accountId, CancellationToken cancellationToken);
 }
 
@@ -39,6 +51,8 @@ public static class PortfolioSources
 /// </remarks>
 public sealed class DevelopmentPortfolioProvider(IConfiguration configuration) : IPortfolioProvider
 {
+    public string Source => PortfolioSources.Development;
+
     public Task<PortfolioSnapshot> GetPortfolioAsync(string accountId, CancellationToken cancellationToken)
     {
         var buyingPower = Decimal("Portfolio:BuyingPower", 25_000m);
@@ -70,6 +84,8 @@ public sealed class DevelopmentPortfolioProvider(IConfiguration configuration) :
 public sealed class IbkrPortfolioProvider(HttpClient httpClient, ILogger<IbkrPortfolioProvider> logger)
     : IPortfolioProvider
 {
+    public string Source => PortfolioSources.Ibkr;
+
     public async Task<PortfolioSnapshot> GetPortfolioAsync(string accountId, CancellationToken cancellationToken)
     {
         // accountId is not forwarded on purpose. Orders are placed against the gateway's configured

@@ -82,12 +82,96 @@ stamped `NULL` — which reads as *unknown*, never as live — and `ApplyMarketD
 alarm when the callback lands. Honest rather than empty, which is the acceptable direction. Pin it
 with a `RequiresTws` test on a live session.
 
-### 3.3 Automation fill paths unverified
+### 3.3 Automation fill paths unverified — *corrected 2026-08-01, it is worse than this said*
 
-Paper automation was built and exercised on a **Saturday**, so orders rest rather than fill.
-Submission, resting, status and cancellation are exercisable; **fills, partial fills, and
-commission reporting are not**. A resting order is not proof the loop works end to end. Needs a
-weekday session — see also task #43.
+The original entry said submission, resting, status and cancellation **are** exercisable on a
+Saturday and only fills are not. **That was wrong, and measured wrong on the wire.**
+
+Probed against live paper TWS on 2026-08-01 (SPY 2026-08-07 740C and 742C, through the running
+gateway at `marketDataType=3`): **both legs return `bid 0 / ask 0` with all four Greeks zero.**
+SPY options have no book at all outside the regular session. Two consequences, and neither is a
+defect:
+
+- The automation's own pricing step refuses — there is no offer to buy the long leg against, so no
+  marketable limit exists. It records a `refused` decision row naming that.
+- Even with a limit supplied by hand, `PortfolioRiskEvaluator` rejects the order `UNPRICEABLE_LEG`
+  before it is routed. `UnpriceableReason` refuses a buy leg with `Ask <= 0` and refuses any leg
+  whose Greeks are all exactly zero (a live option always carries non-zero gamma and vega).
+
+So on a Saturday, with a **coherent** configuration, **no order reaches TWS at all** — not even to
+rest. The earlier claim that a resting order was obtainable came from the 2026-08-01 incident, where
+the order rested only because `MarketData:Source` had silently degraded to the deterministic
+generator and risk was pricing invented quotes. Under a correct configuration that path is closed,
+which is the guard working.
+
+**What that leaves unverified on the wire, in full:** `placeOrder` from automation, an order resting
+at TWS, cancellation of an automated order, fills, partial fills, and commission reporting. The
+submission path is verified as far as ExecutionService → risk and no further. Needs a weekday RTH
+session — see also task #43.
+
+**Cheapest way to get the rest without waiting for Monday:** `IBKR:MarketDataType=2` (frozen) serves
+the last close snapshot outside hours, which would price the spread. It is a gateway-wide setting
+that also affects the live recorder, so it was not changed under a running session.
+
+### 3.6 The paper account now trades on DELAYED quotes by default
+
+`AppHost` moved to `Execution__Router=ibkr`, `Portfolio__Source=ibkr` and
+`MarketData__Source=ibkr-delayed` (2026-08-01). The three are one decision — ExecutionService refuses
+to boot unless they agree — but the value chosen is `ibkr-delayed`, not `ibkr-live`, because the
+regime TWS actually serves is set by `ibkr-market-data-type`, which is still `3` so that first-run
+setup works without an OPRA subscription. The label matches the feed, which is the point.
+
+**It is still delayed data pricing a pre-trade risk check**, and delayed quotes are up to 15 minutes
+stale. The account is verified entitled to live Cboe/OPRA data (docs/STATE.md, 2026-08-01: requested
+1, served 1). **Before any automated order is trusted on price, move both together:**
+`ibkr-market-data-type=1` **and** `MarketData__Source=ibkr-live`. Moving one without the other either
+lies about the feed or wastes the entitlement.
+
+### 3.7 The automation kill switch does not survive a restart
+
+`POST /research/automation/kill` is in-memory. A process restart clears it and automation re-arms
+from configuration. The status endpoint says so verbatim in `killSwitch.durability`, and the durable
+stop is `PaperAutomation__Enabled=false`, but an operator who kills the switch and then sees the
+service restart has no warning beyond that string. Persisting it (a row, or a file beside the
+connection string) is small work that was deliberately skipped for MVP speed.
+
+### 3.8 The automation signal cannot currently return "trade", by construction
+
+`VolResidualSignal` refuses twice over: the latest run is `insufficient-data` (§2.2), and even an
+`ok` run would be a **development** run, which the study's own pre-registration says nothing may be
+traded on. So the scheduled path is a no-trade path today and the `enter` branch is exercised only
+by unit tests with a fake signal. That is deliberate — inventing an entry rule to make the loop fire
+would put a fabricated signal in the decision table — but it means **the automated submission path
+has never run end to end from a real signal.** The manual endpoint
+(`POST /research/automation/manual-order`, operator-supplied limit, recorded as `trigger='manual'`)
+exists to exercise the rest of the path without faking one. A real entry rule is Phase 5/6 work with
+a gate and a leakage review in front of it.
+
+### 3.9 The per-session cap is per trading date, and a weekend order counts against Monday
+
+`ISessionClock.TradingDateOf` assigns an instant outside any session to the **next** session's
+trading date — the leak-safe direction, and correct for the research plane. It means a manual order
+placed on Saturday consumes one of Monday's two. Correct-ish and cheap to live with; noted because
+the arithmetic is not obvious from the status endpoint.
+
+### 3.9a A risk-rejected order consumes a slot of the per-session cap
+
+Measured live 2026-08-01: the manual order came back `RiskRejected` (`UNPRICEABLE_LEG` ×2), nothing
+reached TWS, and `ordersThisSession` still went to 1. Deliberate — the cap counts orders *submitted
+to ExecutionService*, not orders that reached the venue, so a strategy that is rejected every cycle
+stops after two attempts instead of hot-looping against risk. Recorded because it is not what
+"orders this session" reads like at a glance, and because the opposite choice is defensible if the
+cap is ever meant to bound broker exposure rather than attempts.
+
+### 3.10 A crash between transmitting and recording can refund one order of the cap
+
+The cap is derived from `research.paper_automation_decisions` plus an in-process claim taken before
+the order leaves the service. A failed row write leaves the claim held (the safe direction), but a
+**process crash** in that window loses the claim, and the restarted process re-derives a count that
+does not include the order. Bounded at one order, and only on a crash inside a window of
+milliseconds. Closing it properly means deriving the order id before submitting rather than after —
+ExecutionService already derives its own id deterministically from `(accountId, clientOrderId)`, so
+the fix is to duplicate that derivation and claim the row first.
 
 ### 3.4 SPX/SPXW combos park in `PreSubmitted` — *task #37*
 

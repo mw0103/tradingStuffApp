@@ -592,6 +592,8 @@ internal sealed class FakeRiskClient(PortfolioRiskEvaluator evaluator) : IRiskCl
 
 internal sealed class FakePortfolioProvider(PortfolioSnapshot portfolio) : IPortfolioProvider
 {
+    public string Source => PortfolioSources.Development;
+
     public Task<PortfolioSnapshot> GetPortfolioAsync(string accountId, CancellationToken cancellationToken) =>
         Task.FromResult(portfolio);
 }

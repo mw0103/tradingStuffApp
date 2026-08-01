@@ -216,6 +216,32 @@ app.MapPost("/orders/{orderId:guid}/replace", async (
 app.MapGet("/events/published", (IPublishedExecutionEventStore eventStore) => Results.Ok(eventStore.List()))
     .RequireAuthorization();
 
+// What this service RESOLVED, not what it was configured with. The distinction is the whole point:
+// Execution:Router, Portfolio:Source and MarketData:Source each degrade to their safe value on an
+// unrecognised string, so the configuration can read like an opt-in while the resolved component is
+// the fallback — which is exactly how a 10-lot SPY vertical came to be priced against a synthetic
+// feed on 2026-08-01 (docs/LESSONS.md §9). EnsureRouterAndPortfolioAgree and
+// EnsureRouterAndMarketDataAgree refuse to boot on that mismatch *inside this process*; this
+// endpoint exists so a caller in ANOTHER process can establish the same facts before acting, rather
+// than reading its own copy of the environment and assuming this service saw the same thing.
+//
+// marketDataSourceConfigured is deliberately labelled as the configured string and not as a resolved
+// value: MarketDataService, not this service, resolves the quote provider, so the honest answer here
+// is "this is what I was told", and a caller that needs the resolved provider must ask
+// MarketDataService's own /market-data/ibkr/status. Naming it anything shorter would invite it to be
+// read as a measurement it is not.
+app.MapGet("/execution/configuration", (
+        IOrderRouter router,
+        IPortfolioProvider portfolio,
+        IConfiguration configuration) =>
+        Results.Ok(new
+        {
+            router = router.Name,
+            portfolioSource = portfolio.Source,
+            marketDataSourceConfigured = configuration["MarketData:Source"],
+        }))
+    .RequireAuthorization();
+
 app.MapDefaultEndpoints();
 
 app.Run();

@@ -156,6 +156,8 @@ public sealed class TradingWorkflowTests
 
     private sealed class UnavailablePortfolioProvider : IPortfolioProvider
     {
+        public string Source => PortfolioSources.Ibkr;
+
         public Task<PortfolioSnapshot> GetPortfolioAsync(string accountId, CancellationToken cancellationToken) =>
             throw new PortfolioUnavailableException("The IBKR gateway is unreachable.");
     }

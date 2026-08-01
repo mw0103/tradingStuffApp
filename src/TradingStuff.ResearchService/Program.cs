@@ -1,5 +1,6 @@
 using Npgsql;
 using TradingStuff.ResearchContracts;
+using TradingStuff.ResearchService.Automation;
 using TradingStuff.ResearchService.Backfill;
 using TradingStuff.ResearchService.Gateway;
 using TradingStuff.ResearchService.Persistence;
@@ -127,6 +128,45 @@ builder.Services.AddSingleton<VolResidualBarLoader>();
 builder.Services.AddSingleton<VolResidualStudyRunner>();
 builder.Services.AddSingleton<VolResidualStudyStore>();
 
+// ---- paper automation ---------------------------------------------------------------------------
+// Off unless PaperAutomation:Enabled is the exact string "true", and even then it arms only if
+// ExecutionService resolved the IBKR router AND the IBKR portfolio provider AND MarketDataService
+// resolved a real quote provider AND the gateway is connected on a DU account — see
+// PaperAutomationArming. Nothing here is set in AppHost.
+//
+// The research plane owns the SIGNAL and nothing else. Orders go out over HTTP to ExecutionService's
+// existing POST /orders, which runs validate -> quote -> portfolio -> risk -> route -> persist ->
+// publish. There is no path from this service to the IBKR gateway's order surface and none to
+// placeOrder.
+builder.Services.AddSingleton(TimeProvider.System);
+builder.Services.Configure<PaperAutomationOptions>(builder.Configuration.GetSection("PaperAutomation"));
+
+// Retries stripped for the reason on DisableAutomaticRetries: POST /orders is not idempotent, and a
+// retried order reaches the broker twice under two broker order ids while the caller sees only the
+// last attempt's outcome. Observed live on 2026-07-31. 60s comfortably exceeds ExecutionService's own
+// wait on the gateway's 20s order settle timeout.
+builder.Services.AddHttpClient<ExecutionServiceClient>((sp, http) =>
+    {
+        ServiceClientConfiguration.ConfigureInternalClient(
+            http, sp.GetRequiredService<IConfiguration>(), "ExecutionService:BaseUrl", "http://localhost:5000");
+    })
+    .DisableAutomaticRetries(TimeSpan.FromSeconds(60));
+
+// Quote reads ARE safe to retry, but they are left on the default resilience pipeline rather than
+// given a bespoke one: this client prices the order that the client above submits, and the two must
+// not drift apart in configuration for no reason.
+builder.Services.AddHttpClient<MarketDataServiceClient>((sp, http) =>
+{
+    ServiceClientConfiguration.ConfigureInternalClient(
+        http, sp.GetRequiredService<IConfiguration>(), "MarketDataService:BaseUrl", "http://localhost:5001");
+});
+
+builder.Services.AddSingleton<IPaperAutomationStore, PaperAutomationStore>();
+builder.Services.AddSingleton<SpyVerticalPlanner>();
+builder.Services.AddSingleton<IAutomationSignal, VolResidualSignal>();
+builder.Services.AddSingleton<PaperAutomationService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<PaperAutomationService>());
+
 var app = builder.Build();
 
 var spaFiles = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(
@@ -155,8 +195,12 @@ app.MapGet("/ui", () => Results.Redirect("/ui/coverage", permanent: false));
 // Everything under /research/* is a read-only diagnostic surface for this local-first operator UI
 // (coverage, capability registry, migration/node status) and is deliberately anonymous, matching
 // AuditDashboard's existing `/` — the same posture the roadmap specifies for the React research UI.
-// Nothing under this prefix mutates state; if that ever changes, that endpoint must add
-// .RequireAuthorization() individually rather than this comment being quietly wrong.
+//
+// Two exceptions now exist, both under /research/automation and both carrying .RequireAuthorization()
+// individually exactly as this comment has always required: POST .../resume re-arms automation, and
+// POST .../manual-order submits a real order to the paper account. The kill switch beside them is
+// deliberately left anonymous — it only ever STOPS trading, and a kill switch behind a credential is
+// one that does not get pressed. See PaperAutomationEndpoints for the full reasoning.
 
 app.MapGet("/research/status", (MigrationRunner migrations) =>
     {
@@ -420,6 +464,8 @@ app.MapGet("/research/backfill/gaps", async (
     });
 
 app.MapVolResidualStudyEndpoints();
+
+app.MapPaperAutomationEndpoints();
 
 app.MapDefaultEndpoints();
 

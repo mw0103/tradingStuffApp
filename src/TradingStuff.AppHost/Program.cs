@@ -16,6 +16,41 @@ var ibkrClientId = builder.AddParameter("ibkr-client-id", "11", publishValueAsDe
 // Set to 1 for live data once the account has market data subscriptions.
 var ibkrMarketDataType = builder.AddParameter("ibkr-market-data-type", "3", publishValueAsDefault: true);
 
+// Unattended order submission from the research plane. **Committed default: false, and it stays
+// false in every committed file**, exactly like ibkr-allow-live-trading is never set at all.
+//
+// A parameter rather than a hardcoded literal so that switching it on for a session is a runtime
+// decision (`Parameters__paper-automation-enabled=true`) instead of an edit somebody forgets to
+// revert — an edited literal is how a default becomes permanent. It is deliberately the ONLY thing
+// in this file that gates unattended trading now that the router below is real: everything else
+// (a coherent execution plane, a connected DU account, a session, a signal, the per-session cap)
+// narrows what automation may do, but this is what decides whether it runs at all.
+// Read from configuration with a hardcoded "false" fallback, rather than a literal. A literal-valued
+// AddParameter is FIXED at that literal — it never consults configuration — so the only way to switch
+// automation on for a session would be to edit this line, and an edit somebody forgets to revert is
+// how a default quietly becomes permanent. This way the committed default is off, and enabling it is
+// `Parameters__paper-automation-enabled=true` in the environment, which reverts by itself.
+var paperAutomationEnabled = builder.AddParameter(
+    "paper-automation-enabled",
+    builder.Configuration["Parameters:paper-automation-enabled"] ?? "false",
+    publishValueAsDefault: true);
+
+// Which quote provider the mesh uses, as ONE value set on BOTH services that care.
+//
+// It is a parameter rather than two string literals because the two literals diverging is not a
+// hypothetical: MarketData__Source was first set only on marketdataservice, and executionservice —
+// whose EnsureRouterAndMarketDataAgree reads its OWN configuration, since a guard cannot see another
+// process's environment — found it unset and refused to boot with
+// "MarketData:Source is '(unset)'". That is the guard working exactly as intended (fail-closed, and
+// it cost nothing because it fired at startup), but it is also a standing invitation to "fix" it by
+// pasting a second literal that can then drift from the first. One parameter, two consumers.
+//
+// Note that paper automation checks this differently again, and deliberately: it asks
+// MarketDataService which provider it RESOLVED, because two services holding different values for
+// this key is precisely the divergence a configuration-string check cannot see.
+var marketDataSource = builder.AddParameter(
+    "market-data-source", "ibkr-delayed", publishValueAsDefault: true);
+
 // A real Aspire Postgres resource, not a bare container: it produces the connection string that the
 // gateway (order-id map, raw recording) and ResearchService (everything derived) actually consume.
 var postgresUser = builder.AddParameter("postgres-user", "trading", publishValueAsDefault: true);
@@ -93,8 +128,19 @@ var marketData = builder.AddProject(
     .WithReference(ibkrGateway)
     .WithEnvironment("Authentication__DevelopmentToken", devInternalToken)
     .WithEnvironment("IbkrGateway__BaseUrl", ibkrGateway.GetEndpoint("http"))
-    // Deterministic quotes by default. Switch to "ibkr-delayed" (or "ibkr-live") to pull real data.
-    .WithEnvironment("MarketData__Source", "ibkr-deterministic-paper-feed");
+    // Real quotes from TWS through the gateway. This MUST stay one of the recognised IBKR values for
+    // as long as Execution__Router is "ibkr" below: ExecutionService's EnsureRouterAndMarketDataAgree
+    // refuses to BOOT on the combination of a real router and an unrecognised quote source, which is
+    // the fail-closed answer to the 2026-08-01 incident where a 10-lot SPY vertical was approved
+    // against invented bid 27.34 / ask 28.46 on a Saturday.
+    //
+    // The parameter defaults to "ibkr-delayed" rather than "ibkr-live" deliberately, and it is a
+    // label that must match reality rather than ambition: the actual regime TWS serves is driven by
+    // ibkr-market-data-type above, which is 3 (delayed) so that first-run setup works without an OPRA
+    // subscription. Claiming "ibkr-live" while the gateway requests delayed data would put a name on
+    // the feed that the feed does not have. The two move TOGETHER — see docs/FOLLOWUP.md §3.6 before
+    // trusting a price this mesh computes.
+    .WithEnvironment("MarketData__Source", marketDataSource);
     // No WaitFor(ibkrGateway) on purpose: the gateway reports unhealthy whenever TWS is down, and
     // waiting on health would stop the whole mesh from starting just because TWS is closed.
 
@@ -116,13 +162,32 @@ var execution = builder.AddProject(
     .WithEnvironment("RiskService__BaseUrl", risk.GetEndpoint("http"))
     .WithEnvironment("MarketDataService__BaseUrl", marketData.GetEndpoint("http"))
     .WithEnvironment("IbkrGateway__BaseUrl", ibkrGateway.GetEndpoint("http"))
-    // "paper" simulates fills locally. Set to "ibkr" to send approved orders to the paper account
-    // through the gateway. Anything unrecognised stays on paper.
-    .WithEnvironment("Execution__Router", "paper")
-    // Fixed development buying power with no positions. Set to "ibkr" to feed risk the real account's
-    // buying power, daily P&L, and position Greeks. Set this whenever Execution__Router is "ibkr":
-    // otherwise real orders are approved against fabricated portfolio inputs.
-    .WithEnvironment("Portfolio__Source", "development")
+    // ---- the real paper-account path, on by default -------------------------------------------
+    // Approved orders are transmitted to the DU paper account through the gateway, and risk evaluates
+    // them against that account's real buying power, daily P&L and position Greeks. This is what the
+    // paper account is for (CLAUDE.md: "On a verified DU account, exercise anything you build").
+    //
+    // These three settings — router, portfolio source, and MarketData__Source above — are ONE
+    // decision, not three. Each degrades to its safe value independently on an unrecognised string,
+    // which is correct alone and wrong together: docs/LESSONS.md §9. ExecutionService refuses to boot
+    // unless all three agree (EnsureRouterAndPortfolioAgree + EnsureRouterAndMarketDataAgree), and
+    // paper automation independently refuses to arm unless it can MEASURE that they agree — it asks
+    // ExecutionService which router and portfolio provider it resolved and MarketDataService which
+    // quote provider it resolved, rather than reading its own copy of these variables.
+    //
+    // What still stands between this and an unattended order:
+    //   - IBKR__AllowLiveTrading is unset (defaults false), so a non-DU account cannot trade at all;
+    //   - the gateway's DU-prefix check, and paper automation's own re-check of it;
+    //   - PaperAutomation__Enabled is set from the paper-automation-enabled parameter, whose
+    //     committed default is "false" — with the path now real, THAT is the gate that decides
+    //     whether anything fires unattended.
+    .WithEnvironment("Execution__Router", "ibkr")
+    .WithEnvironment("Portfolio__Source", "ibkr")
+    // The third of the three, and it must be set HERE as well as on marketdataservice:
+    // EnsureRouterAndMarketDataAgree reads this process's own configuration, because no guard can see
+    // another process's environment. Omitting it is not a silent hole — this service refuses to boot
+    // — but it is a refusal to boot, so it belongs beside the two settings it has to agree with.
+    .WithEnvironment("MarketData__Source", marketDataSource)
     .WaitFor(risk)
     .WaitFor(marketData)
     .WaitFor(rabbitmq)
@@ -143,6 +208,18 @@ builder.AddProject(
     // can be executed. It is safe to leave on: every slice is idempotent (the request row IS the
     // checkpoint), the pacing governor owns the TWS limits, and a rerun adds zero rows.
     .WithEnvironment("Backfill__Enabled", "true")
+    // Paper automation talks to these two over HTTP and to nothing else that can place an order. The
+    // research plane owns the signal; ExecutionService owns the order and runs the whole spine on it.
+    //
+    // Defaults to "false" (see the parameter's declaration). Switching it on is a per-environment
+    // decision, and it still buys nothing on its own: automation independently refuses to arm unless
+    // it can MEASURE that ExecutionService resolved the IBKR router and portfolio provider and that
+    // MarketDataService resolved a real quote provider.
+    .WithEnvironment("PaperAutomation__Enabled", paperAutomationEnabled)
+    .WithReference(execution)
+    .WithReference(marketData)
+    .WithEnvironment("ExecutionService__BaseUrl", execution.GetEndpoint("http"))
+    .WithEnvironment("MarketDataService__BaseUrl", marketData.GetEndpoint("http"))
     .WithReference(tradingDb)
     .WaitFor(postgres);
     // No WaitFor(ibkrGateway), for the same reason marketdataservice skips it: the gateway reports

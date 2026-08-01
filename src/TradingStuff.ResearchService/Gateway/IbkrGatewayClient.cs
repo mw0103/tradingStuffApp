@@ -10,6 +10,18 @@ namespace TradingStuff.ResearchService.Gateway;
 public sealed record UnderlyingResolution(int ConId, string SecType, string Exchange);
 
 /// <summary>
+/// The gateway's socket status, matched by property name against its own status DTO. Only the fields
+/// a caller needs to decide whether the broker is usable — deliberately not the whole payload, and
+/// deliberately no account numbers beyond what <c>ManagedAccounts</c> already exposes internally.
+/// </summary>
+public sealed record GatewayStatus(
+    bool Connected,
+    bool TradingPermitted,
+    string? TradingBlockedReason,
+    IReadOnlyList<string> ManagedAccounts,
+    int? MarketDataType);
+
+/// <summary>
 /// One futures-family contract, matched by property name against the gateway's own
 /// <c>FuturesContractDefinition</c>. See <see cref="IbkrGatewayClient.GetFuturesFamilyAsync"/>.
 /// </summary>
@@ -29,6 +41,25 @@ public sealed record FuturesContractResolution(
 /// </remarks>
 public sealed class IbkrGatewayClient(HttpClient httpClient, ILogger<IbkrGatewayClient> logger)
 {
+    /// <summary>
+    /// The gateway's view of the TWS socket.
+    /// </summary>
+    /// <remarks>
+    /// Throws rather than returning null on failure, unlike the read-only lookups below. Its one
+    /// caller is the automation arming check, and there "the gateway did not answer" must reach that
+    /// check as an error it refuses on — folding it into a null would make an unreachable gateway
+    /// indistinguishable from a well-formed answer with nothing in it.
+    /// </remarks>
+    public async Task<GatewayStatus> GetStatusAsync(CancellationToken cancellationToken)
+    {
+        var response = await httpClient.GetAsync("/ibkr/status", cancellationToken);
+
+        response.EnsureSuccessStatusCode();
+
+        return await response.Content.ReadFromJsonAsync<GatewayStatus>(cancellationToken)
+               ?? throw new HttpRequestException("The IBKR gateway returned an empty status body.");
+    }
+
     public async Task<UnderlyingResolution?> ResolveUnderlyingAsync(string symbol, CancellationToken cancellationToken)
     {
         var response = await httpClient.GetAsync(
