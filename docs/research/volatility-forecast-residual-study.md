@@ -53,10 +53,14 @@ and the ambiguity was large enough to decide the gate. Frozen here.
 
 | Condition | The only sentence permitted |
 |---|---|
-| Clears HAR | "improves on HAR" |
-| Clears HAR-X | "adds value beyond the same information in a simple model" |
+| Clears HAR | "improves on the realized-only HAR reference" |
+| Clears HAR-X | "adds forecast value beyond a simple model using the same registered information" |
+| Clears HAR-X but not HAR | "improves on the information-matched specification but not the simpler reference; no overall superiority claim" |
 | Lowest mean QLIKE in the ladder | "best observed model" |
+| Survives MCS against the full ladder | "competitive or dominant within the registered ladder" |
 | MCS eliminates all registered baselines | "statistically dominates the registered ladder" |
+| Any QLIKE improvement, of any size | "a statistical forecasting improvement" — and nothing about trading |
+| Net returns after execution, hedging, financing and risk controls | the only evidence that bears on trading alpha, and it comes from the variance-gap study and execution simulator, never from here |
 
 Failing H1 while beating HAR is **not** "no edge" — it is "does not outperform a simple
 information-matched model", which is a different and weaker negative. Record it as such.
@@ -78,16 +82,37 @@ remove any incentive to torture this study into significance.
 negative sign in ≥ 2 folds, or > 50% of the gain from a single calendar year ⇒ study declared
 negative, frozen, registry-recorded with all variants.
 
-All thresholds here — 1%, 2%, 5% — are measured against **HAR-X** in the frozen normalized QLIKE.
-They were written against HAR, which is a materially easier comparator, and the numbers were
-deliberately *not* rescaled when the gate moved: rescaling them to preserve the old pass rate
-would restore exactly the leniency the amendment exists to remove. The study is now harder to
-pass, and that is the intent, not a side effect.
+All thresholds here — 1%, 2%, 5% — are measured against **HAR-X** in the frozen normalized QLIKE,
+and are deliberately **not rescaled** for the new comparator. They are fixed policy thresholds for
+what counts as a material forecast improvement; preserving the prior pass rate is not an
+objective.
 
-Note also what a *near-miss* means under the new gate. Beating HAR but failing HAR-X is **not**
-"no edge" — it is "does not outperform a simple model with the same information", a weaker and
-more specific negative that must be recorded in those words (see Claim language). Only the
-conditions in the first paragraph declare the study negative.
+**HAR-X is adopted because it is information-matched, not because it is assumed to be numerically
+harder.** The new pass condition is `L̄_C ≤ (1 − τ)·L̄_HAR-X`, which is stricter than the old one
+**only if `L̄_HAR-X < L̄_HAR`** out of sample. That is expected but not guaranteed: HAR-X carries
+extra parameter-estimation error, and the VIX-to-RV relationship may be unstable enough that the
+richer specification loses. Asserting in advance that the comparator is harder would be assuming
+the outcome of the baseline race this amendment exists to run. Changing the comparator changes the
+thresholds' empirical calibration; the design intent is more attribution-demanding, and whether
+that is numerically more demanding is an evaluation result, not a premise.
+
+**Power, checked before the evaluation sample opens.** Compute the minimum detectable loss
+differential under the registered block-bootstrap assumptions. This is a power diagnostic, not
+threshold tuning — the thresholds do not move. If the design cannot reliably detect 2%, the
+correct recorded outcome is **"underpowered / inconclusive"**, which is distinct from both "edge"
+and "no edge". **2% is the sole primary inferential margin**; 1% and 5% are pre-registered
+*descriptive* claim bands, not tested hypotheses in their own right.
+
+**Both near-miss directions are defined in advance**, because each supports a different sentence:
+
+- **Beats HAR, fails HAR-X** → "does not outperform a simple model with the same information."
+- **Beats HAR-X, fails HAR** → "improves on the information-matched specification but not on the
+  simpler realized-only reference; no overall forecasting-superiority claim is supported." This is
+  a live possibility, not a formality: it is what you observe when HAR-X uses the extra
+  information *badly* and the candidate merely repairs some of that damage. It is also the reason
+  HAR stays visible on the ladder after being demoted from the gate.
+
+Neither is "no edge". Only the conditions in the first paragraph declare the study negative.
 
 **Statistical vs economic:** 1–2% is real but likely unactionable. Economically meaningful:
 ≥ 5% pooled gain AND ≥ 0.5 annualized-vol-point RMSE reduction in the top VIX tercile. Between
@@ -159,9 +184,23 @@ cannot answer the question H1 asks.
   one-step horizon, same folds and origin as everything else. Chosen over Realized GARCH for v1
   — not because it dominates, but because it is directly a realized-measure forecasting model,
   its original evaluation scores under QLIKE, and its gains are strongest at short horizons.
-  **The lag order is fixed at (1,1) in advance and may not be selected after results are seen.**
+  **The lag order is fixed at (1,1) in advance and may not be selected after results are seen —
+  but a frozen lag order is not a frozen model.** A "fixed HEAVY-RM(1,1)" still hides substantial
+  post-result discretion unless the following are frozen with it, and all of them are, as part of
+  the baseline definition:
+
+  | Frozen | Why it would otherwise be discretion |
+  |---|---|
+  | the exact realized measure fed to HEAVY | swapping RV variants after seeing results is model selection |
+  | parameter constraints and stationarity treatment | boundary handling changes fitted persistence |
+  | estimation criterion | QLIKE vs Gaussian QML give different parameters |
+  | initialization of `μ₀` | materially affects early-fold forecasts |
+  | rolling vs expanding window, and refit cadence | the single largest lever on a baseline's realized loss |
+  | optimizer, retry policy, non-convergence handling | "it didn't converge so we used the other settings" |
+  | forecast floor / clipping rule, if any | clipping changes QLIKE disproportionately, since QLIKE punishes under-prediction hardest |
+
   Log-linear Realized GARCH(1,1) is an optional later robustness row, relevant mainly if the
-  return distribution or option-pricing implications come into scope.
+  return distribution or option-pricing implications come into scope. It is **not** in v1.
 - **B3 — HAR-X — THE PRIMARY GATE.** The registered HAR terms plus **exactly the Tier-1 VIX
   features the candidate receives** (log prior-close VIX², 5-day VIX change, SPX−VIX divergence),
   as a fixed OLS specification with a positivity constraint. Answers the question that actually
@@ -186,13 +225,28 @@ cannot answer the question H1 asks.
    "Try five weighting schemes and report the best" is five variants regardless of what the
    registry is told.
 
-**Retransformation, and why it is ladder-wide.** Every log-form model — HAR, HAR-X, B1, and the
-candidate alike — is estimated by directly minimizing training-window QLIKE, not by OLS on log RV
-followed by `exp()`. Exponentiating an OLS log fit targets something near the conditional *median*
-of RV, while QLIKE is minimized by the conditional *mean*; the resulting handicap is systematic.
-Applying the correction to only some rungs would change their ranking by construction — and would
-do so in the direction that flatters the candidate, which is exactly why it is stated once, here,
-and applied uniformly.
+**Retransformation — uniform as a rule, model-specific in application.** The rule: *every model
+estimated on a transformed target must produce an original-scale conditional-mean forecast using a
+retransformation estimated solely from that model's own current training window.* Exponentiating
+an OLS log fit targets something near the conditional *median* of RV while QLIKE is minimized by
+the conditional *mean*, and the resulting handicap is systematic — so correcting only some rungs
+would change their ranking by construction, in the direction that flatters the candidate.
+
+Three ways to get this wrong, all excluded:
+
+- **One shared correction factor across models.** HAR, HAR-X, B1 and the candidate have different
+  residual distributions; a common smearing factor is not valid for any of them. Each model's
+  correction comes from its own residuals.
+- **Correcting a model that needs no correction.** B2 (HEAVY-RM) already forecasts level-scale
+  variance directly. It is **not** retransformed. "Ladder-wide" means the rule is applied to every
+  model, not that every model receives a correction.
+- **Estimating the correction on evaluation residuals.** Training window only, refit per fold,
+  never pooled across the test sample.
+
+Registered honestly: an unconditional smearing factor assumes the retransformation factor does not
+move materially with the predictors, which in a volatility application is an approximation rather
+than an identity. That is acceptable for v1 and is **not** to be described as an exact
+conditional-mean correction under arbitrary conditional heteroskedasticity.
 
 **Baselines do not consume challenger slots, but they are not free.** Each adds estimation
 windows, lag orders, constraints, convergence and failure handling — researcher degrees of freedom
@@ -231,9 +285,28 @@ sampling noise is an outcome the MCS in H2 exists to absorb.
 - **Regimes:** VIX terciles with TRAIN-defined thresholds; pre/post 2020-02; per-year table.
 - **Trial registry:** every executed variant (feature-set hash, model family, hyperparameters,
   fold config, seed, git sha) appended immutably before results are viewed. Gate p-threshold
-  deflated to 0.05/N over N registered variants; N > 5 additionally triggers an SPA test of the
-  family vs **HAR-X** (the H1 comparator, matching the gate it defends — it was "vs HAR" before
-  the 2026-08-01 amendment). **Hard cap: 10 registered variants before the holdout opens.** Exhausting the
+  deflated to 0.05/N over N registered variants; N > 5 additionally triggers an SPA test —
+  **margin-adjusted, and over candidate variants only**, per the specification below.
+  **Hard cap: 10 registered variants before the holdout opens.**
+- **SPA, specified precisely.** Two corrections beyond moving the benchmark to HAR-X, because
+  moving the benchmark alone does not defend the gate:
+  - *Margin adjustment.* The ordinary differential `d_k,t = L_HAR-X,t − L_k,t` has null
+    `max_k E[d_k,t] ≤ 0`, so rejecting it establishes only that something beats HAR-X **by any
+    positive amount** — not by the registered 2%. The primary SPA therefore uses
+    **`d_k,t(τ) = (1 − τ)·L_HAR-X,t − L_k,t` with τ = 0.02**, whose alternative is
+    `∃k: E[L_k,t] < (1 − τ)·E[L_HAR-X,t]` — the actual gate. A conventional τ = 0 result may also
+    be reported, labelled **"evidence of some superiority"**, and may never be presented as
+    evidence that H1's materiality threshold was met.
+  - *Family restriction.* The SPA alternative set contains **only the pre-registered candidate
+    variants**. B1 (calibrated VIX), B2 (HEAVY-RM), HAR, GARCH(1,1) and any optional Realized
+    GARCH row are **excluded**. Including them would let HEAVY-RM reject the null while the
+    corrected model fails — a technically valid rejection supporting a claim the candidate did
+    not earn.
+  - *Identification.* SPA is benchmark-centric: a rejection says at least one alternative beats
+    the benchmark, not which. Naming a winning variant requires the MCS below, never the SPA
+    rejection alone. With a single primary candidate, H1 is tested by the registered one-sided
+    block bootstrap on `d_primary,t(0.02) = 0.98·L_HAR-X,t − L_primary,t`, and SPA is secondary
+    protection against the ten-variant search. Exhausting the
   cap = negative result; continuing requires data accumulated after re-registration.
 - **Pipeline-validity placebo:** residuals shuffled within VIX-tercile blocks must produce ≈ 0
   improvement before any real result is believed.
