@@ -34,8 +34,28 @@ of edge. Published profitability gets an ex-ante 30–60% haircut (McLean-Pontif
    Bakshi-Kapadia 2003; Christensen-Prabhala 1998); its width forecasts equity returns
    (Bollerslev-Tauchen-Zhou 2009). Pricing concentrates at the front of the term structure
    (Dew-Becker et al. 2017) — never extrapolate the 30-day premium along the curve. VIX² is a
-   usable 30-day implied-variance leg now; self-built strips need the recorder plus
-   CBOE-methodology-faithful construction.
+   usable 30-day implied-variance leg now; self-built strips need
+   CBOE-methodology-faithful construction (and, as of 2026-08-01, historical chains rather than
+   the recorder — see the roadmap's second amendment).
+
+   **The result the whole family rests on** (Demeterfi-Derman-Kamal-Zou 1999, row 18a;
+   Britten-Jones & Neuberger 2000): risk-neutral expected variance is replicable *exactly* by a
+   static strip of options plus a delta hedge, with **no volatility model assumed**. Itô on
+   `d(log S)` leaves `dS/S − d(log S) = (σ²/2)dt`, so `E^Q[∫σ²dt] = 2[rT − E^Q log(S_T/S₀)]`; the
+   log payoff is then statically replicated by Carr-Madan, whose second derivative
+   `f″(K) = 1/K²` **is** the famous weighting. Two consequences the platform depends on:
+   (a) the 1/K² weights are a derivation, not a convention, so the wings dominate and the
+   zero-bid truncation rule is the most consequential implementation choice in the method — which
+   is why row 18's "K₀ failure modes" are diagnosable at all; (b) the replication yields `E^Q`,
+   while realized variance is drawn from `P`, so the implied-realized gap is the premium **by
+   construction** rather than by empirical accident. Anyone expecting a physical forecast to track
+   VIX has mistaken the measure, and a forecast that *did* track VIX would be evidence of an
+   implied-vol proxy rather than of a good forecast.
+
+   Refinement, load-bearing when differencing VIX² against forecast RV: the log-contract
+   replication is exact under diffusion but carries a third-order jump error, so VIX² only
+   approximates the 30-day variance-swap rate (Carr-Wu 2009, row 14). Do not attribute that bias
+   to the premium.
 5. **Surface representation.** Index surfaces are low-dimensional (2–3 factors: level, skew,
    curvature — Cont-da Fonseca 2002), which is what makes a sparse 6–10-node recording viable.
    At that node count fit ≤3–4 parameters per expiry slice (SSVI-style / quadratic in log-forward
@@ -84,6 +104,7 @@ must change; what is lost is noted) · **external** (unavailable without another
 | 16 | Christensen & Prabhala 1998, JFE 50(2), DOI 10.1016/S0304-405X(98)00034-8 | peer-reviewed | now | Non-overlapping IV-vs-RV regressions |
 | 17 | Bakshi & Kapadia 2003, RFS 16(2), DOI 10.1093/rfs/hhg002 | peer-reviewed | prospective | Delta-hedged-gain design for the variance-gap study |
 | 18 | Cboe Volatility Index Mathematics Methodology 2024 (cdn.cboe.com governance doc) | exchange research | consume now / reproduce partially | Strip construction, zero-bid rules, K₀ failure modes |
+| 18a | Demeterfi, Derman, Kamal & Zou 1999, *More Than You Ever Wanted To Know About Volatility Swaps*, Goldman Sachs Quantitative Strategies Research Notes (also J. Derivatives 6(4), 1999, DOI 10.3905/jod.1999.319129) | practitioner research note (the JoD version is peer-reviewed) | **now** — the replication is arithmetic over any chain, and `TradingStuff.Volatility/ImpliedVolatility/ModelFreeVariance.cs` already implements the integral | The derivation *underneath* row 18. Cboe's methodology gives the formula to compute; this gives the reason it is that formula, which is what makes its failure modes diagnosable instead of magic |
 | 19 | Gatheral & Jacquier 2014, Quantitative Finance 14(1), DOI 10.1080/14697688.2013.819986 | peer-reviewed | now (live chain pulls) | Arbitrage-aware slice fitting; SSVI bounds |
 | 20 | Cont & da Fonseca 2002, Quantitative Finance 2(1), DOI 10.1088/1469-7688/2/1/304 | peer-reviewed | prospective (~6 mo of surface days) | Surface factor structure; node-count justification |
 | 21 | Fengler 2009, Quantitative Finance 9(4), DOI 10.1080/14697680802595585 | peer-reviewed | now (method) | Arbitrage-free smoothing of noisy quotes |
