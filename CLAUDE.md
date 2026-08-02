@@ -4,6 +4,30 @@ Local-first .NET Aspire monorepo for paper options trading against Interactive B
 C# owns execution, risk, market data, and orchestration. A Python ML signal service is deferred
 until the execution foundation is stable.
 
+## What this is for
+
+> **Can a better estimate of future realized volatility improve when you sell volatility, avoid
+> selling it, or size the position?** And: come up with a method to make the better estimate.
+
+That is the question the platform exists to answer. It is worth keeping in view because it is
+narrower than "forecast volatility" and wider than any single study, and two things follow from it
+that are easy to lose.
+
+**The estimate is a means, not the end.** A forecast that beats HAR on QLIKE has answered the
+statistical question, not this one. The decision — sell, stand aside, or size differently — is where
+the improvement has to show up. The pre-registration already anticipates the gap: it treats a 2–5%
+QLIKE gain as real but "insufficient economic magnitude", and the companion VRP-conditioning study
+exists to carry the answer toward a decision rather than toward a loss number.
+
+**Both halves are in scope.** "Come up with a method" means the model ladder is a subject of the
+work, not a fixed input to it. New prediction methods are expected — which is precisely why each one
+passes through the registered trial protocol (`research.registered_trials`, `TrialProtocol`) instead
+of being tried until one works. The protocol is what makes an expected search honest rather than a
+fishing expedition.
+
+Full framing: `docs/plans/ibkr-edge-research-roadmap.md`. The pre-registered first study and the
+gates any method is judged against: `docs/research/volatility-forecast-residual-study.md`.
+
 ## Build and test
 
 This environment needs a writable .NET CLI home. Export these first — without them the CLI fails on
