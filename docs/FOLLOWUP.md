@@ -18,12 +18,22 @@ symptom is not an error — it is the historical drain quietly never running aga
 
 | What was changed | Where | Why | Restore/redo |
 |---|---|---|---|
-| The three `kind='topup'` backfill jobs set to `status='paused'` | Aspire Postgres, container `postgres-934a0e61`, db `trading` | They starve the historical drain — see §2.1 | `update research.backfill_jobs set status='running' where kind='topup';` |
-| `vix-daily-trades` priority raised 80 → 200 | same | VIX daily is only 22 slices but sat behind SPX (6,056) and SPY (7,882), so it would not have run for days — and both HAR-X and the calibrated-VIX baseline need it | it will re-seed at 80 from `BackfillJobCatalog` |
+| The three `kind='topup'` backfill jobs set to `status='paused'` | Aspire Postgres, container `postgres-934a0e61`, db `trading` | They starve the historical drain — see §2.1 | `update research.backfill_jobs set status='paused' where kind='topup';` |
+| ~~`vix-daily-trades` priority raised 80 → 200~~ | — | **RESOLVED 2026-08-01** — now `Priority: 200` in `BackfillJobCatalog`, so it survives a restart | n/a |
 
-**Both changes must move into `BackfillJobCatalog` (or the coordinator) before anyone else runs
-this.** Until then, a new environment silently reproduces the original "8 healthy jobs, thousands
-of planned slices, zero bars" state.
+**The top-up pause is still database-only and must move into `BackfillJobCatalog` (or the
+coordinator).** Until it does, a new environment silently reproduces the original "8 healthy jobs,
+thousands of planned slices, zero bars" state.
+
+**This has already bitten once, within the hour it was written.** The VIX priority was first raised
+in the database only; an app-host restart re-seeded the catalog and reverted it to 80, and VIX daily
+went back to sitting behind ~14,000 one-minute slices. That is what moved it into the catalog. The
+top-up pause has exactly the same exposure and has not been fixed.
+
+**A supervisor is currently compensating for this at runtime** (`/tmp/supervise2.sh`): every three
+minutes it re-pauses the top-ups and un-pauses the historical jobs, precisely so that an app-host
+restart cannot silently reintroduce the starvation. That is a scaffold for an overnight run, not a
+fix — it lives in `/tmp` and dies with the machine.
 
 ---
 
@@ -62,6 +72,39 @@ pre-2024 first (~1.5–2 h at the pacing ceiling from the time of writing).
 
 Not a defect — newest-first is the right default for a recorder. Worth a `from`/`to` bound on the
 historical planner so a dev run can pull the window it actually needs first.
+
+**Status 2026-08-01 23:48Z:** SPX has now cleared the holdout (earliest 2023-11-16) and the study
+builds **12 real feature rows** from real SPX bars and real VIX closes — the pipeline is proven
+end to end on live data. It still reports `insufficient-data`, now for a better reason: *"no
+registered walk-forward fold has both >= 30 training rows and >= 1 test row (F1: 0/0, F2: 0/0,
+F3: 0 train / 12 test)"*. F3 trains on 2010–2020, so a scored fold needs essentially the whole
+2010–2023 history, not a partial drain.
+
+### 2.3 The drain pulls ONE DAY per request — the single biggest speed-up available
+
+Each historical request fetches one session of 1-minute bars (390 bars), so SPX 2010→ is 6,056
+requests. **IBKR's pacing limit counts requests, not bars**, and 1-minute data supports far longer
+durations per request. At `1 M` per request SPX would be roughly 200 requests instead of 6,056 —
+about 16 hours becomes well under one, on the same pacing budget.
+
+Nothing needs to be written to exploit this: `BackfillPlanner` already reads a per-job
+`slice_duration` and its own comment says changing it is *"a per-job `slice_duration` change, not a
+code change"*. Every job currently has it NULL.
+
+**Not yet measured, and it must be measured rather than assumed** — the original plan flagged
+exactly this and it was never done (*"Discover the true max duration-per-request for 1-min bars in
+Phase 0 (may cut these times 5×)"*). Three attempts to measure it on 2026-08-01 all returned
+`429 Historical data pacing budget exhausted` because the running drain owns the budget; measuring
+requires pausing the drain for a full ~10-minute pacing window, which costs more progress than it
+saves while a drain is mid-flight. **Do it in a quiet window, then set `slice_duration` per job.**
+
+Also unverified: whether TWS caps 1-minute durations per instrument or per security type, and
+whether index (`IND`) contracts behave differently from stocks here.
+
+**Parallelism is NOT the lever.** Historical pacing is enforced per USERNAME, not per connection or
+client id, so additional API clients share one budget and buy nothing. Observed directly: probe
+requests issued from a second caller were refused by the same governor with `retry after 425s`
+while the drain held the window.
 
 ---
 

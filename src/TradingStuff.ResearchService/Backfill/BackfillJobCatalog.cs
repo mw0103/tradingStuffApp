@@ -90,8 +90,18 @@ public static class BackfillJobCatalog
             UseRth: true, SpxIntradayFrom, TargetTo: null, Priority: 100),
         new("spy-1min-trades", BackfillJobKinds.Historical, InstrumentId: 5, "SPY", "TRADES", "1 min",
             UseRth: true, SpyIntradayFrom, TargetTo: null, Priority: 90),
+        // Priority 200 — ABOVE the 1-minute drains, which is not a typo and not a preference.
+        //
+        // This job is 22 slices; spx-1min-trades is 6,056 and spy-1min-trades 7,882. At priority 80
+        // it sat behind both and would not have run for days. Meanwhile the volatility-residual
+        // study cannot score a single day without it: HAR-X and the calibrated-VIX baseline (B1)
+        // both take a VIX close, so a complete SPX history with no VIX is worth exactly nothing to
+        // the study. Twenty-two slices gating thousands is the wrong way round.
+        //
+        // Ordering cheap-and-blocking ahead of expensive-and-incremental is the general rule here;
+        // priority is doing dependency work that nothing else expresses.
         new("vix-daily-trades", BackfillJobKinds.Historical, InstrumentId: 4, "VIX", "TRADES", "1 day",
-            UseRth: true, VixFrom, TargetTo: null, Priority: 80),
+            UseRth: true, VixFrom, TargetTo: null, Priority: 200),
         // The "probe to the floor" job: VIX intraday depth is UNKNOWN in the capability matrix, so
         // target_from is set optimistically deep and reqHeadTimeStamp decides where planning really
         // starts. Clamping to the head IS the probe — no separate mode, no separate code path.
