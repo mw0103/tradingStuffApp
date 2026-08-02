@@ -3,12 +3,21 @@ using TradingStuff.Volatility.Baselines;
 namespace TradingStuff.ResearchService.Studies.VolResidual;
 
 /// <summary>One test day's realized outcome and all four models' forecasts and QLIKE losses.</summary>
+/// <param name="PriorVix">Prior-close VIX in index points, recovered from the row's registered <c>LogPriorVix2</c> feature.</param>
+/// <param name="VixRegime">
+/// <c>"low"</c> or <c>"high"</c> against this fold's TRAINING-window median prior VIX. H1 requires
+/// the improvement to be positive in both halves, and the registration requires regime thresholds to
+/// be train-defined — so the threshold is fixed here, where the training block is in scope, rather
+/// than by a median taken over the evaluation sample later.
+/// </param>
 public sealed record VolResidualDailyResult(
     DateOnly Date,
     string FoldName,
     double ActualVariance,
     IReadOnlyDictionary<string, double> Forecasts,
-    IReadOnlyDictionary<string, double> Qlike);
+    IReadOnlyDictionary<string, double> Qlike,
+    double PriorVix,
+    string VixRegime);
 
 public sealed record VolResidualFoldResult(
     string FoldName,
@@ -17,7 +26,10 @@ public sealed record VolResidualFoldResult(
     DateOnly TestFrom,
     DateOnly TestTo,
     int TrainDays,
-    IReadOnlyList<VolResidualDailyResult> DailyResults);
+    IReadOnlyList<VolResidualDailyResult> DailyResults,
+    // Test days on which the exploratory GBT forecast was raised by its positivity floor. Zero on a
+    // registered run, which does not fit a GBT at all.
+    int GbtFloorHits = 0);
 
 /// <summary>
 /// Fits all four registered models — HAR-RV (reference), B1 calibrated VIX, HAR-X (the primary
@@ -48,7 +60,15 @@ public static class VolResidualFoldRunner
     public static bool CanScore(VolResidualFoldSplit split) =>
         split.Train.Count >= MinimumTrainRows && split.Test.Count > 0;
 
-    public static VolResidualFoldResult Run(VolResidualFoldSplit split)
+    public static VolResidualFoldResult Run(VolResidualFoldSplit split) => Run(split, includeExploratoryGbt: false);
+
+    /// <param name="includeExploratoryGbt">
+    /// Fits and scores ladder rung 4 (gradient-boosted trees) in addition to the registered models.
+    /// This is OUTSIDE the registered ladder — rung 4 runs only if rung 3 passes the H1 gate, and it
+    /// has not — so it is opt-in per run and every consumer of the result is told so; see
+    /// <see cref="VolResidualExploratoryRung"/>.
+    /// </param>
+    public static VolResidualFoldResult Run(VolResidualFoldSplit split, bool includeExploratoryGbt)
     {
         if (!CanScore(split))
             throw new InvalidOperationException(
@@ -133,8 +153,25 @@ public static class VolResidualFoldRunner
             trainActuals, train.Select(r => Math.Exp(CandidateRawLogForecast(r))).ToList());
         double CandidateForecast(VolResidualRawRow r) => candidateFactor * Math.Exp(CandidateRawLogForecast(r));
 
+        // ---- EXPLORATORY: ladder rung 4, gradient-boosted trees ----
+        // Outside the registered ladder. Fitted on the LEVEL-scale variance target under squared
+        // error, so — unlike every log-space model above — it produces a conditional-mean variance
+        // forecast directly and is deliberately NOT retransformed. See GradientBoostedTreesModel.
+        GradientBoostedTreesModel? gbt = null;
+        if (includeExploratoryGbt)
+        {
+            gbt = GradientBoostedTrees.Fit(train.Select(CandidateFeatures).ToList(), trainActuals);
+        }
+
+        // ---- VIX halves, threshold from the TRAINING window only ----
+        // H1 requires the improvement to be positive in both VIX halves; the registration requires
+        // regime thresholds to be train-defined. Splitting on the median of the test block would
+        // define the regimes with the data used to judge them.
+        var trainMedianLogVix2 = Median(train.Select(r => r.LogPriorVix2));
+
         // ---- Score the test block ----
         var dailyResults = new List<VolResidualDailyResult>(test.Count);
+        var gbtFloorHits = 0;
 
         foreach (var row in test)
         {
@@ -146,11 +183,27 @@ public static class VolResidualFoldRunner
                 [VolResidualModelKeys.Corrected] = CandidateForecast(row),
             };
 
+            if (gbt is not null)
+            {
+                var features = CandidateFeatures(row);
+                forecasts[VolResidualModelKeys.Gbt] = gbt.Predict(features);
+                if (gbt.FloorBinds(features)) gbtFloorHits++;
+            }
+
             var qlike = forecasts.ToDictionary(
                 kvp => kvp.Key,
                 kvp => QlikeRetransformation.Loss(row.ActualVariance, kvp.Value));
 
-            dailyResults.Add(new VolResidualDailyResult(row.Date, split.Fold.Name, row.ActualVariance, forecasts, qlike));
+            // LogPriorVix2 = log((VIX/100)^2), so VIX = 100 * exp(LogPriorVix2 / 2). Reported for
+            // readability only; the regime split below is made on the monotone log scale directly,
+            // so the two orderings are identical and no rounding can move a day between halves.
+            var priorVix = 100.0 * Math.Exp(row.LogPriorVix2 / 2.0);
+            var regime = row.LogPriorVix2 <= trainMedianLogVix2
+                ? VolResidualVixRegimes.Low
+                : VolResidualVixRegimes.High;
+
+            dailyResults.Add(new VolResidualDailyResult(
+                row.Date, split.Fold.Name, row.ActualVariance, forecasts, qlike, priorVix, regime));
         }
 
         return new VolResidualFoldResult(
@@ -160,7 +213,15 @@ public static class VolResidualFoldRunner
             test[0].Date,
             test[^1].Date,
             train.Count,
-            dailyResults);
+            dailyResults,
+            gbtFloorHits);
+    }
+
+    private static double Median(IEnumerable<double> values)
+    {
+        var sorted = values.OrderBy(v => v).ToList();
+        var middle = sorted.Count / 2;
+        return sorted.Count % 2 == 1 ? sorted[middle] : 0.5 * (sorted[middle - 1] + sorted[middle]);
     }
 
     private static (double Mean, double PopulationStd) MeanAndPopulationStd(IEnumerable<double> values)

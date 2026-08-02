@@ -8,6 +8,16 @@ public static class VolResidualModelKeys
     public const string HarX = "HARX";
     public const string Corrected = "CORRECTED";
 
+    /// <summary>
+    /// Ladder rung 4, gradient-boosted trees. Present ONLY on an exploratory run: the registration
+    /// runs rung 4 only if rung 3 passes the H1 gate, and it has not. See
+    /// <see cref="VolResidualExploratoryRung"/>.
+    /// </summary>
+    public const string Gbt = "GBT";
+
     /// <summary>The primary gate — H1 is measured against this model, never HAR.</summary>
     public const string Gate = HarX;
+
+    /// <summary>The registered candidate H1 adjudicates. Never <see cref="Gbt"/>.</summary>
+    public const string RegisteredCandidate = Corrected;
 }

@@ -124,6 +124,7 @@ Governs behaviour; not a suggestion to surface and move past. Check the active p
 |---|---|---|
 | Phase 1–3 and Phase 7 implementation (recorder, backfill, snapshots, execution simulator) | Sonnet | medium |
 | Phase 4 implementation (features, labels, baselines, study runner) | Sonnet | high |
+| Phase 9 implementation (ThetaData chain ingestion) | Sonnet | high |
 | Phase 5, 6, 8 (residual models + gates, implied-vs-forecast study, shadow/live ops) | Opus | high |
 | ALL leakage reviews and order-safety reviews, any phase | Opus | high |
 | UI (`ClientApp/`) and documentation work | Haiku | low |
@@ -141,6 +142,11 @@ counted defect outcomes, not guesses — see `docs/DECISIONS.md` §16 for the ev
   must name the absent-row check AND which table the claim is measured on.
 - **(d) Read-only UI stays Haiku/low** even beside backend work. Defend this row against escalation.
   A server-side aggregation endpoint is NOT UI — it belongs to the package owning its query semantics.
+
+Phase 9's row is Sonnet/**high** rather than medium because of class (c): its correctness statement
+is a negative claim — that an as-of chain reconstruction is survivorship-free — and the review has
+to name the check that would detect a violation. "We used a vendor that serves expired contracts"
+is not that check.
 
 **Two exceptions, and only these — both require words in the prompt itself:** the prompt says not to
 apply the policy, or the prompt names a specific model/effort for this task.

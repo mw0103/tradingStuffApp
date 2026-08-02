@@ -24,6 +24,13 @@ namespace TradingStuff.Volatility.Forecasting
         public int HacLag { get; set; }
 
         /// <summary>
+        /// True when the differential series carried no usable variation, so no test was performed
+        /// and <see cref="Statistic"/> / <see cref="PValue"/> are placeholders rather than results.
+        /// Callers deriving a one-sided p-value must not read 0.0 as "exactly on the boundary".
+        /// </summary>
+        public bool Degenerate { get; set; }
+
+        /// <summary>
         /// True when the candidate's mean loss is lower. Says nothing about significance on
         /// its own - the sign and the p-value are separate questions and the gate needs both.
         /// </summary>
@@ -37,6 +44,47 @@ namespace TradingStuff.Volatility.Forecasting
             return string.Format(
                 "DM={0:F4}  p={1:F4}  meanDiff={2:+0.000000;-0.000000}  n={3}  hacLag={4}",
                 Statistic, PValue, MeanDifferential, Observations, HacLag);
+        }
+    }
+
+    /// <summary>
+    /// Outcome of a margin-adjusted Diebold-Mariano comparison, oriented so that positive means the
+    /// candidate is ahead. See <see cref="DieboldMariano.CompareWithMargin"/>.
+    /// </summary>
+    public class MarginAdjustedDieboldMarianoResult
+    {
+        /// <summary>The materiality margin used, as a fraction. 0.02 is the study's registered gate.</summary>
+        public double Tau { get; set; }
+
+        /// <summary>Mean of <c>(1 - tau)*L_gate - L_candidate</c>. Positive favours the candidate.</summary>
+        public double MeanLossAdvantage { get; set; }
+
+        /// <summary>DM statistic, positive when the candidate is ahead.</summary>
+        public double Statistic { get; set; }
+
+        /// <summary>
+        /// One-sided p-value for the directional alternative "the candidate beats the gate by at
+        /// least tau". This, not the two-sided value, is what the gate is written against.
+        /// </summary>
+        public double OneSidedPValue { get; set; }
+
+        /// <summary>Reported for completeness; the gate never reads it.</summary>
+        public double TwoSidedPValue { get; set; }
+
+        public double LongRunVariance { get; set; }
+
+        public int Observations { get; set; }
+
+        public int HacLag { get; set; }
+
+        /// <summary>No usable variation in the differential: nothing was tested. See <see cref="DieboldMarianoResult.Degenerate"/>.</summary>
+        public bool Degenerate { get; set; }
+
+        public override string ToString()
+        {
+            return string.Format(
+                "tau={0:F4}  DM={1:F4}  p1={2:F4}  meanAdvantage={3:+0.000000;-0.000000}  n={4}  hacLag={5}",
+                Tau, Statistic, OneSidedPValue, MeanLossAdvantage, Observations, HacLag);
         }
     }
 
@@ -114,6 +162,7 @@ namespace TradingStuff.Volatility.Forecasting
                 // and the statistic reaches ~1e16.
                 result.Statistic = 0.0;
                 result.PValue = 1.0;
+                result.Degenerate = true;
                 return result;
             }
 
@@ -173,10 +222,90 @@ namespace TradingStuff.Volatility.Forecasting
             return variance;
         }
 
+        /// <summary>
+        /// Margin-adjusted Diebold-Mariano, in the orientation the study's gate is written in.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// The pre-registration ("SPA, specified precisely") is explicit that the ordinary
+        /// differential is the wrong null for this study. <c>d_t = L_gate,t - L_cand,t</c> has null
+        /// <c>E[d_t] &lt;= 0</c>, so rejecting it establishes only that the candidate beats the gate
+        /// by SOME positive amount. The registered gate is materiality: beat it by tau. Hence
+        /// <c>d_t(tau) = (1 - tau)*L_gate,t - L_cand,t</c>, whose alternative is
+        /// <c>E[L_cand] &lt; (1 - tau)*E[L_gate]</c> — the gate as written. tau = 0 may be reported
+        /// alongside, labelled "evidence of some superiority", and may never stand in for the
+        /// materiality claim.
+        /// </para>
+        /// <para>
+        /// This delegates to <see cref="Compare"/> rather than re-deriving a HAC variance: the
+        /// margin adjustment is a linear rescale of one of the two loss series, so the Bartlett sum,
+        /// the lag clamp and the degeneracy guard are all the same machinery applied to a different
+        /// series. Note that the adjustment moves the long-run variance too, not just the mean —
+        /// scaling the gate leg changes the differential's autocovariances. A tau that only shifted
+        /// the point estimate and left the standard error alone would be an implementation bug.
+        /// </para>
+        /// <para>
+        /// The sign convention here is deliberately the opposite of <see cref="Compare"/>'s:
+        /// <see cref="MarginAdjustedDieboldMarianoResult.Statistic"/> is POSITIVE when the candidate
+        /// is ahead, because the gate, its one-sided p-value and every number reported beside it are
+        /// written that way. The flip happens once, here, rather than at each of the call sites that
+        /// would otherwise have to remember it.
+        /// </para>
+        /// </remarks>
+        /// <param name="candidateLosses">Per-day loss of the model under test.</param>
+        /// <param name="gateLosses">Per-day loss of the gate baseline.</param>
+        /// <param name="tau">
+        /// The registered materiality margin, as a fraction (0.02 for the study's 2% gate). Zero
+        /// gives the conventional test.
+        /// </param>
+        /// <param name="hacLag">Newey-West truncation lag; five for the daily label.</param>
+        public static MarginAdjustedDieboldMarianoResult CompareWithMargin(
+            IReadOnlyList<double> candidateLosses,
+            IReadOnlyList<double> gateLosses,
+            double tau,
+            int hacLag = 5)
+        {
+            if (gateLosses == null) throw new ArgumentNullException("gateLosses");
+            if (tau < 0.0 || tau >= 1.0)
+                throw new ArgumentOutOfRangeException("tau", tau, "The materiality margin must lie in [0, 1).");
+
+            var scaledGate = new double[gateLosses.Count];
+            for (int i = 0; i < gateLosses.Count; i++) scaledGate[i] = (1.0 - tau) * gateLosses[i];
+
+            var inner = Compare(candidateLosses, scaledGate, hacLag);
+
+            return new MarginAdjustedDieboldMarianoResult
+            {
+                Tau = tau,
+                // Compare works in candidate-minus-baseline; the study speaks in advantage.
+                MeanLossAdvantage = -inner.MeanDifferential,
+                Statistic = -inner.Statistic,
+                // A degenerate differential was never tested. Reporting the upper-tail probability of
+                // a placeholder zero statistic would hand back 0.5 — a number that looks like a
+                // result and is not one. One is the only honest answer: nothing was demonstrated.
+                OneSidedPValue = inner.Degenerate ? 1.0 : UpperTailNormalPValue(-inner.Statistic),
+                TwoSidedPValue = inner.PValue,
+                LongRunVariance = inner.LongRunVariance,
+                Observations = inner.Observations,
+                HacLag = inner.HacLag,
+                Degenerate = inner.Degenerate,
+            };
+        }
+
         /// <summary>Two-sided p-value from the standard normal distribution.</summary>
         public static double TwoSidedNormalPValue(double statistic)
         {
             return Erfc(Math.Abs(statistic) / Math.Sqrt(2.0));
+        }
+
+        /// <summary>
+        /// Upper-tail p-value, <c>P(Z &gt;= statistic)</c>. This is the one the gate needs: H1 is a
+        /// directional claim (the candidate is better), and a two-sided p-value tests a hypothesis
+        /// nobody registered.
+        /// </summary>
+        public static double UpperTailNormalPValue(double statistic)
+        {
+            return 0.5 * Erfc(statistic / Math.Sqrt(2.0));
         }
 
         /// <summary>

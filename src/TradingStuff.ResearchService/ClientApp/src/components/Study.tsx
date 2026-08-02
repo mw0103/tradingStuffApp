@@ -1,5 +1,5 @@
 import { useState, useEffect, type ReactNode } from 'react';
-import type { VolatilityResidualStudyRun } from '../types/study';
+import type { VolatilityResidualStudyRun, H1Verdict, ExploratoryRung } from '../types/study';
 import './Study.css';
 
 interface LoadingState {
@@ -358,6 +358,304 @@ const Study = () => {
     );
   };
 
+  // Render H1 Verdict Panel
+  const renderH1VerdictPanel = (h1: H1Verdict): ReactNode => {
+    return (
+      <section className="study-section h1-verdict-section">
+        <h2>H1 verdict</h2>
+        <div className="h1-verdict-panel">
+          {/* Verdict Banner */}
+          <div className={`verdict-banner verdict-${h1.verdict}`}>
+            <div className="verdict-word">{h1.verdict.toUpperCase()}</div>
+          </div>
+
+          {/* Conditions Grid */}
+          <div className="h1-conditions">
+            <div className={`condition-row ${h1.marginPasses ? 'pass' : 'fail'}`}>
+              <span className="condition-label">Pooled margin vs gate</span>
+              <span className="condition-value">{h1.marginPct.toFixed(2)}%</span>
+              <span className="condition-threshold">threshold {'>='} 2%</span>
+              <span className={`condition-marker ${h1.marginPasses ? 'pass' : 'fail'}`}>
+                {h1.marginPasses ? '✓' : '✗'}
+              </span>
+            </div>
+
+            <div className={`condition-row ${h1.dmPasses ? 'pass' : 'fail'}`}>
+              <span className="condition-label">Diebold-Mariano (margin-adjusted, τ=0.02)</span>
+              <span className="condition-value">
+                DM = {h1.dmStatistic.toFixed(3)}, p = {h1.dmPValue.toFixed(4)}
+              </span>
+              <span className="condition-threshold">threshold p {'<'} 0.05</span>
+              <span className={`condition-marker ${h1.dmPasses ? 'pass' : 'fail'}`}>
+                {h1.dmPasses ? '✓' : '✗'}
+              </span>
+            </div>
+
+            <div className={`condition-row ${h1.foldsPass ? 'pass' : 'fail'}`}>
+              <span className="condition-label">Folds positive</span>
+              <span className="condition-value">
+                {h1.foldsPositive} of {h1.foldsTotal}
+              </span>
+              <span className="condition-threshold">threshold {'>='} 2 of 3</span>
+              <span className={`condition-marker ${h1.foldsPass ? 'pass' : 'fail'}`}>
+                {h1.foldsPass ? '✓' : '✗'}
+              </span>
+            </div>
+
+            <div className={`condition-row ${h1.bootstrapExcludesZero ? 'pass' : 'fail'}`}>
+              <span className="condition-label">Bootstrap lower bound</span>
+              <span className="condition-value">{h1.bootstrapLower.toExponential(3)}</span>
+              <span className="condition-threshold">threshold {'>'} 0</span>
+              <span className={`condition-marker ${h1.bootstrapExcludesZero ? 'pass' : 'fail'}`}>
+                {h1.bootstrapExcludesZero ? '✓' : '✗'}
+              </span>
+            </div>
+
+            <div className={`condition-row ${h1.vixHalvesPositive ? 'pass' : 'fail'}`}>
+              <span className="condition-label">VIX halves both positive</span>
+              <span className="condition-value">{h1.vixHalvesPositive ? 'yes' : 'no'}</span>
+              <span className="condition-threshold">threshold both</span>
+              <span className={`condition-marker ${h1.vixHalvesPositive ? 'pass' : 'fail'}`}>
+                {h1.vixHalvesPositive ? '✓' : '✗'}
+              </span>
+            </div>
+          </div>
+
+          {/* Failed Conditions */}
+          {h1.failedConditions.length > 0 && (
+            <div className="h1-section failed-conditions">
+              <strong>Failed conditions:</strong>
+              <div className="condition-list">{h1.failedConditions.join(', ')}</div>
+            </div>
+          )}
+
+          {/* Permitted Claim */}
+          <div className="h1-section permitted-claim">
+            <div className="section-title">Permitted claim</div>
+            <p className="claim-text">{h1.permittedClaim}</p>
+            <div className="claim-basis">Basis: {h1.claimBasis}</div>
+          </div>
+
+          {/* DM Table */}
+          <div className="h1-section dm-table-section">
+            <div className="section-title">Diebold-Mariano Results</div>
+            <div className="table-wrapper">
+              <table className="h1-dm-table">
+                <thead>
+                  <tr>
+                    <th>Model</th>
+                    <th>τ</th>
+                    <th>Statistic</th>
+                    <th>One-sided p</th>
+                    <th>Mean Loss Advantage</th>
+                    <th>Observations</th>
+                    <th>HAC Lag</th>
+                    <th>Interpretation</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr className="dm-row-adjusted">
+                    <td>Margin-adjusted</td>
+                    <td>{h1.marginAdjusted.tau}</td>
+                    <td>{h1.marginAdjusted.statistic.toFixed(3)}</td>
+                    <td>{h1.marginAdjusted.pValueOneSided.toFixed(4)}</td>
+                    <td>{h1.marginAdjusted.meanLossAdvantage.toFixed(4)}</td>
+                    <td>{h1.marginAdjusted.observations}</td>
+                    <td>{h1.marginAdjusted.hacLag}</td>
+                    <td className="interpretation">{h1.marginAdjusted.interpretation}</td>
+                  </tr>
+                  <tr className="dm-row-unadjusted">
+                    <td>Unadjusted</td>
+                    <td>{h1.unadjusted.tau}</td>
+                    <td>{h1.unadjusted.statistic.toFixed(3)}</td>
+                    <td>{h1.unadjusted.pValueOneSided.toFixed(4)}</td>
+                    <td>{h1.unadjusted.meanLossAdvantage.toFixed(4)}</td>
+                    <td>{h1.unadjusted.observations}</td>
+                    <td>{h1.unadjusted.hacLag}</td>
+                    <td className="interpretation">{h1.unadjusted.interpretation}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* Folds Table */}
+          {h1.folds.length > 0 && (
+            <div className="h1-section folds-table-section">
+              <div className="section-title">Per-fold Results</div>
+              <div className="table-wrapper">
+                <table className="h1-folds-table">
+                  <thead>
+                    <tr>
+                      <th>Fold</th>
+                      <th>Days</th>
+                      <th>Gate QLIKE</th>
+                      <th>Candidate QLIKE</th>
+                      <th>Improvement %</th>
+                      <th>Sign</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {h1.folds.map((fold) => (
+                      <tr key={fold.fold} className={fold.positive ? 'positive' : 'negative'}>
+                        <td>{fold.fold}</td>
+                        <td>{fold.days}</td>
+                        <td>{fold.gateQlike.toFixed(4)}</td>
+                        <td>{fold.candidateQlike.toFixed(4)}</td>
+                        <td>{fold.improvementPct.toFixed(2)}%</td>
+                        <td className={`sign-marker ${fold.positive ? 'positive' : 'negative'}`}>
+                          {fold.positive ? '+' : '−'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+
+          {/* VIX Halves Table */}
+          {h1.vixHalves.length > 0 && (
+            <div className="h1-section vix-halves-table-section">
+              <div className="section-title">VIX Regime Results</div>
+              <div className="table-wrapper">
+                <table className="h1-vix-halves-table">
+                  <thead>
+                    <tr>
+                      <th>Regime</th>
+                      <th>Days</th>
+                      <th>Gate QLIKE</th>
+                      <th>Candidate QLIKE</th>
+                      <th>Improvement %</th>
+                      <th>Sign</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {h1.vixHalves.map((half, idx) => (
+                      <tr key={idx} className={half.positive ? 'positive' : 'negative'}>
+                        <td>{half.regime}</td>
+                        <td>{half.days}</td>
+                        <td>{half.gateQlike.toFixed(4)}</td>
+                        <td>{half.candidateQlike.toFixed(4)}</td>
+                        <td>{half.improvementPct.toFixed(2)}%</td>
+                        <td className={`sign-marker ${half.positive ? 'positive' : 'negative'}`}>
+                          {half.positive ? '+' : '−'}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          )}
+        </div>
+      </section>
+    );
+  };
+
+  // Render Exploratory Result Section
+  const renderExploratorySection = (exploratory: ExploratoryRung): ReactNode => {
+    return (
+      <section className="study-section exploratory-result-section">
+        <h2>{exploratory.label}</h2>
+
+        {/* Exploratory Warning Banner */}
+        <div className="exploratory-banner">
+          <strong>EXPLORATORY — not eligible for any claim</strong>
+          <p>{exploratory.reason}</p>
+        </div>
+
+        <div className="exploratory-content">
+          {/* Metrics */}
+          <div className="exploratory-metrics">
+            <div className="metric">
+              <span className="metric-label">Pooled QLIKE:</span>
+              <span className="metric-value">{exploratory.pooledQlike.toFixed(4)}</span>
+            </div>
+            <div className="metric">
+              <span className="metric-label">Improvement vs Gate:</span>
+              <span className="metric-value">{exploratory.improvementVsGatePct.toFixed(2)}%</span>
+            </div>
+            <div className="metric">
+              <span className="metric-label">Positivity Floor Hits:</span>
+              <span className="metric-value">{exploratory.positivityFloorHits}</span>
+            </div>
+          </div>
+
+          {/* Retransformation Note */}
+          <div className="exploratory-section">
+            <div className="section-title">Retransformation Note</div>
+            <p className="retransformation-note">{exploratory.retransformationNote}</p>
+          </div>
+
+          {/* DM Table */}
+          <div className="exploratory-section">
+            <div className="section-title">Diebold-Mariano Results</div>
+            <div className="table-wrapper">
+              <table className="exploratory-dm-table">
+                <thead>
+                  <tr>
+                    <th>Model</th>
+                    <th>τ</th>
+                    <th>Statistic</th>
+                    <th>One-sided p</th>
+                    <th>Mean Loss Advantage</th>
+                    <th>Observations</th>
+                    <th>HAC Lag</th>
+                    <th>Interpretation</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td>Margin-adjusted</td>
+                    <td>{exploratory.marginAdjusted.tau}</td>
+                    <td>{exploratory.marginAdjusted.statistic.toFixed(3)}</td>
+                    <td>{exploratory.marginAdjusted.pValueOneSided.toFixed(4)}</td>
+                    <td>{exploratory.marginAdjusted.meanLossAdvantage.toFixed(4)}</td>
+                    <td>{exploratory.marginAdjusted.observations}</td>
+                    <td>{exploratory.marginAdjusted.hacLag}</td>
+                    <td className="interpretation">{exploratory.marginAdjusted.interpretation}</td>
+                  </tr>
+                  <tr>
+                    <td>Unadjusted</td>
+                    <td>{exploratory.unadjusted.tau}</td>
+                    <td>{exploratory.unadjusted.statistic.toFixed(3)}</td>
+                    <td>{exploratory.unadjusted.pValueOneSided.toFixed(4)}</td>
+                    <td>{exploratory.unadjusted.meanLossAdvantage.toFixed(4)}</td>
+                    <td>{exploratory.unadjusted.observations}</td>
+                    <td>{exploratory.unadjusted.hacLag}</td>
+                    <td className="interpretation">{exploratory.unadjusted.interpretation}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* Frozen Hyperparameters */}
+          {Object.keys(exploratory.frozenHyperparameters).length > 0 && (
+            <div className="exploratory-section">
+              <div className="section-title">Frozen Hyperparameters</div>
+              <div className="hyperparameters-list">
+                {Object.entries(exploratory.frozenHyperparameters).map(([key, value]) => (
+                  <div key={key} className="hyperparameter-item">
+                    <span className="param-key">{key}:</span>
+                    <span className="param-value">{value}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Permitted Claim */}
+          <div className="exploratory-section">
+            <div className="section-title">Permitted Claim</div>
+            <p className="claim-text">{exploratory.permittedClaim}</p>
+          </div>
+        </div>
+      </section>
+    );
+  };
+
   return (
     <div className="study-container">
       <header className="study-header">
@@ -390,6 +688,14 @@ const Study = () => {
 
       {data && (
         <>
+          {/* Exploratory Banner */}
+          {data.isExploratory && (
+            <div className="exploratory-banner">
+              <strong>EXPLORATORY — not eligible for any claim</strong>
+              <p>{data.exploratoryReason}</p>
+            </div>
+          )}
+
           {/* Development Banner */}
           <div className="dev-banner">
             <strong>DEVELOPMENT RUN</strong>
@@ -399,6 +705,9 @@ const Study = () => {
               <code>{data.reservedHoldout.to}</code> (excluded from training and testing)
             </p>
           </div>
+
+          {/* H1 Verdict Panel */}
+          {data.status === 'ok' && data.h1 && renderH1VerdictPanel(data.h1)}
 
           {/* Insufficient Data Case */}
           {data.status === 'insufficient-data' && (
@@ -466,7 +775,7 @@ const Study = () => {
                         const improvementText = isGate ? '—' : `${formatPercent(model.improvementVsGatePct)}%`;
 
                         return (
-                          <tr key={model.key} className={isGate ? 'gate-row' : ''}>
+                          <tr key={model.key} className={isGate ? 'gate-row' : model.role === 'exploratory' ? 'exploratory-row' : ''}>
                             <td className="model-key">
                               <code>{model.key}</code>
                             </td>
@@ -483,6 +792,9 @@ const Study = () => {
                   </table>
                 </div>
               </section>
+
+              {/* Exploratory Result Section */}
+              {data.exploratory && renderExploratorySection(data.exploratory)}
 
               {/* Charts */}
               {data.daily.length > 0 && (
@@ -509,6 +821,8 @@ const Study = () => {
                         <tr>
                           <th>Date</th>
                           <th>Fold</th>
+                          <th>Prior VIX</th>
+                          <th>VIX half</th>
                           <th>Actual vol %</th>
                           <th>HAR vol %</th>
                           <th>VIX vol %</th>
@@ -526,6 +840,8 @@ const Study = () => {
                           <tr key={idx}>
                             <td className="date-cell">{day.date}</td>
                             <td className="number-cell">{day.fold}</td>
+                            <td className="number-cell">{day.priorVix !== undefined ? day.priorVix.toFixed(2) : '—'}</td>
+                            <td className="number-cell">{day.vixRegime ?? '—'}</td>
                             <td className="number-cell">{formatVolPct(day.actualRv)}</td>
                             <td className="number-cell">{formatVolPct(day.forecasts.HAR)}</td>
                             <td className="number-cell">{formatVolPct(day.forecasts.VIX)}</td>

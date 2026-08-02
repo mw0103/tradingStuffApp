@@ -14,6 +14,10 @@ public static class VolResidualEndpoints
         app.MapPost("/research/studies/vol-residual/run", async (
                 DateOnly? from,
                 DateOnly? to,
+                // Opt-in, off by default, and named for what it is. Ladder rung 4 runs only if rung 3
+                // passes the H1 gate; it has not, so any run with this set is tagged exploratory and
+                // non-registrable end to end. See VolResidualStudyRunner.ExploratoryGbtReason.
+                bool? exploratoryGbt,
                 VolResidualStudyRunner runner,
                 VolResidualStudyStore store,
                 CancellationToken cancellationToken) =>
@@ -36,7 +40,7 @@ public static class VolResidualEndpoints
 
                 try
                 {
-                    var response = await runner.RunAsync(from, to, cancellationToken);
+                    var response = await runner.RunAsync(from, to, exploratoryGbt == true, cancellationToken);
                     await store.SaveAsync(response, cancellationToken);
                     return Results.Ok(response);
                 }

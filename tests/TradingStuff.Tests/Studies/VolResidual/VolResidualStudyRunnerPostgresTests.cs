@@ -216,6 +216,125 @@ public sealed class VolResidualStudyRunnerPostgresTests
         Assert.Empty(response.Models);
     }
 
+    // ---------- exploratory runs are tagged, and never reach the trial registry ----------
+
+    /// <summary>
+    /// Seeds enough SPX/VIX history inside fold F1 (train through 2016, test from 2018) for the fold
+    /// to actually score, so the exploratory path runs end to end rather than short-circuiting on
+    /// insufficient data.
+    /// </summary>
+    private static async Task<VolResidualStudyRunner> SeedScoreableFoldOneAsync(string connectionString)
+    {
+        // 22 sessions of HAR warmup + >= 30 training rows after the 5-day purge, all inside F1's
+        // training window, then a handful of days inside its test window.
+        var trainDates = TradingDates(new DateOnly(2016, 8, 1), new DateOnly(2016, 12, 30));
+        var testDates = TradingDates(new DateOnly(2018, 2, 1), new DateOnly(2018, 3, 15));
+
+        var index = 0;
+        foreach (var date in trainDates.Concat(testDates))
+        {
+            await InsertSpxDayAsync(connectionString, date, index % 7);
+            await InsertVixDailyAsync(connectionString, date, 14.0 + index % 9);
+            index++;
+        }
+
+        return RunnerFor(connectionString);
+    }
+
+    private static async Task<long> RegisteredTrialCountAsync(string connectionString)
+    {
+        await using var connection = new NpgsqlConnection(connectionString);
+        await connection.OpenAsync();
+
+        await using var command = new NpgsqlCommand("SELECT count(*) FROM research.registered_trials", connection);
+        return (long)(await command.ExecuteScalarAsync())!;
+    }
+
+    [Fact]
+    public async Task AnExploratoryRunIsTaggedEverywhereAndLeavesTheTrialRegistryEmpty()
+    {
+        if (ServerConnectionString is not { } server) return;
+        var connectionString = await PrepareAsync(server);
+        var runner = await SeedScoreableFoldOneAsync(connectionString);
+
+        var response = await runner.RunAsync(
+            new DateOnly(2016, 1, 1), new DateOnly(2018, 12, 31), includeExploratoryGbt: true, CancellationToken.None);
+
+        Assert.Equal(VolResidualRunStatus.Ok, response.Status);
+
+        // Tagged in the API response.
+        Assert.True(response.IsExploratory);
+        Assert.False(response.Registrable);
+        Assert.NotNull(response.ExploratoryReason);
+        Assert.Contains("only if rung 3", response.ExploratoryReason);
+        Assert.Contains("registered_trials", response.ExploratoryReason);
+
+        Assert.NotNull(response.Exploratory);
+        Assert.True(response.Exploratory!.IsExploratory);
+        Assert.False(response.Exploratory.Registrable);
+        Assert.Equal(VolResidualModelKeys.Gbt, response.Exploratory.ModelKey);
+        Assert.Contains("not eligible for any claim", response.Exploratory.PermittedClaim);
+
+        Assert.Contains(response.Models, m =>
+            m.Key == VolResidualModelKeys.Gbt && m.Role == VolResidualModelRoles.Exploratory);
+
+        // Persisted, and still tagged in the stored artifact.
+        var store = new VolResidualStudyStore(ConfigurationFor(connectionString), NullLogger<VolResidualStudyStore>.Instance);
+        await store.SaveAsync(response, CancellationToken.None);
+
+        var reloaded = await store.GetLatestAsync(CancellationToken.None);
+        Assert.NotNull(reloaded);
+        Assert.True(reloaded!.IsExploratory);
+        Assert.False(reloaded.Registrable);
+        Assert.NotNull(reloaded.Exploratory);
+
+        // And the registry is untouched. This is the property the exploratory tagging exists to
+        // guarantee: a rung outside the registered ladder must not consume a variant slot.
+        Assert.Equal(0L, await RegisteredTrialCountAsync(connectionString));
+    }
+
+    [Fact]
+    public async Task ARegisteredRunFitsNoGbtAndIsNotTaggedExploratory()
+    {
+        if (ServerConnectionString is not { } server) return;
+        var connectionString = await PrepareAsync(server);
+        var runner = await SeedScoreableFoldOneAsync(connectionString);
+
+        var response = await runner.RunAsync(
+            new DateOnly(2016, 1, 1), new DateOnly(2018, 12, 31), CancellationToken.None);
+
+        Assert.Equal(VolResidualRunStatus.Ok, response.Status);
+        Assert.False(response.IsExploratory);
+        Assert.True(response.Registrable);
+        Assert.Null(response.ExploratoryReason);
+        Assert.Null(response.Exploratory);
+        Assert.DoesNotContain(response.Models, m => m.Key == VolResidualModelKeys.Gbt);
+        Assert.All(response.Daily, d => Assert.DoesNotContain(VolResidualModelKeys.Gbt, d.Forecasts.Keys));
+        Assert.Equal(0L, await RegisteredTrialCountAsync(connectionString));
+    }
+
+    [Fact]
+    public async Task TwoIdenticalRunsProduceIdenticalH1Numbers()
+    {
+        if (ServerConnectionString is not { } server) return;
+        var connectionString = await PrepareAsync(server);
+        var runner = await SeedScoreableFoldOneAsync(connectionString);
+
+        var first = await runner.RunAsync(new DateOnly(2016, 1, 1), new DateOnly(2018, 12, 31), CancellationToken.None);
+        var second = await runner.RunAsync(new DateOnly(2016, 1, 1), new DateOnly(2018, 12, 31), CancellationToken.None);
+
+        Assert.NotNull(first.H1);
+        Assert.NotNull(second.H1);
+
+        // Bit-for-bit. The seeded bootstrap is the only stochastic step in the whole pipeline, so a
+        // difference here means the seed is not doing its job.
+        Assert.Equal(first.H1!.BootstrapLower, second.H1!.BootstrapLower);
+        Assert.Equal(first.H1.DmStatistic, second.H1.DmStatistic);
+        Assert.Equal(first.H1.DmPValue, second.H1.DmPValue);
+        Assert.Equal(first.H1.MarginPct, second.H1.MarginPct);
+        Assert.Equal(first.H1.Verdict, second.H1.Verdict);
+    }
+
     [Fact]
     public async Task EnoughSessionsForFeatureRowsButNotForAScoreableFoldStillReportsInsufficientData()
     {

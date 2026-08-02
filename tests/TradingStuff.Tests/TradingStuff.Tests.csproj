@@ -21,6 +21,15 @@
   </ItemGroup>
 
   <ItemGroup>
+    <!--
+      Frozen daily QLIKE loss series from the real 2010-2023 development run. Embedded rather than
+      regenerated so the adjudication tests pin the statistics against numbers computed OUTSIDE this
+      codebase; they exercise the DM/bootstrap/verdict math on a fixed input, not the models.
+    -->
+    <EmbeddedResource Include="Studies\VolResidual\Fixtures\pooled-qlike-2018-2023.csv" />
+  </ItemGroup>
+
+  <ItemGroup>
     <ProjectReference Include="..\..\src\TradingStuff.Contracts\TradingStuff.Contracts.csproj" />
     <ProjectReference Include="..\..\src\TradingStuff.ExecutionService\TradingStuff.ExecutionService.csproj" />
     <ProjectReference Include="..\..\src\TradingStuff.RiskService\TradingStuff.RiskService.csproj" />

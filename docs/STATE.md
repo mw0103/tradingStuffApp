@@ -940,6 +940,47 @@ historical probing and passed 12/12 on re-run. Some of these tests deliberately 
 `EClientSocket`, bypassing the pacing governor, so sustained probing can trip TWS's own limits. It is
 not currently a reliable single-run gate.
 
+### H1 is adjudicable by the platform, and H1 FAILS (2026-08-02)
+
+The vol-residual study reported a pooled QLIKE margin and nothing else, so H1 — a five-condition
+conjunction — could not be resolved from the app. It now can, and the answer on real 2010-2023 data
+(1509 scored days, holdout untouched) is **fail**.
+
+| Condition | Value | Threshold | |
+|---|---|---|---|
+| Pooled margin vs HAR-X | **+3.02 %** | ≥ 2 % | pass |
+| Diebold-Mariano, **margin-adjusted τ = 0.02**, HAC lag 5 | DM = **+0.517**, p₁ = **0.3027** | p < 0.05 | **FAIL** |
+| Folds positive | 2 of 3 (+5.70 %, −0.65 %, +5.48 %) | ≥ 2 of 3 | pass |
+| Block-bootstrap lower bound | **−6.14e−3** | > 0 | **FAIL** |
+| Both train-defined VIX halves positive | low +7.07 %, high +1.45 % | both | pass |
+
+**The margin adjustment is what decides it.** At τ = 0 the same test gives DM = +1.526, p₁ = 0.0636 —
+a near miss that would have been easy to narrate upward. The registration's τ = 0.02 form tests the
+gate that was actually registered (`E[L_cand] < 0.98·E[L_gate]`), and against that the evidence is
+p = 0.30. The τ = 0 row is reported, permanently labelled "evidence of some superiority", and may
+never stand in for the materiality claim.
+
+**The permitted sentence is fixed, not chosen after the fact:** *"does not outperform a simple model
+with the same information."* CORRECTED does beat the HAR reference (0.1931 vs 0.2177), and the
+registration is explicit that this near miss is **not** "no edge" — it is the weaker and different
+statement above. The verdict object carries that sentence as data.
+
+Implementation notes worth keeping: the bootstrap is Politis-Romano stationary (mean block 20 days,
+10 000 resamples, one-sided 5 % percentile bound) on a **SplitMix64** stream rather than
+`System.Random`, because .NET does not guarantee `Random`'s sequence across runtime versions and a
+published bound must not move under a framework upgrade. The VIX-half threshold is each fold's
+**training-window** median, so the halves come out 460/1049 rather than 50/50 — that is correct, and
+it must not be read as a median split of the evaluation sample.
+
+**Exploratory rung 4 (GBT), outside the registered ladder.** Rung 4 runs only if rung 3 passes H1;
+it has not, so a GBT run is tagged `isExploratory: true` / `registrable: false` end to end — API
+response, persisted artifact, UI banner — with a reason string naming the ladder rule. It never
+touches `research.registered_trials`, and a Postgres test proves the table stays empty. Result, for
+the record: pooled QLIKE **0.3300, −65.7 % against the gate**. That is a finding about this
+specification of GBT (level-scale variance target, squared-error loss, no retransformation because
+none is owed), **not** evidence about edge in either direction. Hyperparameters are frozen at the
+registered depth ≤ 3 / ≤ 200 trees / min-child ≥ 50 with no search of any kind.
+
 ## Left
 
 Milestone 2 (research platform — sequenced in `docs/plans/ibkr-edge-research-roadmap.md`):
