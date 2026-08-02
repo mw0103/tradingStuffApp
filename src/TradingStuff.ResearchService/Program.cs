@@ -187,6 +187,7 @@ builder.Services.AddHttpClient<MarketDataServiceClient>((sp, http) =>
 builder.Services.AddSingleton<IPaperAutomationStore, PaperAutomationStore>();
 builder.Services.AddSingleton<SpyVerticalPlanner>();
 builder.Services.AddSingleton<SpyShortVolPlanner>();
+builder.Services.AddSingleton<TradingStuff.ResearchService.Studies.VrpConditioning.VolShadowMarkStore>();
 builder.Services.AddSingleton<IAutomationSignal, VolResidualSignal>();
 builder.Services.AddSingleton<PaperAutomationService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<PaperAutomationService>());
@@ -492,6 +493,7 @@ app.MapOptionChainEndpoints();
 app.MapVolResidualStudyEndpoints();
 
 app.MapVrpConditioningStudyEndpoints();
+app.MapShadowMarkEndpoints();
 
 app.MapPaperAutomationEndpoints();
 
