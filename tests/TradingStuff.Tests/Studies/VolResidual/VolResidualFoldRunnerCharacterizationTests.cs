@@ -59,6 +59,10 @@ public class VolResidualFoldRunnerCharacterizationTests
         { VolResidualModelKeys.HarX,      0.0042547836721217713, 0.0042748569223205451, 0.0042855012728469652 },
         { VolResidualModelKeys.Corrected, 0.0040207778367011586, 0.0039551399839705932, 0.0039878580000450945 },
         { VolResidualModelKeys.Gbt,       0.0042591212498039018, 0.0042591212498039018, 0.0042591212498039027 },
+        // Exploratory candidates added 2026-08-02 (docs/research/model-candidates.md B1 and A1).
+        // New keys, added deliberately; the five above were not moved.
+        { VolResidualModelKeys.EqualWeight, 0.0042534968708758869, 0.0042741106976039393, 0.004275647530729695  },
+        { VolResidualModelKeys.HarqX,       0.004020769655372832,  0.003955165065730239,  0.0039878501955974352 },
     };
 
     [Theory]
@@ -82,8 +86,9 @@ public class VolResidualFoldRunnerCharacterizationTests
         // A new prediction method must show up here deliberately. Adding one silently — or losing
         // one to a wiring change — is the failure this asserts against.
         Assert.Equal(
-            [VolResidualModelKeys.Corrected, VolResidualModelKeys.Gbt, VolResidualModelKeys.Har,
-             VolResidualModelKeys.HarX, VolResidualModelKeys.Vix],
+            [VolResidualModelKeys.Corrected, VolResidualModelKeys.EqualWeight, VolResidualModelKeys.Gbt,
+             VolResidualModelKeys.Har, VolResidualModelKeys.HarqX, VolResidualModelKeys.HarX,
+             VolResidualModelKeys.Vix],
             daily[0].Forecasts.Keys.OrderBy(k => k, StringComparer.Ordinal));
     }
 

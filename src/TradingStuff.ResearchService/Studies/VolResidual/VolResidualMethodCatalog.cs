@@ -29,6 +29,8 @@ public static class VolResidualMethodCatalog
     public static IReadOnlyList<VolResidualMethod> Exploratory { get; } =
     [
         new GbtMethod(),
+        new EqualWeightMethod(),
+        new HarqxMethod(),
     ];
 }
 
@@ -211,5 +213,91 @@ public sealed class GbtMethod : VolResidualMethod
         return new VolResidualFittedMethod(
             Forecast: r => gbt.Predict(Features(r)),
             FloorBinds: r => gbt.FloorBinds(Features(r)));
+    }
+}
+
+
+/// <summary>
+/// Candidate B1: the equal-weight average of the fitted HAR-X and calibrated-VIX forecasts.
+/// </summary>
+/// <remarks>
+/// <para>
+/// The null hypothesis of the combination tier (<c>docs/research/model-candidates.md</c> §3).
+/// Zero parameters beyond the members' own fits, so there is nothing here to overfit and nothing
+/// to tune — which is exactly why it runs first: if an unweighted average of two forecasts that
+/// disagree by construction (history-only versus option-market-only information) does not beat
+/// the gate on DM, estimated weighting schemes are unlikely to, and the tier can be closed
+/// cheaply.
+/// </para>
+/// <para>
+/// The average is taken over the members' REPORTED forecasts — after each member's own
+/// retransformation — because those are the forecasts each member would stand behind alone. No
+/// further retransformation is layered on the average: its members are already calibrated, and a
+/// combination that recalibrates its inputs is a different, parameterized candidate.
+/// </para>
+/// </remarks>
+public sealed class EqualWeightMethod : VolResidualMethod
+{
+    public override string Key => VolResidualModelKeys.EqualWeight;
+    public override bool Registered => false;
+
+    public override VolResidualFittedMethod Fit(VolResidualFoldContext context)
+    {
+        var harx = context.Require(VolResidualModelKeys.HarX);
+        var vix = context.Require(VolResidualModelKeys.Vix);
+
+        return new VolResidualFittedMethod(
+            Forecast: r => 0.5 * (harx.Forecast(r) + vix.Forecast(r)));
+    }
+}
+
+/// <summary>
+/// Candidate A1: HARQ-X — HAR-X with the daily lag attenuated by realized quarticity
+/// (Bollerslev–Patton–Quaedvlieg 2016, adapted to this study's log-space HAR-X).
+/// </summary>
+/// <remarks>
+/// <para>
+/// The premise: sqrt(RQ) proxies the sampling error of a day's realized variance, so the daily
+/// lag should be trusted less on noisily measured days. The interaction term is
+/// <c>(sqrt(RQ_{d-1}) − trainMean(sqrt(RQ))) · LogRvDMinus1</c> — demeaned on the TRAINING
+/// window, as BPQ demean, so the base daily coefficient keeps its interpretation and the model
+/// collapses to exactly HAR-X-shaped behaviour at average measurement quality.
+/// </para>
+/// <para>
+/// Fitted by OLS, not the NNLS the gate uses, and that is a considered exception: the whole
+/// point of the attenuation coefficient is that it can move the daily weight in either
+/// direction, and a non-negativity constraint would clamp away the very effect being tested.
+/// BPQ themselves estimate by OLS.
+/// </para>
+/// </remarks>
+public sealed class HarqxMethod : VolResidualMethod
+{
+    public override string Key => VolResidualModelKeys.HarqX;
+    public override bool Registered => false;
+
+    public override VolResidualFittedMethod Fit(VolResidualFoldContext context)
+    {
+        // Train-frozen centre for the quarticity proxy; never re-estimated on evaluation rows.
+        var trainMeanSqrtRq = context.Train.Average(r => Math.Sqrt(Math.Max(r.RqDMinus1, 0.0)));
+
+        double[] Features(VolResidualRawRow r) =>
+        [
+            r.LogRvDMinus1, r.MeanLogRv5, r.MeanLogRv22,
+            r.LogPriorVix2, r.Vix5DayChange, context.Divergence(r),
+            (Math.Sqrt(Math.Max(r.RqDMinus1, 0.0)) - trainMeanSqrtRq) * r.LogRvDMinus1,
+        ];
+
+        var coefficients = OrdinaryLeastSquares.Fit(
+            context.Train.Select(Features).ToList(), context.TrainLogTargets.ToList());
+
+        double LogForecast(VolResidualRawRow r) => OrdinaryLeastSquares.Predict(coefficients, Features(r));
+
+        var factor = QlikeRetransformation.FitFactor(
+            context.TrainActuals.ToList(),
+            context.Train.Select(r => Math.Exp(LogForecast(r))).ToList());
+
+        return new VolResidualFittedMethod(
+            Forecast: r => factor * Math.Exp(LogForecast(r)),
+            LogForecast: LogForecast);
     }
 }

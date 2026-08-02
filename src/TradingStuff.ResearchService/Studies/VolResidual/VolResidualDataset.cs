@@ -30,7 +30,13 @@ public sealed record VolResidualRawRow(
     double DaysToMonthlyOpex,
     double LogPriorVix2,
     double Vix5DayChange,
-    double Spx1DayLogReturn);
+    double Spx1DayLogReturn,
+    // Realized quarticity of session d-1, in the estimator's session-variance-squared units.
+    // Carried for HARQ-style measurement-error attenuation (candidate A1): sqrt(RQ) proxies the
+    // sampling error of that day's RV, so a model can trust a noisily-measured daily lag less.
+    // Zero when the source day predates quarticity being persisted - consumers treat zero as
+    // "unknown", which collapses the attenuation term to plain HAR-X behaviour for that row.
+    double RqDMinus1 = 0.0);
 
 /// <summary>One VIX daily close, keyed by the SPX-calendar trading date it was observed on.</summary>
 public sealed record VixDailyClose(DateOnly Date, double Close);
@@ -98,7 +104,8 @@ public static class VolResidualFeatureBuilder
                 DaysToNextThirdFriday(dateD),
                 logPriorVix2,
                 vix5DayChange,
-                spx1DayLogReturn));
+                spx1DayLogReturn,
+                ordered[t - 1].RealizedQuarticity));
         }
 
         return rows;

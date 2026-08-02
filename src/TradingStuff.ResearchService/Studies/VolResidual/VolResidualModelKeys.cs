@@ -15,6 +15,17 @@ public static class VolResidualModelKeys
     /// </summary>
     public const string Gbt = "GBT";
 
+    /// <summary>
+    /// Equal-weight average of the fitted HAR-X and calibrated-VIX forecasts — candidate B1 in
+    /// <c>docs/research/model-candidates.md</c>. Exploratory until registered.
+    /// </summary>
+    public const string EqualWeight = "EW-HARX-VIX";
+
+    /// <summary>
+    /// Quarticity-attenuated HAR-X — candidate A1 (HARQ-X). Exploratory until registered.
+    /// </summary>
+    public const string HarqX = "HARQX";
+
     /// <summary>The primary gate — H1 is measured against this model, never HAR.</summary>
     public const string Gate = HarX;
 

@@ -152,11 +152,13 @@ The cap is **10 registered variants** before the holdout opens; the gate thresho
 variant. Hyperparameters declared inside one registration (the elastic-net α grid, B4's discount)
 do not multiply variants; a *changed* feature set or model family does.
 
-**First, an honesty item: register the variant that already ran.** The elastic-net CORRECTED
-configuration was adjudicated before the registry existed in `main`. Its look at the data
-happened; the count is wrong until it is recorded. Register it retroactively as variant #1 with
-its known outcome (`negative`), rationale stating it predates the registry. N is then 1 and the
-next variant is judged at 0.05/2 — which is simply the truth of how many looks have occurred.
+**First, an honesty item: register the variant that already ran.** DONE 2026-08-02: the
+elastic-net CORRECTED configuration is `research.registered_trials` trial_id 1, verdict
+`negative`, every figure sourced from dev run `ed70abaa-8b7f-4246-ac39-9950aff60e69` (1509
+scored days), git sha `5b6a740…`. Its look at the data happened before the registry existed;
+now the count says so. **N = 1; the next registered variant is judged at 0.05/2 = 0.025.**
+One number worth noting from the back-computation: the largest single-year share of the gain
+was 0.480 — the concentration check would have passed.
 
 **Recommended sequence, and the budget it spends:**
 
@@ -182,3 +184,45 @@ Two standing rules, restated because every one of these candidates will tempt ag
   run and re-running "to check" is the behaviour the whole apparatus exists to make impossible at
   the registered tier; extending the same discipline to dev runs costs nothing and keeps the
   file drawer empty.
+
+
+---
+
+## 6. Execution plan
+
+Where this stands and what happens in what order. Tasks mirror this section.
+
+**Done (2026-08-02):**
+
+- Variant #1 registered retroactively with its `negative` outcome (see §5). Append-only
+  triggers verified live against the real database.
+- The fold runner restructured around `VolResidualMethodCatalog`; all five prior models
+  bit-identical through the new structure (characterization suite).
+- **B1** (`EW-HARX-VIX`) and **A1** (`HARQX`) implemented as exploratory catalog entries with
+  quarticity plumbed through the dataset. Mechanics pinned: the average is exactly the average;
+  the attenuation centre is train-frozen; corrupting test-row quarticity moves nothing it
+  should not.
+
+**Next — dev runs on real data (no slots consumed):**
+
+1. Restart the app host against the live Aspire Postgres (STATE.md: restart before any
+   end-to-end check; find ResearchService by probing `/research/status` across ports).
+2. POST the vol-residual dev run with the exploratory catalog on. The run lands in
+   `research.dev_vol_residual_runs` like every prior one; negative results are kept.
+3. Read three numbers per candidate against the HAR-X gate: pooled QLIKE margin, the
+   overlapping-DM p (for scale, not for a claim), and the low/high-VIX half split. B1's
+   question is whether averaging shrinks the error dispersion enough to matter; HARQ-X's is
+   whether the high-VIX half improves specifically.
+
+**Promotion (spends a slot each, judged at 0.025 while N=2):**
+
+4. Register the better candidate as variant #2 with frozen hyperparameters and
+   `feature_set_hash` (HARQ-X's differs: it adds the quarticity interaction). Full registered
+   run, placebo gate first, adjudicate, record the outcome — whatever it is.
+5. Then, per §5's sequence: B3 regime weights (needs B1's dev numbers as its baseline), A4
+   term-structure features (needs a short-dated strip series from the Phase 9 ingestion).
+
+**Further out, and the actual point:** the goal question is about a *decision*. Once any
+variant clears — or once it is clear none will — the VRP-conditioning study carries the
+forecast into sell / stand-aside / size terms at the 21-day horizon. A forecast improvement
+that never moves that layer is a statistics result, not an answer.
