@@ -128,3 +128,39 @@ gated rules at equal participation. The next legitimate places to look are asymm
 (scale DOWN only — cap exposure when the spread is thin, never lever above 1) and the real-
 structure payoff in the paper account, where margin and crush make drawdown reduction worth
 actual money.
+
+## 7. Review classification (2026-08-02) — the programme's current verdict table
+
+Adopted from external review; this table is the reference for what may be claimed:
+
+| Claim | Verdict |
+|---|---|
+| QCJ contains incremental information about future realized variance | **Provisionally supported** |
+| The one-day residual corrector generalizes to 21 days | **Rejected** |
+| QCJ improves economic ranking relative to HAR-X | **Supported across two rule families** |
+| QCJ can reduce drawdown under selective exposure | **Promising, not definitive** |
+| QCJ improves risk-adjusted return over constant short vol | **Not supported** |
+| Worth proceeding to paper/shadow implementation | **Yes** |
+| Ready for live capital | **No** |
+
+Framing of the central finding: *the decomposition appears to contain persistent information
+about the level or composition of future realized variance, whereas the residual corrector was
+primarily a short-horizon effect.* The 21-day result is a robustness test, not an independent
+replication — the underlying history overlaps the one-day study.
+
+Key review constraints now in force:
+
+- The QCJ vs HAR-X differential must be reported with dependence-adjusted uncertainty (HAC at
+  the overlap-appropriate lag, block bootstrap) — the point estimate is no longer the question.
+- The rule search has become adaptive; everything after the first grid is exploratory. Calmar
+  must not become the confirmatory criterion because Sharpe did not win; the scale-down mapping
+  must not be tuned toward a favorable result; the holdout is not spent on iterations. The
+  frozen response to this is `confirmatory-scale-down-protocol.md`.
+- VIX-only is the most important competing explanation and is in the frozen comparison set.
+- The scaled-always experiment was exposure-confounded; all dynamic-sizing results must report
+  realized average vega and per-unit-of-exposure figures at a matched risk budget.
+
+**The paper implementation's narrow mandate**: shadow marks first, then paper-account orders;
+hard exposure and loss limits; no live routing; no claim that paper results validate edge; full
+logging of forecast, implied level, intended size, actual fill, margin usage, realized P&L, and
+the counterfactual constant-one-vega P&L alongside every filled structure.

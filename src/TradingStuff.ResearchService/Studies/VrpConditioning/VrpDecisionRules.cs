@@ -50,8 +50,15 @@ public static class VrpDecisionRules
     /// </summary>
     public const string ScaledAlways = "scaled-always";
 
+    /// <summary>
+    /// The CONFIRMATORY rule of docs/research/confirmatory-scale-down-protocol.md, frozen there
+    /// before evaluation: full vega in buckets 3-5, half in bucket 2, quarter in bucket 1. Never
+    /// above one, never flat. No variant of this mapping may be evaluated under that protocol.
+    /// </summary>
+    public const string ScaleDown = "scale-down";
+
     public static readonly IReadOnlyList<string> All =
-        [AlwaysSell, SellWhenPositive, SellTopQuintiles, Sized, ScaledAlways];
+        [AlwaysSell, SellWhenPositive, SellTopQuintiles, Sized, ScaledAlways, ScaleDown];
 
     /// <summary>Vega position for one day under one rule. Positive = short volatility.</summary>
     public static double Position(string rule, double spread, int bucket) => rule switch
@@ -61,6 +68,7 @@ public static class VrpDecisionRules
         SellTopQuintiles => bucket >= 4 ? 1.0 : 0.0,
         Sized => bucket switch { 5 => 1.5, 4 => 1.0, 3 => 0.5, _ => 0.0 },
         ScaledAlways => 0.5 + 0.25 * (bucket - 1),
+        ScaleDown => bucket switch { 1 => 0.25, 2 => 0.5, _ => 1.0 },
         _ => throw new ArgumentOutOfRangeException(nameof(rule), rule, "Unknown decision rule."),
     };
 
@@ -87,7 +95,16 @@ public static class VrpDecisionRules
         int ThinnedObservations,
         double Participation,
         double WorstDay,
-        double MaxDrawdown)
+        double MaxDrawdown,
+        // Realized average vega over ALL days (zero-position days count as zero) - the
+        // exposure-confound guard: comparisons are void when strategies differ materially here.
+        double AverageVega = 0.0,
+        // Thinned mean P&L per unit of realized average vega - carry that cannot be bought by
+        // simply holding more.
+        double ThinnedMeanPerUnitVega = 0.0,
+        // PRIMARY metric of the frozen protocol: root mean square of NEGATIVE thinned P&L,
+        // per unit of realized average vega.
+        double DownsideDeviationPerUnitVega = 0.0)
     {
         public double Calmar =>
             MaxDrawdown > 1e-12
@@ -128,7 +145,17 @@ public static class VrpDecisionRules
                 // offset after seeing results would be one more quiet selection.
                 var thinned = pnl.Where((_, i) => i % VrpConditioningHorizon.LabelTradingDays == 0).ToList();
 
+                var averageVega = ordered.Count > 0
+                    ? ordered.Average(d => Position(rule, d.Spread[arm], d.Bucket[arm]))
+                    : 0.0;
+
                 var thinnedMean = thinned.Count > 0 ? thinned.Average() : 0.0;
+
+                // Downside deviation: RMS of the negative windows only, zero contribution from
+                // gains. Computed on the thinned series, normalized by realized average vega.
+                var downside = thinned.Count > 0
+                    ? Math.Sqrt(thinned.Sum(v => v < 0.0 ? v * v : 0.0) / thinned.Count)
+                    : 0.0;
                 var thinnedStd = PopulationStd(thinned);
                 var periodsPerYear = VrpConditioningHorizon.TradingDaysPerYear / VrpConditioningHorizon.LabelTradingDays;
                 var sharpe = thinnedStd > 1e-12
@@ -144,7 +171,10 @@ public static class VrpDecisionRules
                     thinned.Count,
                     ordered.Count > 0 ? (double)positioned.Count / ordered.Count : 0.0,
                     positioned.Count > 0 ? positioned.Min(d => d.PnlPerVegaNotional) : 0.0,
-                    MaxDrawdown(thinned)));
+                    MaxDrawdown(thinned),
+                    averageVega,
+                    averageVega > 1e-12 ? thinnedMean / averageVega : 0.0,
+                    averageVega > 1e-12 ? downside / averageVega : 0.0));
             }
         }
 
