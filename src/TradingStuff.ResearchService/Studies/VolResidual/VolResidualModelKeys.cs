@@ -53,6 +53,24 @@ public static class VolResidualModelKeys
     /// </summary>
     public const string CorrectedOverHarqCj = "CORRECTED-QCJ";
 
+    /// <summary>Elastic-net selection over the full feature pool — candidate F1. Exploratory.</summary>
+    public const string Selected = "ENET-ALL";
+
+    /// <summary>Full-pool correction over HARQ-CJ-X — candidate F2. Exploratory.</summary>
+    public const string SelectedCorrection = "CORRECTED-ALL";
+
+    /// <summary>QLIKE-optimal weights over the registered members — candidate W1. Exploratory.</summary>
+    public const string QlikeWeighted = "W-QLIKE";
+
+    /// <summary>QLIKE-optimal weights over the strong member pool — candidate W2. Exploratory.</summary>
+    public const string StrongPoolWeighted = "W-STRONG";
+
+    /// <summary>Gradient-boosted trees on the log target — candidate M1. Exploratory.</summary>
+    public const string GbtLog = "GBT-LOG";
+
+    /// <summary>Kalman-filtered time-varying-parameter HAR-X — candidate M2. Exploratory.</summary>
+    public const string TvpHar = "TVP-HAR";
+
     /// <summary>The primary gate — H1 is measured against this model, never HAR.</summary>
     public const string Gate = HarX;
 

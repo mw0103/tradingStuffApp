@@ -38,6 +38,12 @@ public static class VolResidualMethodCatalog
         new DiscountedQlikeMethod(),
         new HarqCjxMethod(),
         new CorrectedOverHarqCjMethod(),
+        new SelectedFeaturesMethod(),
+        new SelectedCorrectionMethod(),
+        new QlikeWeightedMethod(),
+        new StrongPoolWeightedMethod(),
+        new GbtLogMethod(),
+        new TvpHarMethod(),
     ];
 }
 
@@ -734,4 +740,362 @@ public sealed class CorrectedOverHarqCjMethod : CorrectedMethod
     public override bool Registered => false;
     public override string Label => "A6: elastic-net correction over HARQ-CJ-X";
     public override string Role => VolResidualModelRoles.Exploratory;
+}
+
+/// <summary>
+/// The full feature pool a selection method may choose from: every engineered feature this study
+/// has, in one vector.
+/// </summary>
+/// <remarks>
+/// Nothing here is new information — it is the union of the HAR triplet, the Tier-1 VIX block, the
+/// calendar features, and the A1/A2/A3 decomposition terms. What is new is that a model gets to
+/// decide which of them to keep, rather than a human fixing the subset in advance. Every earlier
+/// candidate is a hand-chosen sub-vector of this pool.
+/// </remarks>
+internal static class FullFeaturePool
+{
+    internal static readonly string[] Names =
+    [
+        "logRv1", "meanLogRv5", "meanLogRv22",
+        "logPriorVix2", "vix5DayChange", "divergence",
+        "logDownsideSemivar", "logUpsideSemivar",
+        "logBipower", "jumpShare",
+        "sqrtRqCentred", "sqrtRqXlogRv1",
+        "dowTue", "dowWed", "dowThu", "dowFri", "daysToOpex",
+    ];
+
+    internal static Func<VolResidualRawRow, double[]> Builder(VolResidualFoldContext context)
+    {
+        var trainMeanSqrtRq = context.Train.Average(r => Math.Sqrt(Math.Max(r.RqDMinus1, 0.0)));
+
+        return r =>
+        {
+            var (down, up) = SharxMethod.Semivariances(r);
+            var (bipower, jumpShare) = HarCjxMethod.Decomposition(r);
+            var sqrtRqCentred = Math.Sqrt(Math.Max(r.RqDMinus1, 0.0)) - trainMeanSqrtRq;
+
+            return
+            [
+                r.LogRvDMinus1, r.MeanLogRv5, r.MeanLogRv22,
+                r.LogPriorVix2, r.Vix5DayChange, context.Divergence(r),
+                Math.Log(down), Math.Log(up),
+                Math.Log(bipower), jumpShare,
+                sqrtRqCentred, sqrtRqCentred * r.LogRvDMinus1,
+                r.DayOfWeekDummies[0], r.DayOfWeekDummies[1], r.DayOfWeekDummies[2], r.DayOfWeekDummies[3],
+                r.DaysToMonthlyOpex,
+            ];
+        };
+    }
+}
+
+/// <summary>
+/// Candidate F1: elastic-net feature SELECTION over the full pool, fitted in log-variance space.
+/// </summary>
+/// <remarks>
+/// Every model before this one used a feature subset a human fixed in advance — the HAR triplet
+/// plus whichever decomposition the candidate was about. This one hands the whole pool to an
+/// elastic net with the registered alpha grid and inner blocked CV, and lets L1 decide what
+/// survives. If the earlier candidates were limited by which features a person thought to combine,
+/// this is the candidate that shows it; if selection finds nothing the hand-built subsets missed,
+/// that is a real result about the feature set rather than about anyone's imagination.
+/// </remarks>
+public sealed class SelectedFeaturesMethod : VolResidualMethod
+{
+    public override string Key => VolResidualModelKeys.Selected;
+    public override bool Registered => false;
+    public override string Label => "F1: elastic-net selection over the full feature pool";
+
+    public override VolResidualFittedMethod Fit(VolResidualFoldContext context)
+    {
+        var features = FullFeaturePool.Builder(context);
+
+        var model = ElasticNet.FitWithCrossValidation(
+            context.Train.Select(features).ToList(), context.TrainLogTargets.ToList());
+
+        double LogForecast(VolResidualRawRow r) => model.Predict(features(r));
+
+        var factor = QlikeRetransformation.FitFactor(
+            context.TrainActuals.ToList(),
+            context.Train.Select(r => Math.Exp(LogForecast(r))).ToList());
+
+        return new VolResidualFittedMethod(
+            Forecast: r => factor * Math.Exp(LogForecast(r)),
+            LogForecast: LogForecast);
+    }
+}
+
+/// <summary>
+/// Candidate F2: the elastic-net residual correction, over the best decomposition base, with the
+/// full feature pool available to the corrector.
+/// </summary>
+/// <remarks>
+/// A6 corrected HARQ-CJ-X using the registered corrector's own twelve features. This gives the
+/// corrector the full pool instead — so the base model handles the level and the corrector is free
+/// to select from everything when modelling what the base still gets wrong.
+/// </remarks>
+public sealed class SelectedCorrectionMethod : VolResidualMethod
+{
+    public override string Key => VolResidualModelKeys.SelectedCorrection;
+    public override bool Registered => false;
+    public override string Label => "F2: full-pool elastic-net correction over HARQ-CJ-X";
+
+    public override VolResidualFittedMethod Fit(VolResidualFoldContext context)
+    {
+        var baseLog = context.Require(VolResidualModelKeys.HarqCjX).LogForecast
+            ?? throw new InvalidOperationException("HARQ-CJ-X exposes no log forecast to correct.");
+
+        var baseLogByDate = context.AllRowsByDate.ToDictionary(r => r.Date, baseLog);
+        var residualByDate = context.AllRowsByDate.ToDictionary(
+            r => r.Date, r => Math.Log(r.ActualVariance) - baseLogByDate[r.Date]);
+
+        // The causal residual walk, identical in construction to the registered corrector's.
+        var meanLast5 = new Dictionary<DateOnly, double>();
+        var recent = new Queue<double>();
+        foreach (var row in context.AllRowsByDate)
+        {
+            meanLast5[row.Date] = recent.Count == 0 ? 0.0 : recent.Average();
+            recent.Enqueue(residualByDate[row.Date]);
+            if (recent.Count > 5) recent.Dequeue();
+        }
+
+        var pool = FullFeaturePool.Builder(context);
+        double[] Features(VolResidualRawRow r) => [.. pool(r), meanLast5[r.Date]];
+
+        var model = ElasticNet.FitWithCrossValidation(
+            context.Train.Select(Features).ToList(),
+            context.Train.Select(r => residualByDate[r.Date]).ToList());
+
+        double LogForecast(VolResidualRawRow r) => baseLogByDate[r.Date] + model.Predict(Features(r));
+
+        var factor = QlikeRetransformation.FitFactor(
+            context.TrainActuals.ToList(),
+            context.Train.Select(r => Math.Exp(LogForecast(r))).ToList());
+
+        return new VolResidualFittedMethod(
+            Forecast: r => factor * Math.Exp(LogForecast(r)),
+            LogForecast: LogForecast);
+    }
+}
+
+/// <summary>
+/// Candidate W1: combination weights fitted by minimizing training QLIKE — B2 done under the loss
+/// the study actually scores.
+/// </summary>
+/// <remarks>
+/// The member pool is unchanged from B2; only the objective differs. Comparing this against
+/// GR-NNLS isolates the loss mismatch exactly: same members, same rows, same out-of-fold
+/// application, different training objective.
+/// </remarks>
+public sealed class QlikeWeightedMethod : VolResidualMethod
+{
+    public override string Key => VolResidualModelKeys.QlikeWeighted;
+    public override bool Registered => false;
+    public override string Label => "W1: QLIKE-optimal combination weights";
+
+    public override VolResidualFittedMethod Fit(VolResidualFoldContext context)
+    {
+        var members = CombinationMembers.Resolve(context);
+        var weights = QlikeWeightFit.Fit(
+            context.Train.Select(r => CombinationMembers.Forecasts(members, r)).ToList(),
+            context.TrainActuals.ToList());
+
+        return new VolResidualFittedMethod(
+            Forecast: r => QlikeWeightFit.Predict(weights, CombinationMembers.Forecasts(members, r)));
+    }
+}
+
+/// <summary>
+/// Candidate W2: QLIKE-optimal weights over the STRONG member pool — the decomposition models and
+/// the corrected candidates, rather than the three registered baselines.
+/// </summary>
+/// <remarks>
+/// <para>
+/// The first combination round failed for a reason that was about the members, not about
+/// combining: calibrated VIX scores −32% against the gate, so any scheme including it is starting
+/// from a badly handicapped pool. That was never a fair test of whether combination helps.
+/// </para>
+/// <para>
+/// This pool is the four models that actually beat the gate — HARQ-CJ-X, HAR-CJ-X, HARQ-X, and the
+/// registered corrector — plus HAR-X itself as the anchor. They disagree by construction
+/// (measurement error, jump structure, residual dynamics) while all being competitive, which is
+/// the condition under which combination is supposed to pay.
+/// </para>
+/// </remarks>
+public sealed class StrongPoolWeightedMethod : VolResidualMethod
+{
+    public override string Key => VolResidualModelKeys.StrongPoolWeighted;
+    public override bool Registered => false;
+    public override string Label => "W2: QLIKE-optimal weights over the strong member pool";
+
+    internal static readonly string[] MemberKeys =
+    [
+        VolResidualModelKeys.HarX,
+        VolResidualModelKeys.HarqCjX,
+        VolResidualModelKeys.HarCjX,
+        VolResidualModelKeys.HarqX,
+        VolResidualModelKeys.Corrected,
+    ];
+
+    public override VolResidualFittedMethod Fit(VolResidualFoldContext context)
+    {
+        var members = MemberKeys.Select(k => context.Require(k).Forecast).ToArray();
+
+        double[] Forecasts(VolResidualRawRow r) => members.Select(m => m(r)).ToArray();
+
+        var weights = QlikeWeightFit.Fit(
+            context.Train.Select(Forecasts).ToList(), context.TrainActuals.ToList());
+
+        return new VolResidualFittedMethod(Forecast: r => QlikeWeightFit.Predict(weights, Forecasts(r)));
+    }
+}
+
+/// <summary>
+/// Candidate M1: gradient-boosted trees on the LOG-variance target over the full feature pool.
+/// </summary>
+/// <remarks>
+/// The recorded rung-4 dead end fitted trees to the level variance under squared error and scored
+/// −65.7% — a number that says the objective was wrong, not that trees cannot forecast variance.
+/// Squared error on a right-skewed level target spends the entire model budget on a handful of
+/// crisis days. This refits the same hyperparameters on log variance, where squared error is a
+/// sane objective and the QLIKE retransformation applies, and gives it the full feature pool.
+/// </remarks>
+public sealed class GbtLogMethod : VolResidualMethod
+{
+    public override string Key => VolResidualModelKeys.GbtLog;
+    public override bool Registered => false;
+    public override string Label => "M1: gradient-boosted trees on log variance, full pool";
+
+    public override VolResidualFittedMethod Fit(VolResidualFoldContext context)
+    {
+        var features = FullFeaturePool.Builder(context);
+
+        var gbt = GradientBoostedTrees.Fit(
+            context.Train.Select(features).ToList(), context.TrainLogTargets.ToList());
+
+        // PredictRaw, not Predict: the model's positivity floor is the smallest training LEVEL
+        // variance (~1e-5), which is meaningless against a log-space prediction (~-8.5) and would
+        // clamp every single row. The floor exists because squared-error boosting on a LEVEL target
+        // can go negative; fitting the log target removes that problem rather than needing the fix.
+        double LogForecast(VolResidualRawRow r) => gbt.PredictRaw(features(r));
+
+        var factor = QlikeRetransformation.FitFactor(
+            context.TrainActuals.ToList(),
+            context.Train.Select(r => Math.Exp(LogForecast(r))).ToList());
+
+        return new VolResidualFittedMethod(
+            Forecast: r => factor * Math.Exp(LogForecast(r)),
+            LogForecast: LogForecast);
+    }
+}
+
+/// <summary>
+/// Candidate M2: TVP-HAR — HAR-X coefficients allowed to drift, tracked by a Kalman filter.
+/// </summary>
+/// <remarks>
+/// <para>
+/// The registration's own stated mechanism is that HAR "under-reacts after volatility spikes and
+/// over-persists after calm". That is a hypothesis that HAR's COEFFICIENTS move, and no fixed-
+/// coefficient model — however flexible its functional form — can express it. This is that
+/// hypothesis stated directly: a random-walk state on the HAR-X coefficient vector, linear and
+/// Gaussian, closed-form, deterministic.
+/// </para>
+/// <para>
+/// Causality: the filter is run forward over train and test together in date order, and a row's
+/// forecast is made from the state as of the PREVIOUS day — the update using day t's realized
+/// variance happens strictly after day t's forecast is produced. The observation and state
+/// variances are set from the training window only: observation variance from the training OLS
+/// residuals, state variance as <see cref="StateNoiseRatio"/> times that, declared rather than
+/// searched.
+/// </para>
+/// </remarks>
+public sealed class TvpHarMethod : VolResidualMethod
+{
+    public override string Key => VolResidualModelKeys.TvpHar;
+    public override bool Registered => false;
+    public override string Label => "M2: TVP-HAR-X (Kalman-filtered drifting coefficients)";
+
+    /// <summary>State noise as a fraction of observation noise. Declared, not tuned.</summary>
+    public const double StateNoiseRatio = 1e-4;
+
+    public override VolResidualFittedMethod Fit(VolResidualFoldContext context)
+    {
+        double[] Features(VolResidualRawRow r) =>
+            [1.0, r.LogRvDMinus1, r.MeanLogRv5, r.MeanLogRv22,
+             r.LogPriorVix2, r.Vix5DayChange, context.Divergence(r)];
+
+        var k = 7;
+
+        // Start from the training OLS fit, with observation noise from its residuals: the filter
+        // begins where a fixed-coefficient model would and is free to drift away from there.
+        var trainDesign = context.Train.Select(r => Features(r)[1..]).ToList();
+        var ols = OrdinaryLeastSquares.Fit(trainDesign, context.TrainLogTargets.ToList());
+
+        var residualVariance = context.Train
+            .Select((r, i) => context.TrainLogTargets[i] - OrdinaryLeastSquares.Predict(ols, Features(r)[1..]))
+            .Select(e => e * e)
+            .Average();
+        var observationNoise = Math.Max(residualVariance, 1e-12);
+        var stateNoise = StateNoiseRatio * observationNoise;
+
+        var state = (double[])ols.Clone();
+
+        // FULL covariance, not a diagonal: the HAR lags are strongly correlated with each other and
+        // with the VIX block, so a per-coefficient update discards exactly the cross-terms that keep
+        // the filter stable and lets the coefficients chase each other.
+        var p = new double[k, k];
+        for (var j = 0; j < k; j++) p[j, j] = observationNoise;
+
+        // One forward pass in date order; the forecast recorded for a day uses the state BEFORE
+        // that day's outcome is seen.
+        var logForecastByDate = new Dictionary<DateOnly, double>();
+
+        foreach (var row in context.AllRowsByDate)
+        {
+            var x = Features(row);
+
+            // Predict: random-walk state, so the mean is unchanged and the covariance grows.
+            for (var j = 0; j < k; j++) p[j, j] += stateNoise;
+
+            var prediction = 0.0;
+            for (var j = 0; j < k; j++) prediction += state[j] * x[j];
+            logForecastByDate[row.Date] = prediction;
+
+            // Update on this day's realized log variance, for use by LATER days only.
+            var px = new double[k];
+            for (var i = 0; i < k; i++)
+            {
+                var sum = 0.0;
+                for (var j = 0; j < k; j++) sum += p[i, j] * x[j];
+                px[i] = sum;
+            }
+
+            var innovationVariance = observationNoise;
+            for (var j = 0; j < k; j++) innovationVariance += x[j] * px[j];
+            if (innovationVariance <= 0.0) continue;
+
+            var innovation = Math.Log(row.ActualVariance) - prediction;
+            for (var j = 0; j < k; j++) state[j] += px[j] / innovationVariance * innovation;
+
+            // P <- P - (Px)(Px)' / S, kept symmetric explicitly.
+            for (var i = 0; i < k; i++)
+            {
+                for (var j = i; j < k; j++)
+                {
+                    var updated = p[i, j] - px[i] * px[j] / innovationVariance;
+                    p[i, j] = updated;
+                    p[j, i] = updated;
+                }
+            }
+        }
+
+        double LogForecast(VolResidualRawRow r) => logForecastByDate[r.Date];
+
+        var factor = QlikeRetransformation.FitFactor(
+            context.TrainActuals.ToList(),
+            context.Train.Select(r => Math.Exp(LogForecast(r))).ToList());
+
+        return new VolResidualFittedMethod(
+            Forecast: r => factor * Math.Exp(LogForecast(r)),
+            LogForecast: LogForecast);
+    }
 }
