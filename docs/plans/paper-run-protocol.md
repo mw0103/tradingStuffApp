@@ -90,3 +90,17 @@ negative result: no adaptive sizing in v1.
    for PAPER only, never live).
 3. **Review against §Success.** Only after that: the question of a capped live pilot, which is
    a separate decision this document does not authorize.
+
+## Phase 1 operational state (2026-08-02)
+
+- Migration 021 applied to the live research database; `research.vol_shadow_marks` exists.
+- **First mark persisted** for 2026-07-31 via `POST /research/shadow-marks/run`: 710 training
+  rows (2023-08-31..2026-07-01, all labels closed), VIX 15.99, QCJ bucket 2 / HAR-X bucket 2 /
+  VIX-only bucket 3, shadow allocations 0.5/0.5/1.0. Planner intent recorded as a named refusal
+  (gateway down, weekend) — the record is honest about what could not be quoted.
+- **Standing operational requirement**: one `POST /research/shadow-marks/run` per trading day
+  after the SPX close (and after the day's bars land in `research.bars`). The endpoint is
+  idempotent per date. Until a scheduler owns this, it is a manual step and missed days are
+  visible as gaps in `GET /research/shadow-marks` — absence renders as absence, per house rule.
+- The service must be running for the endpoint to exist; the durable home is the Aspire app
+  host, not the ad-hoc process used to bootstrap the first mark.
