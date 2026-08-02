@@ -17,6 +17,7 @@ public class VrpConditioningAdjudicationTests
             [VrpConditioningArms.CalibratedVix] = 0.01,
             [VrpConditioningArms.HarX] = 0.01,
             [VrpConditioningArms.Corrected] = 0.01,
+            [VrpConditioningArms.QcjCorrected] = 0.01,
         };
 
         var qlike = new Dictionary<string, double>
@@ -25,6 +26,7 @@ public class VrpConditioningAdjudicationTests
             [VrpConditioningArms.CalibratedVix] = armLoss,
             [VrpConditioningArms.HarX] = gateLoss,
             [VrpConditioningArms.Corrected] = armLoss,
+            [VrpConditioningArms.QcjCorrected] = armLoss,
         };
 
         var spread = forecasts.ToDictionary(kvp => kvp.Key, _ => 0.001);

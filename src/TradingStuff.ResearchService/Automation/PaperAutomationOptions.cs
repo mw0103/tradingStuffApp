@@ -76,4 +76,39 @@ public sealed class PaperAutomationOptions
 
     /// <summary>Contracts per leg. One. Raising it is not an MVP change.</summary>
     public int Quantity { get; set; } = 1;
+
+    /// <summary>
+    /// Which structure the loop plans. <c>debit-vertical</c> (the original MVP shape) or
+    /// <c>short-vol-credit-put</c> (the put credit spread the VRP hypothesis is actually about).
+    /// An unknown value refuses at evaluation time - never silently falls back to either.
+    /// </summary>
+    public string Structure { get; set; } = Structures.DebitVertical;
+
+    public static class Structures
+    {
+        public const string DebitVertical = "debit-vertical";
+        public const string ShortVolCreditPut = "short-vol-credit-put";
+    }
+
+    /// <summary>
+    /// Days ahead to aim the short-vol expiration. ~30 calendar days approximates the study's
+    /// 21-trading-day horizon, so the paper structure tests the window the research was run at.
+    /// </summary>
+    public int ShortVolTargetDaysToExpiration { get; set; } = 30;
+
+    /// <summary>
+    /// Chain half-width for the short-vol window. Wider than the debit vertical's: the short put
+    /// sits OTM by <see cref="ShortVolOtmOffsetFraction"/> and its wing a further width below.
+    /// </summary>
+    public decimal ShortVolMoneynessHalfWidth { get; set; } = 0.05m;
+
+    /// <summary>How far below spot the short put sits, as a fraction. 2%: premium-rich but not at-the-money.</summary>
+    public decimal ShortVolOtmOffsetFraction { get; set; } = 0.02m;
+
+    /// <summary>
+    /// The most this loop will risk on one credit spread, per share: strike width minus credit
+    /// received. The short-vol counterpart of <see cref="MaxDebitDollars"/>, checked before
+    /// submission; the risk service recomputes its own version independently.
+    /// </summary>
+    public decimal ShortVolMaxRiskDollars { get; set; } = 0.85m;
 }

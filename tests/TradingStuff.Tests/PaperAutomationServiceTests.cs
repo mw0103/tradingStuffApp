@@ -612,6 +612,11 @@ public sealed class PaperAutomationServiceTests
                     marketDataClient,
                     options,
                     NullLogger<SpyVerticalPlanner>.Instance),
+                new SpyShortVolPlanner(
+                    new OptionChainClient(_gatewayHttp, NullLogger<OptionChainClient>.Instance),
+                    marketDataClient,
+                    options,
+                    NullLogger<SpyShortVolPlanner>.Instance),
                 new ExecutionServiceClient(_executionHttp),
                 marketDataClient,
                 new IbkrGatewayClient(_gatewayHttp, NullLogger<IbkrGatewayClient>.Instance),

@@ -50,6 +50,7 @@ public sealed class PaperAutomationService(
     ISessionClock sessionClock,
     IPaperAutomationStore store,
     SpyVerticalPlanner planner,
+    SpyShortVolPlanner shortVolPlanner,
     ExecutionServiceClient execution,
     MarketDataServiceClient marketData,
     IbkrGatewayClient gateway,
@@ -295,7 +296,20 @@ public sealed class PaperAutomationService(
         }
 
         var accountId = broker!.ManagedAccounts[0];
-        var plan = await planner.PlanAsync(accountId, tradingDate, operatorLimitPrice, cancellationToken);
+
+        // The structure switch: explicit, and an unknown value refuses rather than defaulting.
+        // A loop configured for a structure this build does not know must not trade the one it does.
+        var plan = options.Value.Structure switch
+        {
+            PaperAutomationOptions.Structures.DebitVertical =>
+                await planner.PlanAsync(accountId, tradingDate, operatorLimitPrice, cancellationToken),
+            PaperAutomationOptions.Structures.ShortVolCreditPut =>
+                await shortVolPlanner.PlanAsync(accountId, tradingDate, operatorLimitPrice, cancellationToken),
+            var unknown => OrderPlanResult.Refused(
+                $"PaperAutomation:Structure is '{unknown}', which this build does not recognise. Known values: " +
+                $"'{PaperAutomationOptions.Structures.DebitVertical}', " +
+                $"'{PaperAutomationOptions.Structures.ShortVolCreditPut}'."),
+        };
 
         if (plan.Failure is { } planFailure)
         {
