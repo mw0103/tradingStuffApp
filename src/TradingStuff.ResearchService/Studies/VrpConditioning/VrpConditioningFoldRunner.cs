@@ -1,4 +1,5 @@
 using TradingStuff.ResearchService.Studies.VolResidual;
+using TradingStuff.Volatility.Baselines;
 using TradingStuff.Volatility.Forecasting;
 
 namespace TradingStuff.ResearchService.Studies.VrpConditioning;
@@ -19,6 +20,15 @@ public static class VrpConditioningArms
     public const string Corrected = "CORRECTED";
 
     /// <summary>
+    /// The parent study's best dev candidate carried to this horizon: the continuous/jump split
+    /// with quarticity attenuation as the base, the elastic-net residual correction on top
+    /// (CORRECTED-QCJ, dev sweep 2026-08-02). Exploratory at this horizon exactly as it is at the
+    /// parent's - present so the decision layer can ask whether the better daily forecast is also
+    /// the better 21-day decision input, which is the study's actual question.
+    /// </summary>
+    public const string QcjCorrected = "QCJ_CORRECTED";
+
+    /// <summary>
     /// The comparator every DM row is measured against. HAR-X, for the same reason the parent study
     /// uses it: it is information-matched to the corrected arm on the contested dimension, so a
     /// difference against it is attributable to the mapping rather than to the inputs. Reporting the
@@ -27,7 +37,7 @@ public static class VrpConditioningArms
     /// </summary>
     public const string Gate = HarX;
 
-    public static readonly IReadOnlyList<string> All = [Unconditional, CalibratedVix, HarX, Corrected];
+    public static readonly IReadOnlyList<string> All = [Unconditional, CalibratedVix, HarX, Corrected, QcjCorrected];
 }
 
 /// <summary>
@@ -188,12 +198,64 @@ public static class VrpConditioningFoldRunner
             trainActuals, train.Select(r => Math.Exp(CorrectedRawLogForecast(r))).ToList());
         double CorrectedForecast(VrpConditioningRawRow r) => correctedFactor * Math.Exp(CorrectedRawLogForecast(r));
 
+        // ---- ARM 5: QCJ-corrected - the parent study's winning composition at this horizon ----
+        // Base: HAR-X with the daily term split into log bipower + jump share and attenuated by
+        // train-centred sqrt(RQ) (the parent's A5). Correction: the same elastic net, on THIS
+        // base's residual, with the same label-aware lagged-residual causality rule.
+        var trainMeanSqrtRq = train.Average(r => Math.Sqrt(Math.Max(r.RealizedQuarticity, 0.0)));
+
+        double[] QcjFeatures(VrpConditioningRawRow r)
+        {
+            var rv = Math.Exp(r.LogRv);
+            var bv = r.BipowerVariation > 0.0 ? r.BipowerVariation : rv;
+            var jump = Math.Max(r.JumpVariation, 0.0);
+            var total = bv + jump;
+            var jumpShare = r.BipowerVariation > 0.0 && total > 0.0 ? Math.Clamp(jump / total, 0.0, 1.0) : 0.0;
+            var logBipower = Math.Log(Math.Max(bv, 1e-6 * rv));
+            var attenuation = (Math.Sqrt(Math.Max(r.RealizedQuarticity, 0.0)) - trainMeanSqrtRq) * logBipower;
+            return
+            [
+                logBipower, jumpShare, r.MeanLogRv5, r.MeanLogRv22,
+                r.LogImpliedVariance, r.Vix5DayChange, Divergence(r), attenuation,
+            ];
+        }
+
+        var qcjBaseCoefficients = OrdinaryLeastSquares.Fit(train.Select(QcjFeatures).ToList(), trainLogTargets);
+        double QcjBaseLogForecast(VrpConditioningRawRow r) => OrdinaryLeastSquares.Predict(qcjBaseCoefficients, QcjFeatures(r));
+
+        var qcjBaseLogByDate = all.ToDictionary(r => r.Date, QcjBaseLogForecast);
+        var qcjResidualByDate = all.ToDictionary(
+            r => r.Date, r => Math.Log(r.LabelCumulativeVariance) - qcjBaseLogByDate[r.Date]);
+        var qcjMeanLast5ResidualByDate = LaggedResidualMeans(all, qcjResidualByDate);
+
+        double[] QcjCandidateFeatures(VrpConditioningRawRow r) =>
+        [
+            r.LogRv, r.MeanLogRv5, r.MeanLogRv22,
+            r.DayOfWeekDummies[0], r.DayOfWeekDummies[1], r.DayOfWeekDummies[2], r.DayOfWeekDummies[3],
+            r.DaysToMonthlyOpex,
+            qcjMeanLast5ResidualByDate[r.Date],
+            r.LogImpliedVariance, r.Vix5DayChange, Divergence(r),
+            r.SpxDrawdown22,
+        ];
+
+        var qcjModel = ElasticNet.FitWithCrossValidation(
+            train.Select(QcjCandidateFeatures).ToList(),
+            train.Select(r => qcjResidualByDate[r.Date]).ToList());
+
+        double QcjRawLogForecast(VrpConditioningRawRow r) =>
+            qcjBaseLogByDate[r.Date] + qcjModel.Predict(QcjCandidateFeatures(r));
+
+        var qcjFactor = QlikeRetransformation.FitFactor(
+            trainActuals, train.Select(r => Math.Exp(QcjRawLogForecast(r))).ToList());
+        double QcjForecast(VrpConditioningRawRow r) => qcjFactor * Math.Exp(QcjRawLogForecast(r));
+
         Dictionary<string, double> ForecastsFor(VrpConditioningRawRow r) => new()
         {
             [VrpConditioningArms.Unconditional] = unconditionalForecast,
             [VrpConditioningArms.CalibratedVix] = CalibratedVixForecast(r),
             [VrpConditioningArms.HarX] = HarxForecast(r),
             [VrpConditioningArms.Corrected] = CorrectedForecast(r),
+            [VrpConditioningArms.QcjCorrected] = QcjForecast(r),
         };
 
         // ---- Quintile breakpoints, from the TRAINING window's spreads ----

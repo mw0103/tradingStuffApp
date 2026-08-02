@@ -45,7 +45,14 @@ public sealed record VrpConditioningRawRow(
     double DaysToMonthlyOpex,
     double Vix5DayChange,
     double Spx1DayLogReturn,
-    double SpxDrawdown22);
+    double SpxDrawdown22,
+    // Decision-day realized-measure decomposition, for the QCJ arm. Day t's OWN session is in the
+    // information set at this study's decision time (the close of t), so unlike the parent study
+    // these are day t's values, not t-1's. Zero when the estimator predates them - consumers treat
+    // zero as "unknown", collapsing the decomposition to plain HAR-X behaviour for that row.
+    double RealizedQuarticity = 0.0,
+    double BipowerVariation = 0.0,
+    double JumpVariation = 0.0);
 
 /// <summary>
 /// Builds the companion study's dataset: one row per decision date that has both a full feature
@@ -117,6 +124,9 @@ public static class VrpConditioningFeatureBuilder
             var meanLogRv22 = window22.Average(d => Math.Log(d.TotalVariance));
 
             var spx1DayLogReturn = Math.Log(day.SessionClose / ordered[t - 1].SessionClose);
+            var realizedQuarticity = day.RealizedQuarticity;
+            var bipowerVariation = day.BipowerVariation;
+            var jumpVariation = day.JumpVariation;
 
             // Drawdown from the running 22-session high, at or below zero by construction. The
             // registration names "recent SPX drawdown" as one of the three conditioning state
@@ -142,7 +152,10 @@ public static class VrpConditioningFeatureBuilder
                 VolResidualFeatureBuilder.DaysToNextThirdFriday(decisionDate),
                 vix - vixMinus5,
                 spx1DayLogReturn,
-                drawdown));
+                drawdown,
+                realizedQuarticity,
+                bipowerVariation,
+                jumpVariation));
         }
 
         return rows;
