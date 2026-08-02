@@ -64,7 +64,8 @@ public class VrpConditioningAdjudicationTests
 
         return new VrpConditioningFoldResult(
             name, start.AddDays(-400), start.AddDays(-100), start, start.AddDays(days - 1), 500,
-            breakpoints, results);
+            breakpoints, results,
+            new VrpConditioningCorrectionFit(name, 1.0, 0.01, 0.0, 3, 13, false, "fixture"));
     }
 
     [Fact]

@@ -61,6 +61,8 @@ export interface VrpConditioningArmConditioning {
   arm: string;
   trainSpreadBreakpoints: number[];
   buckets: VrpConditioningBucket[];
+  spreadVsVixSpearman: number;
+  bucketAgreementWithUnconditional: number;
   pnlMonotonicity: VrpConditioningMonotonicity;
   premiumMonotonicity: VrpConditioningMonotonicity;
   realizedVarianceMonotonicity: VrpConditioningMonotonicity;
@@ -88,6 +90,17 @@ export interface VrpConditioningArmSummary {
   pooledQlike: number;
   improvementVsGatePct: number;
   folds: VrpConditioningArmFold[];
+}
+
+export interface VrpConditioningCorrectionFit {
+  fold: string;
+  alpha: number;
+  lambda: number;
+  intercept: number;
+  nonZeroCoefficients: number;
+  totalFeatures: number;
+  isNullModel: boolean;
+  note: string;
 }
 
 export interface VrpConditioningDm {
@@ -160,6 +173,8 @@ export interface VrpConditioningRun {
   conditioning: VrpConditioningArmConditioning[];
   dieboldMariano: VrpConditioningDmComparison[];
   effectiveSample: VrpConditioningEffectiveSample;
+  correctionFits: VrpConditioningCorrectionFit[];
+  correctionIsInoperativeNote: string | null;
   daily: VrpConditioningDailyRow[];
   limitations: VrpConditioningLimitations;
   registrable: boolean;

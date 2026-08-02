@@ -176,6 +176,8 @@ public static class VrpConditioningQuintiles
             arm,
             breakpoints,
             buckets,
+            SpreadVsVixSpearman(orderedDays, arm),
+            BucketAgreement(orderedDays, arm, VrpConditioningArms.Unconditional),
             Verdict(observedPnlByBucket),
             Verdict(observedPremiumByBucket),
             Verdict(observedRealizedByBucket),
@@ -184,6 +186,62 @@ public static class VrpConditioningQuintiles
             usableResamples == 0 ? 0.0 : (double)monotonePnl / usableResamples,
             usableResamples == 0 ? 0.0 : (double)monotonePremium / usableResamples,
             usableResamples);
+    }
+
+    /// <summary>
+    /// Spearman rank correlation between this arm's spread and the RAW VIX level.
+    /// </summary>
+    /// <remarks>
+    /// <b>This is the number that answers the question the study was commissioned to answer.</b> The
+    /// spread is <c>impliedVar - forecastVar</c>, and the implied leg is a deterministic function of
+    /// VIX. If the forecast leg barely moves the ORDERING, then sorting on the spread is sorting on
+    /// the VIX level with extra steps, and "a better estimate of future realized volatility" cannot
+    /// be improving WHEN you sell volatility — whatever the quintile table looks like. A quintile
+    /// table with a clean gradient and a rank correlation near 1 is a table about VIX, and without
+    /// this figure beside it there is nothing on the page that would say so.
+    /// </remarks>
+    private static double SpreadVsVixSpearman(IReadOnlyList<VrpConditioningDailyResult> days, string arm)
+    {
+        if (days.Count < 2) return double.NaN;
+
+        var vixRanks = Ranks([.. days.Select(d => d.VixLevel)]);
+        var spreadRanks = Ranks([.. days.Select(d => d.Spread[arm])]);
+
+        return Pearson(vixRanks, spreadRanks);
+    }
+
+    /// <summary>
+    /// Fraction of scored days this arm assigns to the same quintile as the do-nothing arm. The
+    /// companion figure to <see cref="SpreadVsVixSpearman"/>: it measures, in the unit the decision
+    /// is actually made in, how often a better forecast would have changed the bucket at all.
+    /// </summary>
+    private static double BucketAgreement(
+        IReadOnlyList<VrpConditioningDailyResult> days, string arm, string reference) =>
+        days.Count == 0 ? double.NaN : days.Count(d => d.Bucket[arm] == d.Bucket[reference]) / (double)days.Count;
+
+    /// <summary>Ordinal ranks, ties broken by original position — adequate for continuous series like these.</summary>
+    private static double[] Ranks(double[] values)
+    {
+        var order = Enumerable.Range(0, values.Length).OrderBy(i => values[i]).ToArray();
+        var ranks = new double[values.Length];
+        for (var i = 0; i < order.Length; i++) ranks[order[i]] = i;
+        return ranks;
+    }
+
+    private static double Pearson(double[] x, double[] y)
+    {
+        var meanX = x.Average();
+        var meanY = y.Average();
+        double sxy = 0.0, sxx = 0.0, syy = 0.0;
+
+        for (var i = 0; i < x.Length; i++)
+        {
+            sxy += (x[i] - meanX) * (y[i] - meanY);
+            sxx += (x[i] - meanX) * (x[i] - meanX);
+            syy += (y[i] - meanY) * (y[i] - meanY);
+        }
+
+        return sxx <= 0.0 || syy <= 0.0 ? double.NaN : sxy / Math.Sqrt(sxx * syy);
     }
 
     private static List<double>[] NewDrawBuffers(int resamples)

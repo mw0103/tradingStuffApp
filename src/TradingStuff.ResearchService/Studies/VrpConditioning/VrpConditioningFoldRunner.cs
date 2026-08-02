@@ -74,7 +74,8 @@ public sealed record VrpConditioningFoldResult(
     DateOnly TestTo,
     int TrainRows,
     IReadOnlyDictionary<string, double[]> TrainSpreadBreakpoints,
-    IReadOnlyList<VrpConditioningDailyResult> DailyResults);
+    IReadOnlyList<VrpConditioningDailyResult> DailyResults,
+    VrpConditioningCorrectionFit CorrectionFit);
 
 /// <summary>
 /// Fits all four arms on one fold's training block and scores them on its test block.
@@ -254,7 +255,44 @@ public static class VrpConditioningFoldRunner
             test[^1].Date,
             train.Count,
             breakpoints,
-            dailyResults);
+            dailyResults,
+            DescribeCorrection(split.Fold.Name, candidateModel));
+    }
+
+    /// <summary>
+    /// Records what the residual model actually selected, and says so out loud when it selected
+    /// nothing.
+    /// </summary>
+    /// <remarks>
+    /// <b>This exists because of docs/LESSONS.md #3 — absence renders as health.</b> When the inner
+    /// blocked CV picks the intercept-only model, the corrected arm's forecast is not merely CLOSE to
+    /// the gate's, it is EXACTLY equal to it, and the two rows in the arms table become
+    /// indistinguishable. Without this record that reads as "the correction agreed with the gate",
+    /// which is a completely different finding from "the correction does not exist". The identity is
+    /// exact and worth spelling out: with an intercept-only model the raw log forecast is
+    /// <c>harxLog + c</c>, so the raw level forecast is <c>e^c * x</c>; the model-specific QLIKE
+    /// retransformation factor is then <c>mean(y/(e^c * x)) = harxFactor / e^c</c>, and the product
+    /// is <c>harxFactor * x</c> — the gate's own forecast, with <c>c</c> cancelled exactly. This is
+    /// the retransformation discipline working as designed, not a defect.
+    /// </remarks>
+    private static VrpConditioningCorrectionFit DescribeCorrection(string foldName, ElasticNetModel model)
+    {
+        var nonZero = model.Coefficients.Count(c => Math.Abs(c) > 1e-14);
+
+        var note = nonZero == 0
+            ? "NULL MODEL. The inner blocked 5-fold CV found no lambda at which any registered feature " +
+              "improved held-out error on the HAR-X residual, so every slope was shrunk to zero and only " +
+              "an intercept remains. An intercept-only correction is a constant multiplicative shift in " +
+              "level space, which this model's own QLIKE retransformation factor absorbs exactly — so " +
+              "the corrected arm's forecasts are IDENTICAL to the gate's, day for day, to floating-point " +
+              "round-off — not merely close to them. Read the two identical rows as 'the correction adds nothing at this horizon', " +
+              "never as 'the two models agree'."
+            : $"{nonZero} of {model.Coefficients.Length} registered features retained a non-zero " +
+              "coefficient after the inner blocked 5-fold CV.";
+
+        return new VrpConditioningCorrectionFit(
+            foldName, model.Alpha, model.Lambda, model.Intercept, nonZero, model.Coefficients.Length,
+            nonZero == 0, note);
     }
 
     /// <summary>

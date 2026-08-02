@@ -2,10 +2,11 @@ import { useState, useEffect } from 'react';
 import Coverage from './components/Coverage';
 import Backfill from './components/Backfill';
 import Study from './components/Study';
+import Vrp from './components/Vrp';
 import Automation from './components/Automation';
 import OptionChains from './components/OptionChains';
 
-type Page = 'coverage' | 'backfill' | 'study' | 'automation' | 'options';
+type Page = 'coverage' | 'backfill' | 'study' | 'vrp' | 'automation' | 'options';
 
 function App() {
   const [currentPage, setCurrentPage] = useState<Page>('coverage');
@@ -14,6 +15,7 @@ function App() {
     const pageFor = (pathname: string): Page => {
       if (pathname.includes('/automation')) return 'automation';
       if (pathname.includes('/options')) return 'options';
+      if (pathname.includes('/vrp')) return 'vrp';
       if (pathname.includes('/study')) return 'study';
       if (pathname.includes('/backfill')) return 'backfill';
       return 'coverage';
@@ -57,6 +59,12 @@ function App() {
             Study
           </button>
           <button
+            className={`nav-link ${currentPage === 'vrp' ? 'active' : ''}`}
+            onClick={() => navigateTo('vrp')}
+          >
+            VRP
+          </button>
+          <button
             className={`nav-link ${currentPage === 'automation' ? 'active' : ''}`}
             onClick={() => navigateTo('automation')}
           >
@@ -74,6 +82,7 @@ function App() {
         {currentPage === 'coverage' && <Coverage />}
         {currentPage === 'backfill' && <Backfill />}
         {currentPage === 'study' && <Study />}
+        {currentPage === 'vrp' && <Vrp />}
         {currentPage === 'automation' && <Automation />}
         {currentPage === 'options' && <OptionChains />}
       </main>

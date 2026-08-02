@@ -126,8 +126,31 @@ public sealed class VrpConditioningStudyRunner(
                 $"{orderedDays.Count} scored decision dates carry {thinned.Count} non-overlapping " +
                 $"{VrpConditioningHorizon.LabelTradingDays}-session windows. The effective sample is " +
                 "smaller still, because volatility is persistent across adjacent windows too."),
+            [.. foldResults.OrderBy(f => f.TestFrom).Select(f => f.CorrectionFit)],
+            CorrectionNote(foldResults),
             BuildDailyRows(orderedDays),
             VrpConditioningLimitations.Registered);
+    }
+
+    /// <summary>
+    /// Names the case where the corrected arm is arithmetically identical to the gate, so nobody has
+    /// to work out from two identical table rows whether the correction agreed or simply did not
+    /// exist. See <c>VrpConditioningFoldRunner.DescribeCorrection</c> for the algebra.
+    /// </summary>
+    private static string? CorrectionNote(IReadOnlyList<VrpConditioningFoldResult> foldResults)
+    {
+        if (!foldResults.All(f => f.CorrectionFit.IsNullModel)) return null;
+
+        return
+            $"THE RESIDUAL CORRECTION IS INOPERATIVE ON THIS DATA. All {foldResults.Count} fold(s) " +
+            "selected the null model: the inner blocked 5-fold CV found no lambda at which any of the " +
+            "registered features improved held-out error on the HAR-X residual, so only an intercept " +
+            $"survived. An intercept-only correction is a constant multiplicative shift, which the " +
+            $"'{VrpConditioningArms.Corrected}' arm's own QLIKE retransformation factor absorbs exactly, " +
+            $"making its forecasts IDENTICAL to '{VrpConditioningArms.HarX}' day for day, to floating-point round-off. The two arms " +
+            "therefore show identical pooled QLIKE, identical quintile buckets and a degenerate " +
+            "Diebold-Mariano row (p = 1, nothing tested). Read that as 'at a 21-trading-day horizon the " +
+            "registered residual correction adds nothing', NOT as 'the two models agree'.";
     }
 
     private static List<VrpConditioningArmConditioning> BuildConditioning(
@@ -201,6 +224,8 @@ public sealed class VrpConditioningStudyRunner(
             Conditioning: [],
             DieboldMariano: [],
             new VrpConditioningEffectiveSample(0, 0, VrpConditioningHorizon.LabelTradingDays, "Nothing was scored."),
+            CorrectionFits: [],
+            CorrectionIsInoperativeNote: null,
             Daily: [],
             VrpConditioningLimitations.Registered);
 }

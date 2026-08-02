@@ -28,6 +28,13 @@ public sealed record VrpConditioningRunResponse(
     IReadOnlyList<VrpConditioningArmConditioning> Conditioning,
     IReadOnlyList<VrpConditioningDmComparison> DieboldMariano,
     VrpConditioningEffectiveSample EffectiveSample,
+    IReadOnlyList<VrpConditioningCorrectionFit> CorrectionFits,
+    // <summary>
+    // Set when the residual correction selected the null model on EVERY fold, in which case the
+    // corrected arm is arithmetically identical to the gate and the arms table shows two identical
+    // rows. Null when at least one fold retained a coefficient.
+    // </summary>
+    string? CorrectionIsInoperativeNote,
     IReadOnlyList<VrpConditioningDailyRow> Daily,
     VrpConditioningLimitations Limitations,
     // <summary>
@@ -90,6 +97,20 @@ public sealed record VrpConditioningDesign(
 public sealed record VrpConditioningArmFold(
     string Fold, DateOnly TrainFrom, DateOnly TrainTo, DateOnly TestFrom, DateOnly TestTo, double Qlike, int Days);
 
+/// <summary>
+/// What the residual model actually selected on one fold, and — when it selected nothing — why the
+/// corrected arm's numbers are then EXACTLY the gate's rather than merely similar.
+/// </summary>
+public sealed record VrpConditioningCorrectionFit(
+    string Fold,
+    double Alpha,
+    double Lambda,
+    double Intercept,
+    int NonZeroCoefficients,
+    int TotalFeatures,
+    bool IsNullModel,
+    string Note);
+
 public sealed record VrpConditioningArmSummary(
     string Key,
     string Label,
@@ -133,10 +154,22 @@ public sealed record VrpConditioningBucket(
 /// Fraction of block-bootstrap resamples in which the five bucket means of the P&amp;L proxy are
 /// monotone. A stability diagnostic for the shape — NOT a p-value, and not to be reported as one.
 /// </param>
+/// <param name="SpreadVsVixSpearman">
+/// Rank correlation between this arm's spread and the RAW VIX level. Near 1 means the conditioning
+/// variable is the VIX level relabelled, and the forecast leg is not deciding anything — which is
+/// the direct answer to "can a better estimate improve WHEN you sell volatility?" and must be read
+/// beside the quintile table, never after it.
+/// </param>
+/// <param name="BucketAgreementWithUnconditional">
+/// Fraction of scored days this arm puts in the same quintile as the do-nothing arm. The same
+/// question asked in the unit the decision is made in.
+/// </param>
 public sealed record VrpConditioningArmConditioning(
     string Arm,
     IReadOnlyList<double> TrainSpreadBreakpoints,
     IReadOnlyList<VrpConditioningBucket> Buckets,
+    double SpreadVsVixSpearman,
+    double BucketAgreementWithUnconditional,
     VrpConditioningMonotonicity PnlMonotonicity,
     VrpConditioningMonotonicity PremiumMonotonicity,
     VrpConditioningMonotonicity RealizedVarianceMonotonicity,

@@ -103,6 +103,51 @@ public class VrpConditioningQuintileTests
     }
 
     [Fact]
+    public void TheArmReportsHowMuchOfItsConditioningIsJustTheVixLevel()
+    {
+        // The spread is impliedVar - forecastVar and the implied leg is a function of VIX alone, so
+        // the study MUST say how much of the sorting the forecast leg is actually responsible for.
+        // The unconditional arm is the extreme case: its forecast is one constant, so its spread is
+        // implied variance shifted, which is a strictly monotone function of the VIX level — rank
+        // correlation exactly 1, and every bucket identical to its own.
+        var dates = VrpConditioningFixture.TradingDates(300, new DateOnly(2016, 1, 4));
+        var rows = VrpConditioningFixture.Rows(dates);
+
+        var fold = new WalkForwardFold
+        {
+            Name = "T1",
+            TrainStart = dates[0].ToDateTime(TimeOnly.MinValue),
+            TrainEnd = dates[159].ToDateTime(TimeOnly.MinValue),
+            ValidationStart = dates[160].ToDateTime(TimeOnly.MinValue),
+            ValidationEnd = dates[179].ToDateTime(TimeOnly.MinValue),
+            TestStart = dates[180].ToDateTime(TimeOnly.MinValue),
+            TestEnd = dates[299].ToDateTime(TimeOnly.MinValue),
+        };
+
+        var result = VrpConditioningFoldRunner.Run(
+            VolResidualSplitter.Split(rows, r => r.Date, [fold], VrpConditioningHorizon.PurgeRows).Single());
+
+        var days = result.DailyResults.OrderBy(d => d.Date).ToList();
+
+        var unconditional = VrpConditioningQuintiles.Aggregate(
+            days, VrpConditioningArms.Unconditional, result.TrainSpreadBreakpoints[VrpConditioningArms.Unconditional]);
+
+        Assert.Equal(1.0, unconditional.SpreadVsVixSpearman, 12);
+        Assert.Equal(1.0, unconditional.BucketAgreementWithUnconditional, 12);
+
+        // And a forecast that genuinely varies must NOT be reported as a perfect VIX relabelling,
+        // or the diagnostic is measuring nothing.
+        var harx = VrpConditioningQuintiles.Aggregate(
+            days, VrpConditioningArms.HarX, result.TrainSpreadBreakpoints[VrpConditioningArms.HarX]);
+
+        Assert.True(harx.SpreadVsVixSpearman < 1.0,
+            $"HAR-X's spread has rank correlation {harx.SpreadVsVixSpearman} with the raw VIX level; a " +
+            "value of exactly 1 would mean its forecast leg never changes the ordering, which cannot " +
+            "be true of a forecast that varies day to day.");
+        Assert.InRange(harx.BucketAgreementWithUnconditional, 0.0, 1.0);
+    }
+
+    [Fact]
     public void MonotonicityIsReportedAsAShapeIncludingWhenItIsAbsent()
     {
         Assert.True(VrpConditioningQuintiles.Verdict([1.0, 2.0, 3.0, 4.0, 5.0]).IsMonotone);
