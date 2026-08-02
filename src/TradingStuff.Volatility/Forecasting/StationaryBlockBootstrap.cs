@@ -110,16 +110,71 @@ namespace TradingStuff.Volatility.Forecasting
             for (int i = 0; i < n; i++) sampleMean += differentials[i];
             sampleMean /= n;
 
+            var means = new double[resamples];
+            var b = 0;
+
+            ForEachResample(n, resamples, meanBlockLength, seed, indices =>
+            {
+                double sum = 0.0;
+                for (int t = 0; t < n; t++) sum += differentials[indices[t]];
+                means[b++] = sum / n;
+            });
+
+            Array.Sort(means);
+
+            return new StationaryBlockBootstrapResult
+            {
+                SampleMean = sampleMean,
+                LowerBound = Quantile(means, alpha),
+                Alpha = alpha,
+                Resamples = resamples,
+                MeanBlockLength = meanBlockLength,
+                Seed = seed,
+                Observations = n,
+            };
+        }
+
+        /// <summary>
+        /// Draws <paramref name="resamples"/> stationary-bootstrap index sequences over
+        /// <c>[0, n)</c> and hands each to <paramref name="consume"/>.
+        /// </summary>
+        /// <remarks>
+        /// <para>
+        /// <see cref="LowerBound"/> is written in terms of this, so the two cannot diverge: the
+        /// random stream, the geometric block lengths and the circular wrap are defined once. That
+        /// matters because a published confidence bound has to be reproducible, and a second copy of
+        /// this loop is a second thing that can drift from it.
+        /// </para>
+        /// <para>
+        /// Handing out INDICES rather than resampled values is what lets a caller bootstrap a
+        /// statistic that is not a mean of one series — the VRP-conditioning study bootstraps
+        /// quintile-bucket means, which need the whole row (spread, realized variance, payoff) that
+        /// each index points at, recomputed inside every resample.
+        /// </para>
+        /// <para>
+        /// The buffer handed to <paramref name="consume"/> is REUSED between resamples. Callers must
+        /// read it and not retain it.
+        /// </para>
+        /// </remarks>
+        public static void ForEachResample(
+            int n, int resamples, double meanBlockLength, ulong seed, Action<int[]> consume)
+        {
+            if (consume == null) throw new ArgumentNullException("consume");
+            if (n < 1) throw new ArgumentOutOfRangeException("n", n, "At least one observation is required.");
+            if (meanBlockLength < 1.0)
+                throw new ArgumentOutOfRangeException("meanBlockLength", meanBlockLength, "The mean block length must be at least one observation.");
+            if (resamples < 1)
+                throw new ArgumentOutOfRangeException("resamples", resamples, "At least one resample is required.");
+
             var restartProbability = 1.0 / meanBlockLength;
             var state = seed;
-            var means = new double[resamples];
+            var buffer = new int[n];
 
             for (int b = 0; b < resamples; b++)
             {
                 var index = (int)(NextDouble(ref state) * n);
                 if (index >= n) index = n - 1; // NextDouble is in [0,1); guard the 1-ulp edge anyway.
 
-                double sum = 0.0;
                 for (int t = 0; t < n; t++)
                 {
                     if (t > 0)
@@ -137,24 +192,11 @@ namespace TradingStuff.Volatility.Forecasting
                         }
                     }
 
-                    sum += differentials[index];
+                    buffer[t] = index;
                 }
 
-                means[b] = sum / n;
+                consume(buffer);
             }
-
-            Array.Sort(means);
-
-            return new StationaryBlockBootstrapResult
-            {
-                SampleMean = sampleMean,
-                LowerBound = Quantile(means, alpha),
-                Alpha = alpha,
-                Resamples = resamples,
-                MeanBlockLength = meanBlockLength,
-                Seed = seed,
-                Observations = n,
-            };
         }
 
         /// <summary>
@@ -162,8 +204,15 @@ namespace TradingStuff.Volatility.Forecasting
         /// <c>q*(B-1)</c> — the "type 7" definition, which is what R's <c>quantile</c> and NumPy's
         /// <c>percentile</c> both default to. Pinned so a bound is comparable with one computed
         /// outside this codebase.
+        /// <para>
+        /// Public so that everything in this repository which needs a quantile — bootstrap interval
+        /// ends, and the VRP-conditioning study's training-window quintile breakpoints — uses the
+        /// SAME definition. Quantile conventions differ at the edges by up to a whole observation,
+        /// and a bucket boundary that moves because two files disagreed about interpolation is a
+        /// defect nobody would think to look for.
+        /// </para>
         /// </summary>
-        private static double Quantile(double[] sorted, double q)
+        public static double Quantile(double[] sorted, double q)
         {
             if (sorted.Length == 1) return sorted[0];
 

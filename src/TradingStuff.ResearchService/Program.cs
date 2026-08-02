@@ -8,6 +8,7 @@ using TradingStuff.ResearchService.Persistence;
 using TradingStuff.ResearchService.Recording;
 using TradingStuff.ResearchService.Sessions;
 using TradingStuff.ResearchService.Studies.VolResidual;
+using TradingStuff.ResearchService.Studies.VrpConditioning;
 using TradingStuff.ResearchService.Universe;
 using TradingStuff.ServiceDefaults;
 using TradingStuff.Volatility.ThetaData;
@@ -144,6 +145,11 @@ builder.Services.AddSingleton<OptionChainCapabilityProbes>();
 builder.Services.AddSingleton<VolResidualBarLoader>();
 builder.Services.AddSingleton<VolResidualStudyRunner>();
 builder.Services.AddSingleton<VolResidualStudyStore>();
+
+// The companion VRP-conditioning study: the 21-trading-day version of the same pipeline, answering
+// the question the parent study's one-session horizon cannot. Shares VolResidualBarLoader above.
+builder.Services.AddSingleton<VrpConditioningStudyRunner>();
+builder.Services.AddSingleton<VrpConditioningStudyStore>();
 
 // ---- paper automation ---------------------------------------------------------------------------
 // Off unless PaperAutomation:Enabled is the exact string "true", and even then it arms only if
@@ -483,6 +489,8 @@ app.MapGet("/research/backfill/gaps", async (
 app.MapOptionChainEndpoints();
 
 app.MapVolResidualStudyEndpoints();
+
+app.MapVrpConditioningStudyEndpoints();
 
 app.MapPaperAutomationEndpoints();
 

@@ -157,10 +157,30 @@ public sealed record VolResidualFoldSplit(WalkForwardFold Fold, List<VolResidual
 public static class VolResidualSplitter
 {
     public static List<VolResidualFoldSplit> Split(
-        IReadOnlyList<VolResidualRawRow> rows, IReadOnlyList<WalkForwardFold> folds, int purgeDays = 5)
+        IReadOnlyList<VolResidualRawRow> rows, IReadOnlyList<WalkForwardFold> folds, int purgeDays = 5) =>
+        Split(rows, r => r.Date, folds, purgeDays)
+            .Select(s => new VolResidualFoldSplit(s.Fold, s.Train, s.Test))
+            .ToList();
+
+    /// <summary>
+    /// The same walk-forward cut, over any row type that can name its own date. Added so the
+    /// companion VRP-conditioning study reuses this purge rather than growing a second, subtly
+    /// different copy of it — the failure mode the parent study's own remarks describe.
+    /// </summary>
+    /// <param name="purgeDays">
+    /// Rows dropped from the tail of TRAINING. It is the caller's job to pass a purge at least as
+    /// large as its label horizon: a row dated <c>s</c> whose label reaches <c>s + h</c> leaks into
+    /// whatever block follows unless at least <c>h</c> rows are removed.
+    /// </param>
+    public static List<(WalkForwardFold Fold, List<T> Train, List<T> Test)> Split<T>(
+        IReadOnlyList<T> rows, Func<T, DateOnly> dateOf, IReadOnlyList<WalkForwardFold> folds, int purgeDays)
     {
-        var ordered = rows.OrderBy(r => r.Date).ToList();
-        var result = new List<VolResidualFoldSplit>();
+        ArgumentNullException.ThrowIfNull(rows);
+        ArgumentNullException.ThrowIfNull(dateOf);
+        ArgumentNullException.ThrowIfNull(folds);
+
+        var ordered = rows.OrderBy(dateOf).ToList();
+        var result = new List<(WalkForwardFold, List<T>, List<T>)>();
 
         foreach (var fold in folds)
         {
@@ -169,13 +189,13 @@ public static class VolResidualSplitter
             var testStart = DateOnly.FromDateTime(fold.TestStart);
             var testEnd = DateOnly.FromDateTime(fold.TestEnd);
 
-            var train = ordered.Where(r => r.Date >= trainStart && r.Date <= trainEnd).ToList();
-            var test = ordered.Where(r => r.Date >= testStart && r.Date <= testEnd).ToList();
+            var train = ordered.Where(r => dateOf(r) >= trainStart && dateOf(r) <= trainEnd).ToList();
+            var test = ordered.Where(r => dateOf(r) >= testStart && dateOf(r) <= testEnd).ToList();
 
             var purge = Math.Min(purgeDays, train.Count);
             if (purge > 0) train.RemoveRange(train.Count - purge, purge);
 
-            result.Add(new VolResidualFoldSplit(fold, train, test));
+            result.Add((fold, train, test));
         }
 
         return result;
