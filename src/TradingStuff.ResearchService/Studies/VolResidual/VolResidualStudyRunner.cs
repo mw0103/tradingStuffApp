@@ -198,21 +198,14 @@ public sealed class VolResidualStudyRunner(
     private static List<VolResidualModelSummary> BuildModelSummaries(
         IReadOnlyList<VolResidualFoldResult> foldResults, bool includeExploratoryGbt)
     {
-        List<(string Key, string Label, string Role)> definitions =
-        [
-            (VolResidualModelKeys.Har, "HAR-RV", VolResidualModelRoles.Reference),
-            (VolResidualModelKeys.Vix, "B1: calibrated VIX", VolResidualModelRoles.Baseline),
-            (VolResidualModelKeys.HarX, "HAR-X (primary gate)", VolResidualModelRoles.Gate),
-            (VolResidualModelKeys.Corrected, "Corrected (elastic net on HAR-X residual)", VolResidualModelRoles.Candidate),
-        ];
+        // Derived from the catalog, never a parallel list: a method the fold runner fitted but the
+        // reporting layer forgot would be invisible in exactly the way that lets a result go
+        // unexamined. Adding a catalog entry is sufficient to have it reported.
+        var methods = includeExploratoryGbt
+            ? VolResidualMethodCatalog.Registered.Concat(VolResidualMethodCatalog.Exploratory).ToList()
+            : VolResidualMethodCatalog.Registered.ToList();
 
-        if (includeExploratoryGbt)
-        {
-            definitions.Add((
-                VolResidualModelKeys.Gbt,
-                "Rung 4: gradient-boosted trees (EXPLORATORY — not eligible for any claim)",
-                VolResidualModelRoles.Exploratory));
-        }
+        var definitions = methods.Select(m => (m.Key, m.Label, m.Role)).ToList();
 
         var gatePooled = PooledQlike(foldResults, VolResidualModelKeys.Gate);
 

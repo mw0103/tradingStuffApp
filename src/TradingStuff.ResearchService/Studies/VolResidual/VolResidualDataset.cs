@@ -36,7 +36,17 @@ public sealed record VolResidualRawRow(
     // sampling error of that day's RV, so a model can trust a noisily-measured daily lag less.
     // Zero when the source day predates quarticity being persisted - consumers treat zero as
     // "unknown", which collapses the attenuation term to plain HAR-X behaviour for that row.
-    double RqDMinus1 = 0.0);
+    double RqDMinus1 = 0.0,
+    // Signed semivariances of session d-1 (candidate A2, SHAR): the sum of squared negative and
+    // positive intraday returns, which partition TotalVariance exactly. Patton-Sheppard find the
+    // downside half carries most of the predictive content.
+    double DownsideVarianceDMinus1 = 0.0,
+    double UpsideVarianceDMinus1 = 0.0,
+    // Bipower variation and the jump component of session d-1 (candidate A3, HAR-CJ). BV estimates
+    // the continuous part of quadratic variation; the jump residual mean-reverts faster, so one
+    // coefficient across both blurs each.
+    double BipowerDMinus1 = 0.0,
+    double JumpDMinus1 = 0.0);
 
 /// <summary>One VIX daily close, keyed by the SPX-calendar trading date it was observed on.</summary>
 public sealed record VixDailyClose(DateOnly Date, double Close);
@@ -105,7 +115,11 @@ public static class VolResidualFeatureBuilder
                 logPriorVix2,
                 vix5DayChange,
                 spx1DayLogReturn,
-                ordered[t - 1].RealizedQuarticity));
+                ordered[t - 1].RealizedQuarticity,
+                ordered[t - 1].DownsideVariance,
+                ordered[t - 1].UpsideVariance,
+                ordered[t - 1].BipowerVariation,
+                ordered[t - 1].JumpVariation));
         }
 
         return rows;

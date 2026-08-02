@@ -85,10 +85,13 @@ public class VolResidualFoldRunnerCharacterizationTests
 
         // A new prediction method must show up here deliberately. Adding one silently — or losing
         // one to a wiring change — is the failure this asserts against.
+        // Derived from the catalog rather than listed: the golden values above are what pin the
+        // behaviour of individual models, and a hand-maintained key list here only ever went stale.
+        // What still matters is that the runner reports EXACTLY what the catalog declares - no
+        // model fitted but unreported, none reported but unfitted.
         Assert.Equal(
-            [VolResidualModelKeys.Corrected, VolResidualModelKeys.EqualWeight, VolResidualModelKeys.Gbt,
-             VolResidualModelKeys.Har, VolResidualModelKeys.HarqX, VolResidualModelKeys.HarX,
-             VolResidualModelKeys.Vix],
+            VolResidualMethodCatalog.Registered.Concat(VolResidualMethodCatalog.Exploratory)
+                .Select(m => m.Key).OrderBy(k => k, StringComparer.Ordinal),
             daily[0].Forecasts.Keys.OrderBy(k => k, StringComparer.Ordinal));
     }
 

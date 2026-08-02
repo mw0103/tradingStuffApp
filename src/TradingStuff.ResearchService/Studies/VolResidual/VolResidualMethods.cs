@@ -142,5 +142,18 @@ public abstract class VolResidualMethod
     /// </summary>
     public abstract bool Registered { get; }
 
+    /// <summary>
+    /// How this method is named in a run's reported model list. Defaults to the key, so a new
+    /// method is reported the moment it is added to the catalog — the reporting layer enumerates
+    /// the catalog rather than keeping a parallel list that can silently omit a model.
+    /// </summary>
+    public virtual string Label => Key;
+
+    /// <summary>
+    /// The role the run reports this method under. Anything unregistered is exploratory by
+    /// definition and cannot be anything else, so only registered methods may override.
+    /// </summary>
+    public virtual string Role => VolResidualModelRoles.Exploratory;
+
     public abstract VolResidualFittedMethod Fit(VolResidualFoldContext context);
 }
