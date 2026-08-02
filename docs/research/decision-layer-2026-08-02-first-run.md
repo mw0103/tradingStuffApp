@@ -95,3 +95,36 @@ Ranked by evidence-to-effort:
 5. **The holdout question is sharpening.** The confirmatory test the holdout is reserved for is
    now concrete: QCJ_CORRECTED vs HAR-X at both horizons, plus the sized-rule economics, once —
    after the rule family above is frozen.
+
+## 6. Addendum — the scaled-always run
+
+The rule §5.1 proposed was implemented and run in the same sweep. Result, honestly read: **it
+raises carry, not risk-adjusted return.**
+
+| Rule / arm | Thinned mean | Sharpe | Calmar | Max DD |
+|---|---|---|---|---|
+| always-sell (any arm) | 5.469 | **3.286** | **2.001** | 32.8 |
+| scaled-always, QCJ | 7.071 | 3.000 | 1.942 | 43.7 |
+| scaled-always, HARX | 6.923 | 2.907 | 1.788 | 46.5 |
+
+The +29% mean comes mostly from higher average exposure (test-window spreads sit above the
+train-frozen breakpoints, so the average step exceeds 1 vega), and the extra exposure brings
+slightly more than proportional drawdown. Per unit of risk, the constant short remains the best
+rule on this idealized payoff, on both Sharpe and Calmar.
+
+Two details worth keeping:
+
+- Within scaled-always, QCJ again beats HARX on every column — the forecast-ordering result of
+  §3 finding 3 replicates under a second rule family.
+- The UNCONDITIONAL arm (spread = implied − constant, i.e. ranking by the VIX level itself) sizes
+  as well as any model-based ranking. For SIZING specifically, the implied level alone carries
+  most of the signal; the model's edge shows in gated selection and drawdown, not in scale.
+
+Standing conclusion after two rule families: on an idealized variance-swap payoff over
+2010–2023, no declared conditioning of the short — gating or scaling, any forecast — improved
+risk-adjusted return over constantly selling one vega. The forecast's demonstrated value is
+(a) 21-day forecast accuracy itself (+2.39% QLIKE), and (b) a one-third drawdown reduction in
+gated rules at equal participation. The next legitimate places to look are asymmetric rules
+(scale DOWN only — cap exposure when the spread is thin, never lever above 1) and the real-
+structure payoff in the paper account, where margin and crush make drawdown reduction worth
+actual money.
