@@ -138,7 +138,7 @@ Adopted from external review; this table is the reference for what may be claime
 | QCJ contains incremental information about future realized variance | **Provisionally supported** |
 | The one-day residual corrector generalizes to 21 days | **Rejected** |
 | QCJ improves economic ranking relative to HAR-X | **Supported across two rule families** |
-| QCJ can reduce drawdown under selective exposure | **Promising, not definitive** |
+| QCJ can reduce drawdown under selective exposure | **Rejected at this granularity** (confirmatory run: participation artifact; see confirmatory-scale-down-result.md) |
 | QCJ improves risk-adjusted return over constant short vol | **Not supported** |
 | Worth proceeding to paper/shadow implementation | **Yes** |
 | Ready for live capital | **No** |
