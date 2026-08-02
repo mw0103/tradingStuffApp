@@ -64,13 +64,13 @@ public class LiveDecisionLayerHarness
         // ---- The decision layer ----
         var strategies = VrpDecisionRules.Evaluate(days);
 
-        Console.WriteLine("### strategy: arm | rule | meanPnl/day | thinnedMean | thinnedSharpe | nThin | particip% | worstDay | maxDD");
+        Console.WriteLine("### strategy: arm | rule | meanPnl/day | thinnedMean | thinnedSharpe | nThin | particip% | worstDay | maxDD | calmar");
         foreach (var s in strategies.OrderBy(x => x.Rule, StringComparer.Ordinal).ThenBy(x => x.Arm, StringComparer.Ordinal))
         {
             Console.WriteLine(
                 $"### {s.Arm,-14} | {s.Rule,-18} | {s.MeanPnlPerDay,10:F4} | {s.ThinnedMeanPnl,10:F4} | " +
                 $"{s.ThinnedSharpe,7:F3} | {s.ThinnedObservations,5} | {100.0 * s.Participation,6:F1} | " +
-                $"{s.WorstDay,8:F3} | {s.MaxDrawdown,8:F3}");
+                $"{s.WorstDay,8:F3} | {s.MaxDrawdown,8:F3} | {s.Calmar,7:F3}");
         }
 
         Assert.NotEmpty(days);

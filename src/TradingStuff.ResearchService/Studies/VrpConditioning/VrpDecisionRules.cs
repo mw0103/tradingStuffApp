@@ -42,8 +42,16 @@ public static class VrpDecisionRules
     /// </summary>
     public const string Sized = "sized";
 
+    /// <summary>
+    /// Always short, vega stepped by the train-frozen spread quintile: 0.5 at bucket 1 up to 1.5
+    /// at bucket 5, never flat. The rule the first run's findings point at - participation gating
+    /// destroyed carry while the forecast's RANKING added value, so this uses the ranking without
+    /// ever standing aside. Steps are declared, not fitted.
+    /// </summary>
+    public const string ScaledAlways = "scaled-always";
+
     public static readonly IReadOnlyList<string> All =
-        [AlwaysSell, SellWhenPositive, SellTopQuintiles, Sized];
+        [AlwaysSell, SellWhenPositive, SellTopQuintiles, Sized, ScaledAlways];
 
     /// <summary>Vega position for one day under one rule. Positive = short volatility.</summary>
     public static double Position(string rule, double spread, int bucket) => rule switch
@@ -52,6 +60,7 @@ public static class VrpDecisionRules
         SellWhenPositive => spread > 0.0 ? 1.0 : 0.0,
         SellTopQuintiles => bucket >= 4 ? 1.0 : 0.0,
         Sized => bucket switch { 5 => 1.5, 4 => 1.0, 3 => 0.5, _ => 0.0 },
+        ScaledAlways => 0.5 + 0.25 * (bucket - 1),
         _ => throw new ArgumentOutOfRangeException(nameof(rule), rule, "Unknown decision rule."),
     };
 
@@ -65,6 +74,10 @@ public static class VrpDecisionRules
     /// <param name="Participation">Fraction of days with a nonzero position.</param>
     /// <param name="WorstDay">Worst single overlapping-window payoff taken while positioned.</param>
     /// <param name="MaxDrawdown">Max peak-to-trough on the thinned cumulative P&amp;L.</param>
+    /// <param name="Calmar">
+    /// Annualized thinned mean over max drawdown - the drawdown-adjusted counterpart of the
+    /// Sharpe, since cutting the worst excursion is where conditioning showed value first.
+    /// </param>
     public sealed record StrategyResult(
         string Arm,
         string Rule,
@@ -74,7 +87,13 @@ public static class VrpDecisionRules
         int ThinnedObservations,
         double Participation,
         double WorstDay,
-        double MaxDrawdown);
+        double MaxDrawdown)
+    {
+        public double Calmar =>
+            MaxDrawdown > 1e-12
+                ? ThinnedMeanPnl * (VrpConditioningHorizon.TradingDaysPerYear / VrpConditioningHorizon.LabelTradingDays) / MaxDrawdown
+                : 0.0;
+    }
 
     /// <summary>
     /// Scores every arm under every rule over a set of scored days (typically all folds' test
