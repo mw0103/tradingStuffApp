@@ -87,8 +87,20 @@ const Study = () => {
     return num.toFixed(decimals);
   };
 
+  // improvementVsGatePct is ALREADY a percentage from the API (3.02 means 3.02%). This used to
+  // multiply by 100 and render "302.14%" for a 3.02% improvement — a display bug that overstated
+  // every result by two orders of magnitude while the underlying JSON was correct.
   const formatPercent = (percent: number): string => {
-    return (percent * 100).toFixed(2);
+    return percent.toFixed(2);
+  };
+
+  // Session realized VARIANCE is ~1e-5, so four decimal places renders every level as "0.0000".
+  // Shown as annualised volatility in % instead: sqrt(variance * 252) * 100. That is the unit the
+  // numbers are actually discussed in ("VIX was 18"), and it makes the columns readable without
+  // changing anything the models were scored on — QLIKE is still computed on variance server-side.
+  const formatVolPct = (variance: number): string => {
+    if (!Number.isFinite(variance) || variance < 0) return '—';
+    return (Math.sqrt(variance * 252) * 100).toFixed(2);
   };
 
   // Chart: Actual vs Forecast
@@ -194,7 +206,7 @@ const Study = () => {
               fontSize="11"
               fill="currentColor"
             >
-              {formatNumber(val, 3)}
+              {formatVolPct(val)}
             </text>
           </g>
         ))}
@@ -497,11 +509,11 @@ const Study = () => {
                         <tr>
                           <th>Date</th>
                           <th>Fold</th>
-                          <th>Actual RV</th>
-                          <th>HAR</th>
-                          <th>VIX</th>
-                          <th>HARX</th>
-                          <th>CORRECTED</th>
+                          <th>Actual vol %</th>
+                          <th>HAR vol %</th>
+                          <th>VIX vol %</th>
+                          <th>HARX vol %</th>
+                          <th>CORRECTED vol %</th>
                           <th>QLIKE (HAR)</th>
                           <th>QLIKE (VIX)</th>
                           <th>QLIKE (HARX)</th>
@@ -514,11 +526,11 @@ const Study = () => {
                           <tr key={idx}>
                             <td className="date-cell">{day.date}</td>
                             <td className="number-cell">{day.fold}</td>
-                            <td className="number-cell">{formatNumber(day.actualRv)}</td>
-                            <td className="number-cell">{formatNumber(day.forecasts.HAR)}</td>
-                            <td className="number-cell">{formatNumber(day.forecasts.VIX)}</td>
-                            <td className="number-cell">{formatNumber(day.forecasts.HARX)}</td>
-                            <td className="number-cell">{formatNumber(day.forecasts.CORRECTED)}</td>
+                            <td className="number-cell">{formatVolPct(day.actualRv)}</td>
+                            <td className="number-cell">{formatVolPct(day.forecasts.HAR)}</td>
+                            <td className="number-cell">{formatVolPct(day.forecasts.VIX)}</td>
+                            <td className="number-cell">{formatVolPct(day.forecasts.HARX)}</td>
+                            <td className="number-cell">{formatVolPct(day.forecasts.CORRECTED)}</td>
                             <td className="number-cell">{formatNumber(day.qlike.HAR, 6)}</td>
                             <td className="number-cell">{formatNumber(day.qlike.VIX, 6)}</td>
                             <td className="number-cell">{formatNumber(day.qlike.HARX, 6)}</td>
