@@ -142,12 +142,26 @@ namespace TradingStuff.Volatility.ThetaData
                     "{0} requires a subscription this account does not have. Terminal said: {1}",
                     url, Truncate(body, 300)));
 
+            // Measured live against the Terminal 2026-08-02: /v3/option/history/quote answers a
+            // date range with no trading (e.g. a weekend, or before the contract's own listing
+            // window) with HTTP 472 and the plain-text body "No data found for your request" - a
+            // THIRD spelling of "no data", distinct from both the 200-with-error-body shape checked
+            // below and the two exceptional status codes above. Checked before the generic
+            // "!IsSuccessStatusCode" branch, or this would be misclassified as a generic
+            // InvalidOperationException and a caller (this ingestion coordinator included) would
+            // retry a legitimately-empty result as a transient failure until it exhausts its
+            // attempt budget instead of settling it once as empty.
+            if ((int)response.StatusCode == 472)
+                throw new ThetaDataNoDataException(string.Format(
+                    "No data available for {0}. Terminal said (HTTP 472): {1}", url, Truncate(body, 300)));
+
             if (!response.IsSuccessStatusCode)
                 throw new InvalidOperationException(string.Format(
                     "{0} returned {1}: {2}", url, (int)response.StatusCode, Truncate(body, 500)));
 
             // The Terminal reports several conditions with a 200 and an error body.
-            if (body.IndexOf("No data for the specified", StringComparison.OrdinalIgnoreCase) >= 0)
+            if (body.IndexOf("No data for the specified", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                body.IndexOf("No data found for your request", StringComparison.OrdinalIgnoreCase) >= 0)
                 throw new ThetaDataNoDataException(string.Format("No data available for {0}.", url));
 
             return CsvTable.Parse(body);

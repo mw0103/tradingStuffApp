@@ -3,12 +3,14 @@ using TradingStuff.ResearchContracts;
 using TradingStuff.ResearchService.Automation;
 using TradingStuff.ResearchService.Backfill;
 using TradingStuff.ResearchService.Gateway;
+using TradingStuff.ResearchService.OptionChains;
 using TradingStuff.ResearchService.Persistence;
 using TradingStuff.ResearchService.Recording;
 using TradingStuff.ResearchService.Sessions;
 using TradingStuff.ResearchService.Studies.VolResidual;
 using TradingStuff.ResearchService.Universe;
 using TradingStuff.ServiceDefaults;
+using TradingStuff.Volatility.ThetaData;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -120,6 +122,21 @@ builder.Services.AddSingleton<GapDetector>();
 // contract is rebuilt from research.instruments plus the row's own con_id.
 builder.Services.AddSingleton<EsContractWalker>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<EsContractWalker>());
+
+// ---- Phase 9: ThetaData historical option-chain ingestion ---------------------------------------
+// A local Theta Terminal, not TWS — an entirely separate process on 127.0.0.1:25503 that proxies to
+// ThetaData and holds its own credentials, so requests from here carry none of their own (see
+// ThetaDataClient's remarks). Bound from "ThetaData" so BaseAddress/Timeout/StrikeDivisor/
+// SnapshotTimeOfDay are all operator-configurable without a code change; defaults match the client's
+// own (25503, 10-minute timeout, divisor 1 for v3, 15:45 snapshot).
+builder.Services.Configure<ThetaDataOptions>(builder.Configuration.GetSection("ThetaData"));
+builder.Services.AddSingleton(sp => new ThetaDataClient(sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<ThetaDataOptions>>().Value));
+
+builder.Services.Configure<OptionChainOptions>(builder.Configuration.GetSection("OptionChains"));
+builder.Services.AddSingleton<OptionChainStore>();
+builder.Services.AddSingleton<OptionChainCoordinator>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<OptionChainCoordinator>());
+builder.Services.AddSingleton<OptionChainCapabilityProbes>();
 
 // The volatility-forecast-residual study's DEVELOPMENT run (docs/research/volatility-forecast-residual-study.md
 // is the pre-registration; this is explicitly not the registered scripted run). Read-only over
@@ -462,6 +479,8 @@ app.MapGet("/research/backfill/gaps", async (
                 statusCode: StatusCodes.Status503ServiceUnavailable);
         }
     });
+
+app.MapOptionChainEndpoints();
 
 app.MapVolResidualStudyEndpoints();
 

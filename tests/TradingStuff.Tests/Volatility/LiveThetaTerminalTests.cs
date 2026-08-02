@@ -18,7 +18,7 @@ namespace TradingStuff.Tests.Volatility;
 /// with <c>400 Invalid right: *</c>. No mocked test could have found any of it, because a mock
 /// asserts the shape you already believe.
 /// <para>
-/// Measured 2026-08-01 against Terminal build 202607271 on a FREE subscription. SPXW lists 2226
+/// Measured 2026-08-01 against Terminal build 202607271. SPXW lists 2226
 /// expirations from 2012-06-01. The 2024-03-15 chain at 15:45 on 2024-03-04 returns 804 quotes
 /// spanning strikes 200–8000, from which the model-free integral used 340 strikes on a 5-point
 /// grid, recovering an implied volatility of 13.46% against a forward of 5143.95 and K0 of 5140.
@@ -26,10 +26,15 @@ namespace TradingStuff.Tests.Volatility;
 /// right direction for that term structure, which is a sanity check rather than a replication.
 /// </para>
 /// <para>
-/// Subscription coverage is asset-class gated. Option endpoints are open on FREE; index and stock
-/// history return 403, so <see cref="ThetaDataClient.GetIndexPriceAsync"/> and
+/// Subscription coverage is asset-class gated, and re-verified 2026-08-02: Options is now a PAID,
+/// deep subscription (SPXW back to 2012-06-01, SPX to 2012-06-16, VIX options to 2012-06-20; full
+/// NBBO both sides — see docs/FOLLOWUP.md §4.6, which corrects an earlier note in this class that
+/// wrongly said the measurements above were taken on a FREE subscription: Options never was free,
+/// only Index/Stock are gated). Index and stock history still return 403 on this subscription
+/// tier, so <see cref="ThetaDataClient.GetIndexPriceAsync"/> and
 /// <see cref="ThetaDataClient.GetStockOhlcAsync"/> are confirmed only as far as the subscription
-/// check. Read-only throughout.
+/// check — expected and harmless, since IBKR already covers both and reaches deeper (see
+/// docs/plans/ibkr-edge-research-roadmap.md Phase 9). Read-only throughout.
 /// </para>
 /// </remarks>
 [Trait("Category", "RequiresThetaTerminal")]

@@ -3,51 +3,34 @@ import Coverage from './components/Coverage';
 import Backfill from './components/Backfill';
 import Study from './components/Study';
 import Automation from './components/Automation';
+import OptionChains from './components/OptionChains';
+
+type Page = 'coverage' | 'backfill' | 'study' | 'automation' | 'options';
 
 function App() {
-  const [currentPage, setCurrentPage] = useState<'coverage' | 'backfill' | 'study' | 'automation'>('coverage');
+  const [currentPage, setCurrentPage] = useState<Page>('coverage');
 
   useEffect(() => {
+    const pageFor = (pathname: string): Page => {
+      if (pathname.includes('/automation')) return 'automation';
+      if (pathname.includes('/options')) return 'options';
+      if (pathname.includes('/study')) return 'study';
+      if (pathname.includes('/backfill')) return 'backfill';
+      return 'coverage';
+    };
+
     // Determine which page to show based on pathname
-    const pathname = window.location.pathname;
-    if (pathname.includes('/automation')) {
-      setCurrentPage('automation');
-    } else if (pathname.includes('/study')) {
-      setCurrentPage('study');
-    } else if (pathname.includes('/backfill')) {
-      setCurrentPage('backfill');
-    } else {
-      setCurrentPage('coverage');
-    }
+    setCurrentPage(pageFor(window.location.pathname));
 
     // Listen for navigation events to switch pages
-    const handlePopState = () => {
-      const newPathname = window.location.pathname;
-      if (newPathname.includes('/automation')) {
-        setCurrentPage('automation');
-      } else if (newPathname.includes('/study')) {
-        setCurrentPage('study');
-      } else if (newPathname.includes('/backfill')) {
-        setCurrentPage('backfill');
-      } else {
-        setCurrentPage('coverage');
-      }
-    };
+    const handlePopState = () => setCurrentPage(pageFor(window.location.pathname));
 
     window.addEventListener('popstate', handlePopState);
     return () => window.removeEventListener('popstate', handlePopState);
   }, []);
 
-  const navigateTo = (page: 'coverage' | 'backfill' | 'study' | 'automation') => {
-    const newPath =
-      page === 'coverage'
-        ? '/ui/coverage'
-        : page === 'backfill'
-          ? '/ui/backfill'
-          : page === 'study'
-            ? '/ui/study'
-            : '/ui/automation';
-    window.history.pushState(null, '', newPath);
+  const navigateTo = (page: Page) => {
+    window.history.pushState(null, '', `/ui/${page}`);
     setCurrentPage(page);
   };
 
@@ -79,6 +62,12 @@ function App() {
           >
             Automation
           </button>
+          <button
+            className={`nav-link ${currentPage === 'options' ? 'active' : ''}`}
+            onClick={() => navigateTo('options')}
+          >
+            Option Chains
+          </button>
         </div>
       </nav>
       <main>
@@ -86,6 +75,7 @@ function App() {
         {currentPage === 'backfill' && <Backfill />}
         {currentPage === 'study' && <Study />}
         {currentPage === 'automation' && <Automation />}
+        {currentPage === 'options' && <OptionChains />}
       </main>
     </>
   );

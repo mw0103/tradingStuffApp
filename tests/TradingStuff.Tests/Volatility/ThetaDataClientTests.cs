@@ -417,6 +417,38 @@ public class ThetaDataClientTests
     }
 
     [Fact]
+    public async Task AHttp472IsReportedAsNoDataNotAsAGenericFailure()
+    {
+        // Measured live against the Terminal 2026-08-02: /v3/option/history/quote answers a date
+        // range with no trading (e.g. a weekend) with HTTP 472 and the plain-text body "No data
+        // found for your request" — a third spelling this client did not originally recognize.
+        // Before this test's own fix, a caller (OptionChainCoordinator included) would have seen a
+        // generic InvalidOperationException and retried a legitimately-empty result as a transient
+        // failure until it exhausted its attempt budget, rather than settling it once as empty.
+        var (client, _) = Build(status: (HttpStatusCode)472, body: "No data found for your request");
+        using (client)
+        {
+            var ex = await Assert.ThrowsAsync<ThetaDataNoDataException>(() =>
+                client.GetContractQuotesAsync(
+                    "SPXW", new DateTime(2012, 6, 8), 1050.0, OptionRightCode.Call,
+                    new DateTime(2012, 6, 3), new DateTime(2012, 6, 3), TimeSpan.FromMinutes(1)));
+
+            Assert.Contains("/v3/option/history/quote", ex.Message, StringComparison.Ordinal);
+            Assert.Contains("472", ex.Message, StringComparison.Ordinal);
+        }
+    }
+
+    [Fact]
+    public async Task TheAlternateNoDataWordingIsAlsoRecognizedOnA200()
+    {
+        var (client, _) = Build(body: "No data found for your request");
+        using (client)
+        {
+            await Assert.ThrowsAsync<ThetaDataNoDataException>(() => client.ListExpirationsAsync("SPXW"));
+        }
+    }
+
+    [Fact]
     public async Task AnUnreachableTerminalSaysSo()
     {
         var handler = new FakeHandler { ThrowOnSend = new HttpRequestException("connection refused") };
