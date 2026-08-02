@@ -981,6 +981,88 @@ specification of GBT (level-scale variance target, squared-error loss, no retran
 none is owed), **not** evidence about edge in either direction. Hyperparameters are frozen at the
 registered depth ≤ 3 / ≤ 200 trees / min-child ≥ 50 with no search of any kind.
 
+### Phase 9 — ThetaData option chains, and the strip reproduces VIX (2026-08-02)
+
+The economic half of the programme was blocked on having no implied-variance series: IBKR option
+history is weeks deep, so the implied leg had to come from somewhere else. Migration 019 adds
+`research.option_chain_{jobs,requests,quotes}` with an idempotent resumable coordinator modelled on
+`BackfillCoordinator` (request row as checkpoint, `SKIP LOCKED` claims, identical rerun adds zero
+rows). Disabled by default.
+
+**The canonical quote PK is `(underlying, trading_class, expiration, strike, option_right,
+observed_at)` — no vendor identifier in it.** `DECISIONS.md` §15 records provider identifiers in
+`research.bars`' primary key as a debt whose reversal cost grows daily; this deliberately does not
+add a second instance. Vendor identity lives in descriptive columns and in `ThetaSymbolMap`, which
+is the adapter boundary.
+
+**Acceptance criterion passed — the strip reproduces published VIX**, through the existing
+`ModelFreeVariance` / `ConstantMaturityVariance` / `ImpliedVarianceSeriesBuilder` unchanged and
+untuned:
+
+| Date | Strip | VIX close | Diff |
+|---|---|---|---|
+| 2016-06-13 (calm) | 20.85 % | 20.97 % | **−0.12 pts** |
+| 2016-06-24 (day after Brexit) | 24.65 % | 25.76 % | −1.11 pts |
+
+Neither day truncated on either side, so truncation bias is not in play. The **shape** carries the
+information: a wrong `T` or annualisation would be uniformly wrong on both days and is not, so the
+~1-point shortfall on the turbulent day reads as mild under-capture during a spike rather than a
+systematic error. This validates the integral, strike selection, the two-consecutive-zero-bid
+truncation rule, forward-from-put-call-parity and constant-maturity interpolation against a series
+computed independently by Cboe.
+
+**The survivorship claim has a named check** (class (c) — a negative claim's review must name what
+would detect a violation). Historical SPXW expiring 2012-06-08 lists 59 strikes spanning 1000–1475
+and carries 118 real NBBO quote rows five trading days before expiry; the 2026-08-17 expiration
+spans 3000–9800. The ranges do not overlap, and a "today's list filtered by expiration" answer
+cannot produce a 2012 ladder centred where SPX actually traded in 2012. Recorded in
+`capability_probes` as genuinely as-of, with an earlier probe that failed for an unrelated reason
+(a weekend quote date) preserved beside it rather than overwritten.
+
+**Two defects found by running it, not reading it:** HTTP 472 ("No data found") was not classified
+as `ThetaDataNoDataException`, so a legitimately-empty expiration would have retried as a failure
+until attempts were exhausted rather than settling once as empty; and ThetaData caps a single bulk
+quote call at ~1 month (HTTP 400, undocumented, absent from the existing client) — hence
+`MonthlyDateRangeChunker`.
+
+**Throughput, measured, correcting this repo's own earlier note:** bulk historical quote calls take
+**1–3+ minutes each**, single-day calls 25–80 s. `FOLLOWUP.md` §4.6's "8 concurrent requests under a
+second" was measured on small recent requests and does **not** generalise to month-wide historical
+pulls. Full SPXW chains 2012→2026 are therefore weeks of vendor calls, not a weekend.
+**Consequence not yet decided: ingest a node grid (the roadmap's 6 DTE × 9 delta) or EOD snapshots
+rather than whole chains.** Decide before draining anything large.
+
+### Where the MVP stands, and the live environment (2026-08-02)
+
+**Goal.** Run and visualise the study, and trade it on the paper account with automation. Hardening
+is deferred to `docs/FOLLOWUP.md` — read its §1 before running anything.
+
+**Both MVP legs exist.** `/ui/study` renders a real result on real data; paper automation is built,
+armed through the real TWS path (`Execution:Router=ibkr`, `Portfolio:Source=ibkr`) and **off by
+default** (`PaperAutomation__Enabled=false`, an AppHost parameter rather than a literal so enabling
+it reverts by itself).
+
+**Data on hand:** SPX 1-min **complete, 2010-01-04 → 2026-07-31, 4,168 sessions, 1.64 M bars**; VIX
+daily complete 2005-10-03 → 2026-07-31 (5,222 closes). SPY and VIX 1-min still draining. The drain
+went ~20× faster after `slice_duration` moved from one day to `4 W` per request — see
+`BackfillJobCatalog`'s measurements; the pacing limit counts **requests, not bars**.
+
+**The best forecast we have is HAR-X**, which beats HAR by 9.32 % at DM p = 0.0011. The elastic-net
+residual correction does not clear H1 and the level-target GBT is far worse. Any strategy work
+should use HAR-X as the physical leg.
+
+**The open structural problem:** the study's label is one 6.5-hour session, which cannot inform a
+30–60 DTE short-volatility decision. The ~21-trading-day VRP conditioning study is the fix and was
+in flight when this was written.
+
+**Live state that is NOT in version control** — full detail in `FOLLOWUP.md` §1:
+- the three `kind='topup'` backfill jobs are manually `paused` in the Aspire database; they starve
+  the historical drain and a fresh database re-seeds them as claimable
+- Aspire assigns **ephemeral ports on every `aspire start`** — no URL in these docs stays valid
+- TWS (7497) and Theta Terminal (25503) are local desktop processes; nothing works without them
+- **the running service serves the LAST BUILT binary** — restart the app host before any end-to-end
+  check, or you will verify old code and believe you verified new code. This cost real time twice.
+
 ## Left
 
 Milestone 2 (research platform — sequenced in `docs/plans/ibkr-edge-research-roadmap.md`):
