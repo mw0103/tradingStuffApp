@@ -85,11 +85,42 @@ public static class BackfillJobCatalog
             UseRth: false, VixFrom, TopUpHorizon, Priority: 1000),
 
         // ---- the historical drain, in roadmap order ---------------------------------------------
-        // SPX 1-min is RTH-only at the source (an index price is computed during the regular session).
+        //
+        // SliceDuration "4 W" on every 1-minute historical drain, and the size is measured rather
+        // than chosen. Against live paper TWS on 2026-08-02, SPX 1-minute TRADES at a 2019 anchor:
+        //
+        //     1 D  ->    390 bars ( 1 session)  in  0s
+        //     5 D  ->  1,950 bars ( 5 sessions) in  1s
+        //     1 M  ->  8,580 bars (22 sessions) in  0s
+        //     2 M  -> 16,770 bars (43 sessions) in 42s
+        //     6 M  -> 504, TWS did not answer in time
+        //
+        // The pacing limit counts REQUESTS, not bars, so a day per request was spending the scarce
+        // resource ~20x faster than necessary: SPX 2010-> was 6,056 requests and becomes ~300. The
+        // planner's own note said raising this was "a per-job slice_duration change, not a code
+        // change" and deferred the maximum to a probe; this is that probe.
+        //
+        // "4 W" rather than the "1 M" that was measured, because TryParseCadence accepts only D, W
+        // and Y — months name no fixed-length boundary grid the planner can walk deterministically,
+        // and it refuses (marking the job failed) rather than silently substituting a cadence nobody
+        // asked for. That refusal is correct and it caught this exact mistake. 4 W is 28 days,
+        // bracketed by two measured-good durations, so it buys essentially the 1 M win.
+        //
+        // 2 M is rejected despite working. 43 sessions in 42s is worse throughput per unit time than
+        // 22 in ~0s, and it sits next to the duration where TWS stops answering — a cliff worth
+        // staying well clear of on a multi-hour unattended drain.
+        //
+        // What this gives up, stated because CadenceForBarSize was deliberate about it: a one-day
+        // cadence put every slice boundary on a UTC midnight, which for Cboe products never splits a
+        // session (SPX/SPXW overnight opens 19:15 CT, after UTC midnight). A month-long slice has no
+        // such alignment, so a boundary can land mid-session. That is safe rather than merely
+        // tolerable: adjacent requests still cover the whole range between them, and research.bars'
+        // primary key makes any bar returned by both a no-op. Gap detection is what would catch it
+        // if that reasoning is ever wrong.
         new("spx-1min-trades", BackfillJobKinds.Historical, InstrumentId: 1, "SPX", "TRADES", "1 min",
-            UseRth: true, SpxIntradayFrom, TargetTo: null, Priority: 100),
+            UseRth: true, SpxIntradayFrom, TargetTo: null, Priority: 100, SliceDuration: "4 W"),
         new("spy-1min-trades", BackfillJobKinds.Historical, InstrumentId: 5, "SPY", "TRADES", "1 min",
-            UseRth: true, SpyIntradayFrom, TargetTo: null, Priority: 90),
+            UseRth: true, SpyIntradayFrom, TargetTo: null, Priority: 90, SliceDuration: "4 W"),
         // Priority 200 — ABOVE the 1-minute drains, which is not a typo and not a preference.
         //
         // This job is 22 slices; spx-1min-trades is 6,056 and spy-1min-trades 7,882. At priority 80
@@ -106,6 +137,6 @@ public static class BackfillJobCatalog
         // target_from is set optimistically deep and reqHeadTimeStamp decides where planning really
         // starts. Clamping to the head IS the probe — no separate mode, no separate code path.
         new("vix-1min-trades", BackfillJobKinds.Historical, InstrumentId: 4, "VIX", "TRADES", "1 min",
-            UseRth: false, VixFrom, TargetTo: null, Priority: 70),
+            UseRth: false, VixFrom, TargetTo: null, Priority: 70, SliceDuration: "4 W"),
     ];
 }
