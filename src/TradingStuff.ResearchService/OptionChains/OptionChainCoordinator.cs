@@ -281,16 +281,31 @@ public sealed class OptionChainCoordinator(
         try
         {
             // The vendor caps a single bulk-quote call's [start_date, end_date] span at roughly a
-            // month (measured live, undocumented — see MonthlyDateRangeChunker's remarks); a job's
-            // full target range is very often wider than that, so one expiration's worth of history
-            // is fetched in chunks and landed together. A no-data chunk (e.g. the tail end of the
-            // job's range, past this expiration's own settlement) is treated as zero rows for that
-            // chunk rather than aborting the whole expiration — the expiration as a whole is still
-            // very much real, just not active for that particular slice of the range.
+            // month (measured live, undocumented — see MonthlyDateRangeChunker's remarks), and a
+            // no-data chunk still costs the Terminal a 14–47s vendor round trip (measured live,
+            // 2026-08-02 — see ExpirationFetchWindow's remarks), so the fetch is bounded to the
+            // window where this expiration's quotes can exist and THEN chunked. A no-data chunk
+            // inside that window is treated as zero rows for the chunk rather than aborting the
+            // whole expiration — the expiration as a whole is still very much real, just not
+            // active for that particular slice of the range.
+            var window = ExpirationFetchWindow.For(job.TargetFrom, job.TargetTo, request.Expiration);
+
+            if (window is null)
+            {
+                logger.LogWarning(
+                    "Expiration {Expiration:yyyy-MM-dd} of {Job} has no overlap with the job's " +
+                    "[{From:yyyy-MM-dd}, {To:yyyy-MM-dd}] range; settling it as empty.",
+                    request.Expiration, job.Name, job.TargetFrom, job.TargetTo);
+                await store.MarkOutcomeAsync(
+                    request.RequestId, OwnerId, OptionChainRequestState.Empty,
+                    "The expiration's fetch window has no overlap with the job's date range.", cancellationToken);
+                return TimeSpan.Zero;
+            }
+
             var rows = new List<OptionChainQuoteRow>();
 
             foreach (var (chunkStart, chunkEnd) in MonthlyDateRangeChunker.Split(
-                         job.TargetFrom.ToDateTime(TimeOnly.MinValue), job.TargetTo.ToDateTime(TimeOnly.MinValue)))
+                         window.Value.Start.ToDateTime(TimeOnly.MinValue), window.Value.End.ToDateTime(TimeOnly.MinValue)))
             {
                 try
                 {
@@ -373,6 +388,24 @@ public sealed class OptionChainCoordinator(
                 "Request {RequestId} of {Job} (expiration {Expiration:yyyy-MM-dd}) failed on attempt {Attempt}: {Message}",
                 request.RequestId, job.Name, request.Expiration, request.Attempts, ex.Message);
             await store.MarkOutcomeAsync(request.RequestId, OwnerId, OptionChainRequestState.Failed, ex.Message, cancellationToken);
+            return TimeSpan.FromSeconds(_options.TransientBackoffSeconds);
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            // HttpClient.Timeout surfaces as a TaskCanceledException whose token is NOT ours.
+            // Without this clause it would escape every handler here (they all exclude
+            // OperationCanceledException to keep shutdown clean), fault the BackgroundService, and
+            // take the whole host down over one slow vendor response — while recording nothing,
+            // which is exactly the timeout-becomes-absence failure the A4 readiness audit warns
+            // about. A retryable 'failed' with an explicit reason is the honest outcome.
+            var message = string.Format(
+                "HTTP timeout after {0} fetching expiration {1:yyyy-MM-dd}.",
+                client.Options.Timeout, request.Expiration);
+            logger.LogWarning(
+                "Request {RequestId} of {Job} (expiration {Expiration:yyyy-MM-dd}) timed out on attempt " +
+                "{Attempt}; recorded as a retryable failure.",
+                request.RequestId, job.Name, request.Expiration, request.Attempts);
+            await store.MarkOutcomeAsync(request.RequestId, OwnerId, OptionChainRequestState.Failed, message, cancellationToken);
             return TimeSpan.FromSeconds(_options.TransientBackoffSeconds);
         }
     }
