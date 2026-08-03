@@ -116,9 +116,14 @@ public sealed class TermStructureSeriesBuilderPostgresTests
             connection);
         var jobId = (long)(await job.ExecuteScalarAsync())!;
 
+        // The 2013-02-01 row is an already-settled expiration still marked failed: it must be
+        // ignored by the per-date boundary (it cannot be a leg for any later date) — the
+        // regression where a PAST unresolved expiration made later failures read as genuine
+        // absence turned every parked date 'unusable'.
         await using var requests = new NpgsqlCommand(
             """
             INSERT INTO research.option_chain_requests (job_id, expiration, state) VALUES
+              ($1, '2013-02-01', 'failed'),
               ($1, '2013-03-12', 'succeeded'), ($1, '2013-03-15', 'succeeded'),
               ($1, '2013-04-05', 'succeeded'), ($1, '2013-04-12', 'pending')
             """,

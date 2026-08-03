@@ -38,10 +38,12 @@ public sealed class TermStructureSeriesBuilder(
 
         var builder = new TermStructureBuilder(rates);
 
-        // § 8: the earliest chain expiration ingestion has NOT terminally resolved. Any bracket
-        // leg at or beyond it may be wrong (a nearer, still-unfetched expiration could be the
-        // true leg), so dates needing that region are 'unresolved', never 'absent'.
-        var unresolvedFrom = await EarliestUnresolvedExpirationAsync(cancellationToken);
+        // § 8: every chain expiration ingestion has NOT terminally resolved, sorted. Per session
+        // date, the first of these AFTER the date is the boundary: any bracket leg at or beyond
+        // it may be wrong (a nearer, still-unfetched expiration could be the true leg), so dates
+        // needing that region are 'unresolved', never 'absent'. The boundary must be computed
+        // per date — a single global minimum degenerates once it lies in a date's past.
+        var unresolvedExpirations = await UnresolvedExpirationsAsync(cancellationToken);
 
         int usable = 0, unusable = 0, unresolved = 0, sessions = 0;
 
@@ -52,7 +54,7 @@ public sealed class TermStructureSeriesBuilder(
             cancellationToken.ThrowIfCancellationRequested();
             sessions++;
 
-            var row = await BuildSessionAsync(session.TradingDate, builder, unresolvedFrom, cancellationToken);
+            var row = await BuildSessionAsync(session.TradingDate, builder, unresolvedExpirations, cancellationToken);
             await store.SaveAsync(row, cancellationToken);
 
             switch (row.Status)
@@ -67,13 +69,13 @@ public sealed class TermStructureSeriesBuilder(
             "Term-structure build [{From}..{To}]: {Sessions} session(s) — {Usable} usable, " +
             "{Unusable} unusable, {Unresolved} unresolved (ingestion frontier {Frontier}).",
             from, to, sessions, usable, unusable, unresolved,
-            unresolvedFrom?.ToString("yyyy-MM-dd") ?? "clear");
+            unresolvedExpirations.Count == 0 ? "clear" : unresolvedExpirations[0].ToString("yyyy-MM-dd"));
 
         return new BuildReport(sessions, usable, unusable, unresolved);
     }
 
     private async Task<TermStructureRow> BuildSessionAsync(
-        DateOnly tradingDate, TermStructureBuilder builder, DateOnly? unresolvedFrom,
+        DateOnly tradingDate, TermStructureBuilder builder, IReadOnlyList<DateOnly> unresolvedExpirations,
         CancellationToken cancellationToken)
     {
         var snapshotUtc = EtInstant(tradingDate, SnapshotEt);
@@ -82,12 +84,12 @@ public sealed class TermStructureSeriesBuilder(
         var day = builder.BuildDay(tradingDate.ToDateTime(TimeOnly.MinValue), slices);
         var underlying = await UnderlyingAtSnapshotAsync(snapshotUtc, cancellationToken);
 
-        // The unresolved boundary as an instant: the earliest moment the first unresolved
-        // expiration could settle (its AM settlement). Selected far legs must land strictly
-        // before it for the brackets to be trustworthy.
-        var boundaryUtc = unresolvedFrom is { } u
-            ? EtInstant(u, AmSettlementEt)
-            : DateTimeOffset.MaxValue.UtcDateTime;
+        // THIS date's unresolved boundary: the first unresolved expiration strictly after it,
+        // as the earliest instant it could settle (its AM settlement). Selected far legs must
+        // land strictly before it for the brackets to be trustworthy; a failed point is only
+        // trustworthy as genuine absence when no such expiration exists at all.
+        var boundary = FirstAfter(unresolvedExpirations, tradingDate);
+        var boundaryUtc = boundary is { } b ? EtInstant(b, AmSettlementEt) : DateTime.MaxValue;
 
         var nineTrustworthy = PointResolved(day.NineDay, snapshotUtc, boundaryUtc);
         var thirtyTrustworthy = PointResolved(day.ThirtyDay, snapshotUtc, boundaryUtc);
@@ -100,7 +102,7 @@ public sealed class TermStructureSeriesBuilder(
             status = "usable";
             note = null;
         }
-        else if (unresolvedFrom is { } frontier && (!nineTrustworthy || !thirtyTrustworthy))
+        else if (boundary is { } frontier && (!nineTrustworthy || !thirtyTrustworthy))
         {
             // Ingestion has not resolved everything the brackets could need. Fetch-failure is
             // not absence: park the date and let a later rebuild replace it.
@@ -138,9 +140,22 @@ public sealed class TermStructureSeriesBuilder(
             return snapshotUtc.AddDays(point.NextTermDays) < boundaryUtc;
         }
 
-        // The point failed. If ANY unresolved expiration lies ahead of the snapshot, it could
-        // be the leg this date is missing, so the failure cannot be trusted as absence.
-        return boundaryUtc == DateTimeOffset.MaxValue.UtcDateTime || boundaryUtc <= snapshotUtc;
+        // The point failed. If ANY unresolved expiration lies ahead of this date, it could be
+        // the leg this date is missing, so the failure cannot be trusted as absence.
+        return boundaryUtc == DateTime.MaxValue;
+    }
+
+    /// <summary>First element strictly after <paramref name="date"/>, or null. The list is sorted.</summary>
+    private static DateOnly? FirstAfter(IReadOnlyList<DateOnly> sorted, DateOnly date)
+    {
+        int lo = 0, hi = sorted.Count;
+        while (lo < hi)
+        {
+            var mid = (lo + hi) / 2;
+            if (sorted[mid] <= date) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo < sorted.Count ? sorted[lo] : null;
     }
 
     private static double? Diag(double? value) => value is 0.0 ? null : value;
@@ -200,21 +215,29 @@ public sealed class TermStructureSeriesBuilder(
         return [.. slices.Values];
     }
 
-    private async Task<DateOnly?> EarliestUnresolvedExpirationAsync(CancellationToken cancellationToken)
+    private async Task<IReadOnlyList<DateOnly>> UnresolvedExpirationsAsync(CancellationToken cancellationToken)
     {
         await using var connection = await OpenAsync(cancellationToken);
 
         await using var command = new NpgsqlCommand(
             """
-            SELECT min(r.expiration)
+            SELECT DISTINCT r.expiration
             FROM research.option_chain_requests r
             JOIN research.option_chain_jobs j ON j.job_id = r.job_id
             WHERE j.underlying = 'SPX' AND r.state NOT IN ('succeeded', 'empty')
+            ORDER BY r.expiration
             """,
             connection);
 
-        var result = await command.ExecuteScalarAsync(cancellationToken);
-        return result is DateOnly d ? d : null;
+        var expirations = new List<DateOnly>();
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            expirations.Add(reader.GetFieldValue<DateOnly>(0));
+        }
+
+        return expirations;
     }
 
     private async Task<double?> UnderlyingAtSnapshotAsync(DateTime snapshotUtc, CancellationToken cancellationToken)
