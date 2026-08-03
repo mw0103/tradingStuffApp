@@ -250,6 +250,260 @@ public sealed class PaperAutomationServiceTests
         Assert.Equal(0, harness.OrdersPosted);
     }
 
+    // ---- the lifecycle: one declared exit rule ---------------------------------------------------
+
+    [Fact]
+    public async Task A_position_at_the_threshold_is_closed_and_the_row_names_the_rule_that_closed_it()
+    {
+        // Short the 740 put, long the 739 wing, five days out. Closing buys the 740 back at its ask
+        // (shortBid + 0.03 = 0.58) and sells the wing at its bid (longAsk - 0.03 = 0.17): a 0.41
+        // natural debit, 0.46 with the buffer paid to cross.
+        using var harness = new Harness(
+            signal: Signals.Trade, longAsk: 0.20m, shortBid: 0.55m, positions: PutCreditSpread(new DateOnly(2026, 8, 10)));
+
+        var decision = await harness.EvaluateScheduledAsync();
+
+        Assert.Equal(AutomationActions.ExitSubmitted, decision.Action);
+        Assert.True(decision.OrderSubmitted);
+        Assert.NotNull(decision.OrderId);
+        Assert.Equal(0.46m, decision.LimitPrice);
+
+        // The rule is at the head of the reason, and the row can never say "closed" without saying
+        // which rule closed it. A second rule would have to declare itself here.
+        Assert.StartsWith(AutomationExitRules.Dte, decision.ActionReason);
+        Assert.Contains("5 calendar day(s)", decision.ActionReason);
+        Assert.Contains("7-day threshold", decision.ActionReason);
+        Assert.Contains("\"rule\":\"exit-dte\"", decision.Detail);
+
+        // The signal has no part in an exit and was genuinely not asked — an overridden signal would
+        // leave its own state on the row.
+        Assert.Equal(SignalStates.NotEvaluated, decision.SignalState);
+        Assert.Equal(0, harness.SignalEvaluations);
+
+        // The order is the exact inverse of what is open: the short leg bought back, the wing sold,
+        // both marked closing, and still a limit.
+        var submitted = Assert.Single(harness.SubmittedOrders);
+        Assert.Equal(OrderType.Limit, submitted.OrderType);
+        Assert.All(submitted.Legs, leg => Assert.Equal(PositionEffect.Close, leg.PositionEffect));
+        Assert.Equal(739m, submitted.Legs[0].Contract.Strike);
+        Assert.Equal(OrderSide.Sell, submitted.Legs[0].Side);
+        Assert.Equal(740m, submitted.Legs[1].Contract.Strike);
+        Assert.Equal(OrderSide.Buy, submitted.Legs[1].Side);
+    }
+
+    [Fact]
+    public async Task A_position_outside_the_threshold_is_held_and_the_signal_is_not_consulted()
+    {
+        // Thirty days out with a signal asking to enter: the position is held and nothing is stacked
+        // on top of it. Constant one-vega exposure is one spread, not one per evaluation that felt
+        // like it.
+        using var harness = new Harness(signal: Signals.Trade, positions: PutCreditSpread(new DateOnly(2026, 9, 4)));
+
+        var decision = await harness.EvaluateScheduledAsync();
+
+        Assert.Equal(AutomationActions.NoTrade, decision.Action);
+        Assert.Contains("Holding 1 open managed structure(s)", decision.ActionReason);
+        Assert.Contains("2026-09-04 (30d)", decision.ActionReason);
+        Assert.Equal(0, harness.OrdersPosted);
+        Assert.Equal(0, harness.SignalEvaluations);
+        Assert.Single(harness.Store.Recorded);
+    }
+
+    [Fact]
+    public async Task Entry_resumes_on_the_pass_after_the_account_is_flat()
+    {
+        using var harness = new Harness(signal: Signals.Trade, cap: 5, positions: PutCreditSpread(new DateOnly(2026, 9, 4)));
+
+        Assert.Equal(AutomationActions.NoTrade, (await harness.EvaluateScheduledAsync()).Action);
+
+        harness.Positions.Clear();
+
+        Assert.Equal(AutomationActions.Submitted, (await harness.EvaluateScheduledAsync()).Action);
+        Assert.Equal(1, harness.OrdersPosted);
+    }
+
+    [Fact]
+    public async Task An_exit_evaluated_twice_submits_one_closing_order()
+    {
+        // The claim discipline the entry path uses, applied per position: the broker still reports
+        // the spread on the next pass because the close has not filled yet, and a second closing
+        // order would sell the spread the first one bought back.
+        using var harness = new Harness(
+            signal: Signals.Trade, cap: 5, longAsk: 0.20m, shortBid: 0.55m,
+            positions: PutCreditSpread(new DateOnly(2026, 8, 10)));
+
+        var first = await harness.EvaluateScheduledAsync();
+        var second = await harness.EvaluateScheduledAsync();
+
+        Assert.Equal(AutomationActions.ExitSubmitted, first.Action);
+
+        Assert.Equal(AutomationActions.NoTrade, second.Action);
+        Assert.Contains("already submitted on this trading date", second.ActionReason);
+
+        // The assertion that matters: the venue saw one closing order, not two.
+        Assert.Equal(1, harness.OrdersPosted);
+
+        // And the suppressed pass is still a row. "Nothing happened because a close is pending" has
+        // to BE a row, not an absence.
+        Assert.Equal(2, harness.Store.Recorded.Count);
+    }
+
+    [Fact]
+    public async Task A_spent_cap_counts_the_exit_and_does_not_block_it()
+    {
+        // The realistic sequence: the day's one order is spent on an entry, it fills, and the
+        // position later comes due. A cap enforced against the exit would leave it open into an
+        // expiration this platform does not handle — an uncloseable position is worse than an extra
+        // order.
+        using var harness = new Harness(signal: Signals.Trade, cap: 1);
+
+        var entry = await harness.EvaluateScheduledAsync();
+        Assert.Equal(AutomationActions.Submitted, entry.Action);
+
+        // The fill: the 739/740 call vertical the entry planner just bought, seven days out.
+        harness.Positions.AddRange(CallDebitVertical(new DateOnly(2026, 8, 12)));
+
+        var exit = await harness.EvaluateScheduledAsync();
+
+        Assert.Equal(AutomationActions.ExitSubmitted, exit.Action);
+        Assert.Equal(2, harness.OrdersPosted);
+
+        // The gate genuinely refused — this is the cap being passed, not the cap failing to fire.
+        Assert.False(exit.Armed);
+        Assert.Equal(ArmStates.CapReached, exit.ArmState);
+
+        // And the closing order is counted: two of a cap of one, on the record and in the status.
+        Assert.Equal(2, exit.OrdersThisSession);
+        Assert.Equal(2, (await harness.Service.GetStatusAsync(10, CancellationToken.None)).OrdersThisSession);
+    }
+
+    [Fact]
+    public async Task A_spent_cap_still_blocks_an_entry()
+    {
+        // The other half of the same rule: nothing about permitting exits loosens the cap on new
+        // exposure. Without this the test above would pass against a loop that had simply lost its cap.
+        using var harness = new Harness(signal: Signals.Trade, cap: 1);
+
+        await harness.EvaluateScheduledAsync();
+        var second = await harness.EvaluateScheduledAsync();
+
+        Assert.Equal(AutomationActions.NoTrade, second.Action);
+        Assert.Equal(ArmStates.CapReached, second.ArmState);
+        Assert.Equal(1, harness.OrdersPosted);
+    }
+
+    [Fact]
+    public async Task An_unpriceable_closing_order_is_refused_with_its_reason_and_retried_next_pass()
+    {
+        // 0/0 on both legs, which is what SPY options quote outside the regular session. The position
+        // is due and cannot be closed; the refusal reappears on every pass rather than being handled
+        // into silence — coverage of failure paths IS the point of this run.
+        using var harness = new Harness(
+            signal: Signals.Trade, cap: 5, longAsk: 0m, shortBid: 0m,
+            positions: PutCreditSpread(new DateOnly(2026, 8, 10)));
+
+        var first = await harness.EvaluateScheduledAsync();
+        var second = await harness.EvaluateScheduledAsync();
+
+        Assert.Equal(AutomationActions.ExitRefused, first.Action);
+        Assert.Equal(AutomationActions.ExitRefused, second.Action);
+        Assert.Contains("no bid", first.ActionReason);
+        Assert.StartsWith(AutomationExitRules.Dte, first.ActionReason);
+        Assert.Equal(0, harness.OrdersPosted);
+        Assert.Equal(2, harness.Store.Recorded.Count);
+    }
+
+    [Fact]
+    public async Task A_closing_order_whose_outcome_is_unknown_is_not_sent_again()
+    {
+        // ExecutionService answers 502: the closing order WAS routed and may be resting at the venue.
+        // Re-sending it because the response was lost is the same defect as re-entering for the same
+        // reason, and it would leave the account short the spread it meant to be flat of.
+        using var harness = new Harness(
+            signal: Signals.Trade, cap: 5, longAsk: 0.20m, shortBid: 0.55m,
+            orderResponse: HttpStatusCode.BadGateway, positions: PutCreditSpread(new DateOnly(2026, 8, 10)));
+
+        var first = await harness.EvaluateScheduledAsync();
+
+        Assert.Equal(AutomationActions.ExitOutcomeUnknown, first.Action);
+        Assert.False(first.OrderSubmitted);
+        Assert.Contains("may be live at the venue", first.ActionReason);
+
+        var second = await harness.EvaluateScheduledAsync();
+
+        Assert.Equal(AutomationActions.NoTrade, second.Action);
+        Assert.Equal(1, harness.OrdersPosted);
+    }
+
+    [Fact]
+    public async Task An_account_that_cannot_be_read_neither_exits_nor_enters()
+    {
+        // An unreadable account is not a flat one. Folding the failure into an empty position list
+        // would skip a due exit AND unblock an entry in one silent step.
+        using var harness = new Harness(signal: Signals.Trade, portfolioReadable: false);
+
+        var decision = await harness.EvaluateScheduledAsync();
+
+        Assert.Equal(AutomationActions.NoTrade, decision.Action);
+        Assert.Contains("could not be read", decision.ActionReason);
+        Assert.Equal(0, harness.OrdersPosted);
+        Assert.Equal(0, harness.SignalEvaluations);
+        Assert.Single(harness.Store.Recorded);
+    }
+
+    [Fact]
+    public async Task A_position_in_another_underlying_is_neither_closed_nor_treated_as_the_managed_spread()
+    {
+        // The account is not this loop's to tidy. A QQQ position must not block a SPY entry and must
+        // certainly not be closed by a rule that was declared about the managed structure.
+        using var harness = new Harness(
+            signal: Signals.Trade, cap: 5,
+            positions:
+            [
+                Position("QQQ", new DateOnly(2026, 8, 10), 500m, -1),
+                Position("QQQ", new DateOnly(2026, 8, 10), 499m, 1),
+            ]);
+
+        var decision = await harness.EvaluateScheduledAsync();
+
+        Assert.Equal(AutomationActions.Submitted, decision.Action);
+        Assert.Equal("SPY", Assert.Single(harness.SubmittedOrders).Legs[0].Contract.Underlying);
+    }
+
+    [Fact]
+    public async Task An_open_structure_that_is_not_the_managed_shape_is_refused_rather_than_closed_wrongly()
+    {
+        // A lone short leg, due. Reversing "whatever is there" would be a guess about a position
+        // automation did not build; the refusal is recorded on every pass instead.
+        using var harness = new Harness(
+            signal: Signals.Trade, cap: 5,
+            positions: [Position("SPY", new DateOnly(2026, 8, 10), 740m, -1)]);
+
+        var decision = await harness.EvaluateScheduledAsync();
+
+        Assert.Equal(AutomationActions.ExitRefused, decision.Action);
+        Assert.Contains("1 leg(s)", decision.ActionReason);
+        Assert.Equal(0, harness.OrdersPosted);
+    }
+
+    [Fact]
+    public async Task A_decision_log_that_cannot_say_what_was_already_closed_submits_nothing()
+    {
+        // The same conclusion as an unreadable cap: an exit whose prior attempts cannot be read is an
+        // exit that might already be resting at the venue.
+        using var harness = new Harness(
+            signal: Signals.Trade, cap: 5, longAsk: 0.20m, shortBid: 0.55m,
+            positions: PutCreditSpread(new DateOnly(2026, 8, 10)));
+
+        harness.Store.FailExitKeys = true;
+
+        var decision = await harness.EvaluateScheduledAsync();
+
+        Assert.Equal(AutomationActions.ExitRefused, decision.Action);
+        Assert.Contains("duplicate closing order cannot be ruled out", decision.ActionReason);
+        Assert.Equal(0, harness.OrdersPosted);
+    }
+
     // ---- the kill switch -------------------------------------------------------------------------
 
     [Fact]
@@ -443,6 +697,32 @@ public sealed class PaperAutomationServiceTests
 
     // ---- harness ---------------------------------------------------------------------------------
 
+    // ---- position fixtures -----------------------------------------------------------------------
+
+    /// <summary>The short-vol structure: short the 740 put, long the 739 wing.</summary>
+    private static PositionSnapshot[] PutCreditSpread(DateOnly expiration) =>
+        [
+            Position("SPY", expiration, 740m, -1),
+            Position("SPY", expiration, 739m, 1),
+        ];
+
+    /// <summary>The debit vertical the entry planner builds against the harness chain: long 739, short 740.</summary>
+    private static PositionSnapshot[] CallDebitVertical(DateOnly expiration) =>
+        [
+            Position("SPY", expiration, 739m, 1, OptionRight.Call),
+            Position("SPY", expiration, 740m, -1, OptionRight.Call),
+        ];
+
+    private static PositionSnapshot Position(
+        string underlying, DateOnly expiration, decimal strike, int quantity, OptionRight right = OptionRight.Put) =>
+        new(
+            new OptionContract(
+                $"{underlying}{expiration:yyyyMMdd}{(right == OptionRight.Put ? 'P' : 'C')}{strike:F0}",
+                underlying, expiration, strike, right, TradingClass: underlying),
+            quantity,
+            1.00m,
+            GreeksVector.Zero);
+
     private static class Signals
     {
         public static SignalResult InsufficientData => new(
@@ -548,6 +828,7 @@ public sealed class PaperAutomationServiceTests
             int exitDteThreshold = 7)
         {
             Store = new FakeStore();
+            Positions = [.. positions ?? []];
 
             var time = new FakeTimeProvider(now ?? InsideNyseSession);
 
@@ -636,14 +917,16 @@ public sealed class PaperAutomationServiceTests
                         };
                     }
 
+                    // Read from the mutable list, not the constructor argument: a fill between two
+                    // passes is exactly the transition the lifecycle tests exercise.
                     return Ok(new
                     {
                         portfolio = new PortfolioSnapshot(
-                            "DUQ000001", 25_000m, 0m, GreeksVector.Zero, positions ?? []),
+                            "DUQ000001", 25_000m, 0m, GreeksVector.Zero, Positions),
                         capturedAt = time.GetUtcNow(),
                         dailyPnLAvailable = true,
                         greeksComplete = true,
-                        optionPositionCount = positions?.Count ?? 0,
+                        optionPositionCount = Positions.Count,
                         nonOptionPositionCount = 0,
                     });
                 }
@@ -699,6 +982,9 @@ public sealed class PaperAutomationServiceTests
         public int SignalEvaluations { get; private set; }
 
         public int PortfolioReads { get; private set; }
+
+        /// <summary>What the gateway reports open, mutable so a pass can fill between evaluations.</summary>
+        public List<PositionSnapshot> Positions { get; }
 
         public List<SubmitOrderRequest> SubmittedOrders { get; } = [];
 
