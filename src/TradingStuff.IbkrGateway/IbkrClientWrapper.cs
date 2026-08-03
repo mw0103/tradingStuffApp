@@ -26,6 +26,7 @@ internal sealed record OptionChainSegment(
 public sealed class IbkrClientWrapper(
     IbkrRequestRegistry registry,
     IbkrOrderTracker orderTracker,
+    ExecutionCommissionRouter executionCommissions,
     ILogger<IbkrClientWrapper> logger)
     : DefaultEWrapper
 {
@@ -284,11 +285,36 @@ public sealed class IbkrClientWrapper(
             execution.Shares,
             execution.Price);
 
+        // A SOLICITED pull (reqExecutions) owns its reqId and takes the report exclusively. The
+        // capture layer replays whole trading days, including days whose orders this process never
+        // placed, and letting those reach the order tracker would let an observation surface write
+        // into the live order path — which is the one thing that surface is forbidden to do.
+        // Unsolicited pushes for orders this process placed arrive with no registered request and
+        // fall through to the tracker exactly as before.
+        if (reqId >= 0 && registry.Get<ExecutionsRequest>(reqId) is { } solicited)
+        {
+            solicited.Add(contract, execution);
+            return;
+        }
+
         orderTracker.ApplyExecution(contract, execution);
     }
 
-    public override void commissionAndFeesReport(CommissionAndFeesReport commissionAndFeesReport) =>
+    public override void execDetailsEnd(int reqId)
+    {
+        // Deliberately NOT registry.Remove: the client removes it once the commission grace has
+        // elapsed, so a late error against this id still faults the request rather than vanishing.
+        registry.Get<ExecutionsRequest>(reqId)?.Complete();
+    }
+
+    public override void commissionAndFeesReport(CommissionAndFeesReport commissionAndFeesReport)
+    {
+        // Offered to both, because this callback carries no request id and so cannot be routed: the
+        // tracker takes it only for an execId it recorded, and an in-flight pull only for one it
+        // received. At most one of them holds any given execId.
         orderTracker.ApplyCommission(commissionAndFeesReport);
+        executionCommissions.Apply(commissionAndFeesReport);
+    }
 }
 
 /// <summary>The socket dropped, or was never up, when a request needed it.</summary>

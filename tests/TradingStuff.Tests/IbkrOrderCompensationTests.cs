@@ -122,7 +122,7 @@ public sealed class IbkrOrderCompensationTests
 
             Tracker = new IbkrOrderTracker(NullLogger<IbkrOrderTracker>.Instance);
 
-            var wrapper = new IbkrClientWrapper(registry, Tracker, NullLogger<IbkrClientWrapper>.Instance);
+            var wrapper = new IbkrClientWrapper(registry, Tracker, new ExecutionCommissionRouter(), NullLogger<IbkrClientWrapper>.Instance);
 
             var governor = new IbkrPacingGovernor(
                 options, TimeProvider.System, new TestMeterFactory(), NullLogger<IbkrPacingGovernor>.Instance);

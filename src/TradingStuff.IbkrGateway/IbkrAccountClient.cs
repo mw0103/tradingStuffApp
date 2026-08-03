@@ -23,6 +23,47 @@ public sealed record IbkrPortfolioSnapshot(
     int OptionPositionCount,
     int NonOptionPositionCount);
 
+/// <summary>One account-summary tag as TWS reported it: unparsed value, and the currency it is in.</summary>
+public sealed record IbkrAccountSummaryTag(string Tag, string Value, string Currency);
+
+/// <summary>Every summary tag TWS is currently reporting for one account.</summary>
+public sealed record IbkrAccountSummary(
+    string Account,
+    DateTimeOffset CapturedAt,
+    IReadOnlyList<IbkrAccountSummaryTag> Tags);
+
+/// <summary>
+/// One open position exactly as <c>reqPositionsMulti</c> reported it.
+/// </summary>
+/// <remarks>
+/// Not a <c>PositionSnapshot</c>: this carries non-option holdings too, keeps IBKR's own per-contract
+/// average cost rather than converting it to per-share, and has no Greeks. It is what the broker
+/// said, not what the risk engine needs.
+/// </remarks>
+public sealed record IbkrRawPosition(
+    int ConId,
+    string Symbol,
+    string SecType,
+    DateOnly? Expiration,
+    decimal? Strike,
+    string? Right,
+    string? TradingClass,
+    string? Currency,
+    string? Multiplier,
+    string? LocalSymbol,
+    decimal Quantity,
+    /// <summary>
+    /// IBKR's per-CONTRACT average cost, in TWS's own units. Null when TWS reported no value —
+    /// a zero would read as a position acquired for nothing.
+    /// </summary>
+    decimal? AverageCost);
+
+/// <summary>Every open position TWS is reporting for one account.</summary>
+public sealed record IbkrPositionsReport(
+    string Account,
+    DateTimeOffset CapturedAt,
+    IReadOnlyList<IbkrRawPosition> Positions);
+
 /// <summary>
 /// Read-only account summary, positions, and P&amp;L against the single TWS socket.
 /// </summary>
@@ -43,7 +84,17 @@ public sealed class IbkrAccountClient(
     /// <summary>
     /// Tags requested from <c>reqAccountSummary</c>. All are balances in the account's base currency.
     /// </summary>
-    private const string SummaryTags = "NetLiquidation,BuyingPower,AvailableFunds,ExcessLiquidity,GrossPositionValue";
+    /// <remarks>
+    /// The two margin tags are here for the paper-run protocol's shadow record item 8 (margin
+    /// requirement), which the capture layer reads through <see cref="GetAccountSummaryAsync"/>.
+    /// Widening the tag list rather than opening a second summary stream is not a preference: TWS
+    /// counts DISTINCT account-summary request ids and permits exactly two per API client (see
+    /// <see cref="RebuildFeedAsync"/>), so a second stream would spend the only spare slot and leave
+    /// none for a rebuild. Extra tags cost nothing — they arrive on the stream that is already open,
+    /// and <see cref="ReadDecimal"/> selects by name, so nothing that reads this feed today changes.
+    /// </remarks>
+    private const string SummaryTags =
+        "NetLiquidation,BuyingPower,AvailableFunds,ExcessLiquidity,GrossPositionValue,MaintMarginReq,InitMarginReq";
 
     /// <summary>Buying power, in preference order — not every account type reports every tag.</summary>
     private static readonly string[] BuyingPowerTags = ["BuyingPower", "AvailableFunds", "ExcessLiquidity"];
@@ -98,6 +149,99 @@ public sealed class IbkrAccountClient(
         {
             _refreshGate.Release();
         }
+    }
+
+    /// <summary>
+    /// Every account-summary tag TWS is currently reporting for the account, unparsed.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The RAW read behind the capture layer, deliberately separate from
+    /// <see cref="GetPortfolioAsync"/>: that one projects the account onto the risk engine's
+    /// <c>PortfolioSnapshot</c> and drops everything the risk engine has no field for, margin
+    /// included. Here the tags are handed over as strings with their currency, exactly as TWS sent
+    /// them, so a tag nobody has written a column for yet is still recorded the day it matters.
+    /// </para>
+    /// <para>
+    /// <b>Pacing: no socket traffic at all in the steady state.</b> The summary stream is opened once
+    /// per connection and TWS pushes into it; this reads the values already delivered.
+    /// </para>
+    /// </remarks>
+    public async Task<IbkrAccountSummary> GetAccountSummaryAsync(string? accountId, CancellationToken cancellationToken)
+    {
+        var account = SelectAccount(connection.GetStatus().ManagedAccounts, accountId, _options.AccountId);
+        var feed = await EnsureFeedAsync(account, cancellationToken);
+
+        var tags = feed.Summary.Values
+            .Where(row => row.Account.Equals(account, StringComparison.OrdinalIgnoreCase))
+            .OrderBy(row => row.Tag, StringComparer.Ordinal)
+            .Select(row => new IbkrAccountSummaryTag(row.Tag, row.Value, row.Currency))
+            .ToArray();
+
+        return new IbkrAccountSummary(account, DateTimeOffset.UtcNow, tags);
+    }
+
+    /// <summary>
+    /// Every open position TWS is reporting for the account, unparsed.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The raw counterpart of the positions inside <see cref="GetPortfolioAsync"/>, and it differs in
+    /// two ways that matter to a capture layer. Non-option positions are INCLUDED — the portfolio
+    /// projection has nowhere to put an equity or a future and logs them away, which is correct for
+    /// the Greek limits and wrong for a record of what the account held. And no quotes are taken, so
+    /// no Greeks and no market data lines: v1 captures raw positions and derives Greeks later from
+    /// the chain data.
+    /// </para>
+    /// <para>
+    /// <b>What is NOT here, and why:</b> <c>reqPositionsMulti</c> reports quantity and average cost
+    /// and nothing else — no market price, no market value, no unrealized P&amp;L. Those live on
+    /// <c>reqAccountUpdates</c>' portfolio callback, a different subscription with its own
+    /// single-account restriction. Rather than report a mark this stream never produced, the marks
+    /// are simply absent and the capture record shows them absent.
+    /// </para>
+    /// </remarks>
+    public async Task<IbkrPositionsReport> GetPositionsAsync(string? accountId, CancellationToken cancellationToken)
+    {
+        var account = SelectAccount(connection.GetStatus().ManagedAccounts, accountId, _options.AccountId);
+        var feed = await EnsureFeedAsync(account, cancellationToken);
+
+        var positions = feed.Positions.Rows
+            // A closed position lingers as a zero-quantity row until TWS drops it; it is not a holding.
+            .Where(row => row.Position != 0m)
+            .Select(ToRawPosition)
+            .ToArray();
+
+        return new IbkrPositionsReport(account, DateTimeOffset.UtcNow, positions);
+    }
+
+    internal static IbkrRawPosition ToRawPosition(AccountPositionRow row)
+    {
+        var contract = row.Contract;
+
+        return new IbkrRawPosition(
+            contract.ConId,
+            contract.Symbol ?? string.Empty,
+            contract.SecType ?? string.Empty,
+            DateOnly.TryParseExact(
+                contract.LastTradeDateOrContractMonth, ExpirationFormat,
+                CultureInfo.InvariantCulture, DateTimeStyles.None, out var expiration)
+                ? expiration
+                : null,
+            // Not `Strike == 0`: a non-option position carries IBApi's unset marker, and this stream
+            // is the one that reports the equities and futures the portfolio projection drops.
+            QuoteRequest.TryReadStrike(contract.Strike),
+            string.IsNullOrWhiteSpace(contract.Right) ? null : contract.Right,
+            string.IsNullOrWhiteSpace(contract.TradingClass) ? null : contract.TradingClass,
+            string.IsNullOrWhiteSpace(contract.Currency) ? null : contract.Currency,
+            contract.Multiplier,
+            contract.LocalSymbol,
+            row.Position,
+            // IBKR's avgCost for an option is the cost of one CONTRACT and so already carries the
+            // multiplier. It is recorded in TWS's own units here; converting to per-share is a
+            // derivation, and derivations do not belong in a raw capture. Through the sentinel guard
+            // because an unset avgCost is double.MaxValue, which a bare cast would throw on.
+            QuoteRequest.TryConvertSigned(row.AverageCost, out var averageCost) ? averageCost : null);
     }
 
     private IbkrPortfolioSnapshot? TryGetCached(string account, TimeSpan ttl)

@@ -112,7 +112,7 @@ public sealed class LiveTwsSubscriptionManagerTests
         var governor = new IbkrPacingGovernor(
             options, TimeProvider.System, new TestMeterFactory(), NullLogger<IbkrPacingGovernor>.Instance);
         var wrapper = new IbkrClientWrapper(
-            registry, new IbkrOrderTracker(NullLogger<IbkrOrderTracker>.Instance),
+            registry, new IbkrOrderTracker(NullLogger<IbkrOrderTracker>.Instance), new ExecutionCommissionRouter(),
             NullLogger<IbkrClientWrapper>.Instance);
 
         using var connection = new IbkrConnection(
@@ -284,7 +284,7 @@ public sealed class LiveTwsSubscriptionManagerTests
         var governor = new IbkrPacingGovernor(
             options, TimeProvider.System, new TestMeterFactory(), NullLogger<IbkrPacingGovernor>.Instance);
         var wrapper = new IbkrClientWrapper(
-            registry, new IbkrOrderTracker(NullLogger<IbkrOrderTracker>.Instance),
+            registry, new IbkrOrderTracker(NullLogger<IbkrOrderTracker>.Instance), new ExecutionCommissionRouter(),
             NullLogger<IbkrClientWrapper>.Instance);
 
         using var connection = new IbkrConnection(

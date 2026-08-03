@@ -18,6 +18,11 @@ builder.Services.Configure<IbkrOptions>(builder.Configuration.GetSection(IbkrOpt
 
 builder.Services.AddSingleton(TimeProvider.System);
 builder.Services.AddSingleton<IbkrRequestRegistry>();
+
+// Routes the one TWS callback that carries no request id (commissionAndFeesReport) to whichever
+// executions pull is in flight. A type of its own so the wrapper and the executions client can share
+// it without either referencing the other — see ExecutionCommissionRouter.
+builder.Services.AddSingleton<ExecutionCommissionRouter>();
 builder.Services.AddSingleton<IbkrClientWrapper>();
 builder.Services.AddSingleton<IbkrConnection>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<IbkrConnection>());
@@ -33,6 +38,7 @@ builder.Services.AddSingleton<IbkrHistoricalClient>();
 builder.Services.AddSingleton<IbkrOrderTracker>();
 builder.Services.AddSingleton<IbkrOrderClient>();
 builder.Services.AddSingleton<IbkrAccountClient>();
+builder.Services.AddSingleton<IbkrExecutionsClient>();
 
 // Recording plane: raw ticks land here append-only; standing subscriptions are leased through
 // SubscriptionManager rather than fire-and-forget, so a heartbeat failure or a reconnect has a
@@ -434,6 +440,84 @@ app.MapGet("/ibkr/account/portfolio", async (
                 detail: ex.Message,
                 statusCode: StatusCodes.Status504GatewayTimeout);
         }
+    })
+    .RequireAuthorization();
+
+// ---- raw account capture ------------------------------------------------------------------------
+// Read-only, and RAW: the three endpoints below hand back what TWS said, unprojected, for the
+// paper-run protocol's shadow record items 6-8 (docs/plans/paper-run-protocol.md). They exist
+// alongside /ibkr/account/portfolio rather than replacing it because that one answers a different
+// question — it projects the account onto the risk engine's inputs and necessarily drops everything
+// the risk engine has no field for. A capture layer cannot use a projection: what is dropped today
+// is exactly what cannot be recovered tomorrow.
+//
+// Pacing: summary and positions read streams that are already open and cost NO socket traffic;
+// executions is a single Normal-class message through the governor with no market-data line and no
+// historical window. None of the three is a subscription, and none touches the order path.
+
+// One failure ladder for all three, because the caller has to tell the cases apart: a broker
+// rejection (400/502 with the TWS code), a socket that is down (503), and TWS accepting a request
+// and never answering (504). Collapsing them into a 500 would make "the gateway is down" — a
+// recoverable refusal the capture layer records and retries — indistinguishable from a defect.
+static async Task<IResult> ReadAccountAsync<T>(Func<Task<T>> read)
+{
+    try
+    {
+        return Results.Ok(await read());
+    }
+    catch (IbkrRequestException ex)
+    {
+        return Results.Problem(
+            title: "IBKR rejected the account request.",
+            detail: ex.Message,
+            statusCode: ex.IsPermanent ? StatusCodes.Status400BadRequest : StatusCodes.Status502BadGateway,
+            extensions: new Dictionary<string, object?> { ["ibkrErrorCode"] = ex.ErrorCode });
+    }
+    catch (IbkrConnectionException ex)
+    {
+        return Results.Problem(
+            title: "Not connected to TWS.",
+            detail: ex.Message,
+            statusCode: StatusCodes.Status503ServiceUnavailable);
+    }
+    catch (TimeoutException ex)
+    {
+        return Results.Problem(
+            title: "TWS did not answer the account request in time.",
+            detail: ex.Message,
+            statusCode: StatusCodes.Status504GatewayTimeout);
+    }
+}
+
+app.MapGet("/ibkr/account/summary", async (
+        [FromQuery] string? accountId,
+        IbkrAccountClient accounts,
+        CancellationToken cancellationToken) =>
+        await ReadAccountAsync(() => accounts.GetAccountSummaryAsync(accountId, cancellationToken)))
+    .RequireAuthorization();
+
+app.MapGet("/ibkr/account/positions", async (
+        [FromQuery] string? accountId,
+        IbkrAccountClient accounts,
+        CancellationToken cancellationToken) =>
+        await ReadAccountAsync(() => accounts.GetPositionsAsync(accountId, cancellationToken)))
+    .RequireAuthorization();
+
+// `since` is the lower bound on execution time, UTC. Required rather than defaulted: a pull with no
+// bound asks TWS for everything it still holds, and a caller that meant "today" would silently get
+// a week. The caller knows its session boundary; this endpoint does not.
+app.MapGet("/ibkr/account/executions", async (
+        [FromQuery] DateTimeOffset? since,
+        [FromQuery] string? accountId,
+        IbkrExecutionsClient executions,
+        CancellationToken cancellationToken) =>
+    {
+        if (since is not { } from)
+        {
+            return Results.BadRequest(new { error = "A 'since' timestamp is required." });
+        }
+
+        return await ReadAccountAsync(() => executions.GetExecutionsAsync(accountId, from, cancellationToken));
     })
     .RequireAuthorization();
 

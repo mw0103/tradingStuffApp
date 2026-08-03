@@ -254,6 +254,17 @@ public class PacedSocket(
     }
 
     /// <summary>
+    /// Requests the account's execution reports. A one-shot query, not a subscription: TWS answers
+    /// with <c>execDetails</c> per fill and terminates with <c>execDetailsEnd</c>, so there is no
+    /// line to acquire and nothing to cancel afterwards. Ordinary Normal-class message budget.
+    /// </summary>
+    public async Task ReqExecutionsAsync(int requestId, ExecutionFilter filter, CancellationToken cancellationToken)
+    {
+        await governor.AcquireMessagesAsync(1, SocketMessageClass.Normal, cancellationToken);
+        connection.RequireClient().reqExecutions(requestId, filter);
+    }
+
+    /// <summary>
     /// Desubscribes an account stream. Never throws — a rebuild must proceed whether or not the
     /// cancel lands, and a socket that has already gone has dropped the subscription anyway.
     /// </summary>

@@ -72,7 +72,7 @@ public sealed class LiveTwsOptionChainTests(LiveTwsOptionChainTests.TwsFixture t
             var governor = new IbkrPacingGovernor(
                 options, TimeProvider.System, new TestMeterFactory(), NullLogger<IbkrPacingGovernor>.Instance);
             var wrapper = new IbkrClientWrapper(
-                registry, new IbkrOrderTracker(NullLogger<IbkrOrderTracker>.Instance),
+                registry, new IbkrOrderTracker(NullLogger<IbkrOrderTracker>.Instance), new ExecutionCommissionRouter(),
                 NullLogger<IbkrClientWrapper>.Instance);
 
             _connection = new IbkrConnection(
