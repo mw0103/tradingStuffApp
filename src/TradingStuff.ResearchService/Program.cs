@@ -188,6 +188,8 @@ builder.Services.AddSingleton<IPaperAutomationStore, PaperAutomationStore>();
 builder.Services.AddSingleton<SpyVerticalPlanner>();
 builder.Services.AddSingleton<SpyShortVolPlanner>();
 builder.Services.AddSingleton<TradingStuff.ResearchService.Studies.VrpConditioning.VolShadowMarkStore>();
+builder.Services.AddSingleton<TradingStuff.ResearchService.Studies.TermStructure.TermStructureStore>();
+builder.Services.AddSingleton<TradingStuff.ResearchService.Studies.TermStructure.TermStructureSeriesBuilder>();
 builder.Services.AddSingleton<IAutomationSignal, VolResidualSignal>();
 builder.Services.AddSingleton<PaperAutomationService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<PaperAutomationService>());
@@ -494,6 +496,7 @@ app.MapVolResidualStudyEndpoints();
 
 app.MapVrpConditioningStudyEndpoints();
 app.MapShadowMarkEndpoints();
+TradingStuff.ResearchService.Studies.TermStructure.TermStructureEndpoints.MapTermStructureEndpoints(app);
 
 app.MapPaperAutomationEndpoints();
 
