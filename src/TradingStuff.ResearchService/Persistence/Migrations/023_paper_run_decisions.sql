@@ -4,7 +4,10 @@
 -- The protocol says entry "requires a registered decision that the paper run may proceed on
 -- dev-provenance infrastructure (the signal's provenance refusal is amended by that decision for
 -- PAPER only, never live)". A row here is that decision. It is the KEY; ConstantExposureSignal is
--- the lock, and nothing in the automation loop opens a position while this table is empty.
+-- the lock, and nothing on the AUTOMATED path opens a position while this table is empty. The
+-- manual trigger (POST /research/automation/manual-order) deliberately bypasses the signal and is
+-- recorded as trigger=manual, signal_state=not-evaluated: this table gates the loop, not the
+-- operator.
 --
 -- The row is a signed statement by a human, so its columns are the parts of a signature that make
 -- it attributable later: WHO signed it, WHAT they signed, WHICH document they signed against, and

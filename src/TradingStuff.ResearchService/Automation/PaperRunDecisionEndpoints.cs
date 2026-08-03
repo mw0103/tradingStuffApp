@@ -39,6 +39,16 @@ public sealed record RevokePaperRunDecisionRequest(string? Reason);
 /// thirty seconds when it matters.
 /// </item>
 /// </list>
+/// <para>
+/// <b>What the credential is, and what it proves.</b> The accepted bearer is the mesh's shared
+/// development token (<c>Authentication:DevelopmentToken</c>, default <c>dev-internal-token</c> —
+/// see README's curl examples); a bodiless 401 from the create means the
+/// <c>Authorization: Bearer</c> header is missing or wrong, nothing more. Because every internal
+/// service holds the same token, possessing it does not attribute the signature to a human —
+/// attribution rests on <c>signed_by</c> plus the Critical log line, and the credential merely
+/// keeps the create off the anonymous surface until the dev handler is replaced by Keycloak
+/// (docs/STATE.md outstanding list).
+/// </para>
 /// </remarks>
 public static class PaperRunDecisionEndpoints
 {
@@ -49,8 +59,23 @@ public static class PaperRunDecisionEndpoints
         app.MapGet("/research/paper-run/decision", async (
             IPaperRunDecisionStore store, int? history, CancellationToken cancellationToken) =>
         {
-            var active = await store.GetActiveAsync(cancellationToken);
-            var recent = await store.ListAsync(Math.Clamp(history ?? 20, 1, 200), cancellationToken);
+            PaperRunDecision? active;
+            IReadOnlyList<PaperRunDecision> recent;
+
+            try
+            {
+                active = await store.GetActiveAsync(cancellationToken);
+                recent = await store.ListAsync(Math.Clamp(history ?? 20, 1, 200), cancellationToken);
+            }
+            catch (Exception ex) when (ex is Npgsql.NpgsqlException or InvalidOperationException)
+            {
+                // These two handlers are anonymous, and the developer exception page would hand a
+                // stack trace plus connection detail to anyone who asks while the database is down.
+                return Results.Problem(
+                    title: "The decision store is unreachable.",
+                    detail: ex.Message,
+                    statusCode: StatusCodes.Status503ServiceUnavailable);
+            }
 
             return Results.Ok(new
             {
@@ -108,7 +133,22 @@ public static class PaperRunDecisionEndpoints
             ILogger<PaperRunDecisionStore> logger,
             CancellationToken cancellationToken) =>
         {
-            var result = await store.RevokeActiveAsync(request?.Reason, cancellationToken);
+            PaperRunDecisionResult result;
+
+            try
+            {
+                result = await store.RevokeActiveAsync(request?.Reason, cancellationToken);
+            }
+            catch (Exception ex) when (ex is Npgsql.NpgsqlException or InvalidOperationException)
+            {
+                // Same reasoning as the GET: anonymous surface, no stack traces. The revoke intent
+                // (stop entry) fails CLOSED anyway — the signal cannot read an unreachable store
+                // and refuses on its own.
+                return Results.Problem(
+                    title: "The decision store is unreachable.",
+                    detail: ex.Message,
+                    statusCode: StatusCodes.Status503ServiceUnavailable);
+            }
 
             if (result.Refusal is { } refusal)
             {
