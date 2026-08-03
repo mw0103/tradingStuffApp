@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Options;
 using Npgsql;
 using TradingStuff.ResearchContracts;
 using TradingStuff.ResearchService.Automation;
@@ -185,12 +186,49 @@ builder.Services.AddHttpClient<MarketDataServiceClient>((sp, http) =>
 });
 
 builder.Services.AddSingleton<IPaperAutomationStore, PaperAutomationStore>();
+builder.Services.AddSingleton<IPaperRunDecisionStore, PaperRunDecisionStore>();
 builder.Services.AddSingleton<SpyVerticalPlanner>();
 builder.Services.AddSingleton<SpyShortVolPlanner>();
 builder.Services.AddSingleton<TradingStuff.ResearchService.Studies.VrpConditioning.VolShadowMarkStore>();
 builder.Services.AddSingleton<TradingStuff.ResearchService.Studies.TermStructure.TermStructureStore>();
 builder.Services.AddSingleton<TradingStuff.ResearchService.Studies.TermStructure.TermStructureSeriesBuilder>();
-builder.Services.AddSingleton<IAutomationSignal, VolResidualSignal>();
+// The signal source, selected by PaperAutomation:Signal. 'vol-residual' stays the default and keeps
+// refusing every path; 'constant-exposure' asks for the protocol's mandated constant one-vega
+// position and only while an operator-signed research.paper_run_decisions row stands.
+//
+// Resolved once, here, because the loop asks the signal a question rather than choosing one — so an
+// unrecognised value cannot refuse at evaluation time the way an unknown Structure does. It lands on
+// the refusing signal instead, and says so at Critical: a typo must not read as a deliberate choice,
+// and it must not silently arm anything either.
+builder.Services.AddSingleton<IAutomationSignal>(sp =>
+{
+    var configured = sp.GetRequiredService<IOptions<PaperAutomationOptions>>().Value.Signal;
+    var selected = PaperAutomationOptions.Signals.Select(configured, out var recognised);
+    var logger = sp.GetRequiredService<ILoggerFactory>().CreateLogger("TradingStuff.ResearchService.Automation.Signal");
+
+    if (!recognised)
+    {
+        logger.LogCritical(
+            "PaperAutomation:Signal is '{Configured}', which this build does not recognise. Falling back to " +
+            "'{Fallback}', which refuses every path. Known values: '{VolResidual}', '{ConstantExposure}'.",
+            configured, selected,
+            PaperAutomationOptions.Signals.VolResidual,
+            PaperAutomationOptions.Signals.ConstantExposure);
+    }
+
+    if (selected != PaperAutomationOptions.Signals.ConstantExposure)
+    {
+        return ActivatorUtilities.CreateInstance<VolResidualSignal>(sp);
+    }
+
+    logger.LogWarning(
+        "PaperAutomation:Signal is 'constant-exposure': the loop will ask for a position whenever an unrevoked " +
+        "research.paper_run_decisions row authorizes the paper run. No forecast is consulted — the protocol's " +
+        "exposure is constant by construction. Arming, the DU-only check, the session and the cap all still apply.");
+
+    return ActivatorUtilities.CreateInstance<ConstantExposureSignal>(sp);
+});
+
 builder.Services.AddSingleton<PaperAutomationService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<PaperAutomationService>());
 
@@ -499,6 +537,7 @@ app.MapShadowMarkEndpoints();
 TradingStuff.ResearchService.Studies.TermStructure.TermStructureEndpoints.MapTermStructureEndpoints(app);
 
 app.MapPaperAutomationEndpoints();
+app.MapPaperRunDecisionEndpoints();
 
 app.MapDefaultEndpoints();
 

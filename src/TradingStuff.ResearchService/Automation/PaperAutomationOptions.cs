@@ -91,6 +91,42 @@ public sealed class PaperAutomationOptions
     }
 
     /// <summary>
+    /// Which signal source may ask for a position. <c>vol-residual</c> (the default) refuses every
+    /// path by construction; <c>constant-exposure</c> asks for the protocol's mandated constant
+    /// one-vega position, and only while an operator-signed <c>research.paper_run_decisions</c> row
+    /// authorizes it.
+    /// </summary>
+    /// <remarks>
+    /// Unlike <see cref="Structure"/>, an unrecognised value here cannot refuse at evaluation time:
+    /// the signal is resolved once, at startup, and the loop asks it a question rather than choosing
+    /// it. So an unrecognised value lands on the REFUSING signal — the safe direction, and the one
+    /// every other opt-in in this repository degrades in — while Program.cs logs Critical rather than
+    /// substituting silently.
+    /// </remarks>
+    public string Signal { get; set; } = Signals.VolResidual;
+
+    public static class Signals
+    {
+        public const string VolResidual = "vol-residual";
+        public const string ConstantExposure = "constant-exposure";
+
+        /// <summary>
+        /// Resolves the configured name to one this build implements. <paramref name="recognised"/>
+        /// is false for anything else, so the caller can report the substitution instead of letting a
+        /// typo read as a deliberate choice.
+        /// </summary>
+        public static string Select(string? configured, out bool recognised)
+        {
+            recognised = string.Equals(configured, VolResidual, StringComparison.Ordinal)
+                         || string.Equals(configured, ConstantExposure, StringComparison.Ordinal);
+
+            return string.Equals(configured, ConstantExposure, StringComparison.Ordinal)
+                ? ConstantExposure
+                : VolResidual;
+        }
+    }
+
+    /// <summary>
     /// Days ahead to aim the short-vol expiration. ~30 calendar days approximates the study's
     /// 21-trading-day horizon, so the paper structure tests the window the research was run at.
     /// </summary>
