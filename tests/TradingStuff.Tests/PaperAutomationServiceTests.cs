@@ -745,7 +745,7 @@ public sealed class PaperAutomationServiceTests
     }
 
     /// <summary>An in-memory decision log that answers the cap from what it was told to record.</summary>
-    private sealed class FakeStore : IPaperAutomationStore
+    internal sealed class FakeStore : IPaperAutomationStore
     {
         private long _nextId = 1;
 
@@ -804,7 +804,13 @@ public sealed class PaperAutomationServiceTests
         }
     }
 
-    private sealed class Harness : IDisposable
+    /// <summary>
+    /// The loop with its three HTTP peers stubbed. Internal rather than private so the
+    /// RequiresPostgres suite can drive the same service against the real decision log — the
+    /// idempotency claim is about the store, and proving it against a different harness would prove
+    /// it about a different loop.
+    /// </summary>
+    internal sealed class Harness : IDisposable
     {
         private static readonly JsonSerializerOptions Json = new(JsonSerializerDefaults.Web);
 
@@ -825,8 +831,11 @@ public sealed class PaperAutomationServiceTests
             HttpStatusCode orderResponse = HttpStatusCode.Created,
             IReadOnlyList<PositionSnapshot>? positions = null,
             bool portfolioReadable = true,
-            int exitDteThreshold = 7)
+            int exitDteThreshold = 7,
+            IPaperAutomationStore? store = null)
         {
+            // The in-memory log is always constructed so Store is never null; it is simply unused
+            // when a real one is supplied.
             Store = new FakeStore();
             Positions = [.. positions ?? []];
 
@@ -952,7 +961,7 @@ public sealed class PaperAutomationServiceTests
                 options,
                 new FakeSignal(signal ?? Signals.InsufficientData, () => SignalEvaluations++),
                 new SessionClock(),
-                Store,
+                store ?? Store,
                 new SpyVerticalPlanner(
                     new OptionChainClient(_gatewayHttp, NullLogger<OptionChainClient>.Instance),
                     marketDataClient,
