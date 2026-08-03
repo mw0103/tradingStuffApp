@@ -480,18 +480,48 @@ public sealed class PaperAutomationServiceTests
             return Task.FromResult(id);
         }
 
+        public bool FailExitKeys { get; set; }
+
+        // Mirrors PaperAutomationStore's query, exit actions included: an exit-submitted row carries
+        // an order id so order_submitted covers it, and exit-outcome-unknown is named alongside its
+        // entry counterpart because a closing order whose outcome was lost may be live too.
         public Task<int> CountSubmittedOnAsync(DateOnly tradingDate, CancellationToken cancellationToken) =>
             FailCount
                 ? Task.FromException<int>(new InvalidOperationException("the decision log is unreachable"))
                 : Task.FromResult(Recorded.Count(d =>
                     d.SessionTradingDate == tradingDate
-                    && (d.OrderSubmitted || d.Action == AutomationActions.OutcomeUnknown)));
+                    && (d.OrderSubmitted
+                        || d.Action == AutomationActions.OutcomeUnknown
+                        || d.Action == AutomationActions.ExitOutcomeUnknown)));
 
         public Task<IReadOnlyList<AutomationDecision>> RecentAsync(int limit, CancellationToken cancellationToken) =>
             Task.FromResult<IReadOnlyList<AutomationDecision>>([.. Recorded.AsEnumerable().Reverse().Take(limit)]);
 
         public Task<IReadOnlyList<AutomationDecision>> SubmittedOnAsync(DateOnly tradingDate, CancellationToken cancellationToken) =>
             Task.FromResult<IReadOnlyList<AutomationDecision>>([.. Recorded.Where(d => d.OrderSubmitted)]);
+
+        /// <summary>The same projection the SQL does: <c>detail-&gt;&gt;'exitKey'</c> on order-bearing exit rows.</summary>
+        public Task<IReadOnlyList<string>> ExitKeysOrderedOnAsync(DateOnly tradingDate, CancellationToken cancellationToken)
+        {
+            if (FailExitKeys)
+            {
+                return Task.FromException<IReadOnlyList<string>>(
+                    new InvalidOperationException("the decision log is unreachable"));
+            }
+
+            var keys = Recorded
+                .Where(d => d.SessionTradingDate == tradingDate
+                            && d.Action is AutomationActions.ExitSubmitted or AutomationActions.ExitOutcomeUnknown
+                            && d.Detail is not null)
+                .Select(d => JsonDocument.Parse(d.Detail!).RootElement.TryGetProperty("exitKey", out var key)
+                    ? key.GetString()
+                    : null)
+                .Where(key => key is not null)
+                .Select(key => key!)
+                .ToArray();
+
+            return Task.FromResult<IReadOnlyList<string>>(keys);
+        }
     }
 
     private sealed class Harness : IDisposable
@@ -512,7 +542,10 @@ public sealed class PaperAutomationServiceTests
             decimal longAsk = 2.41m,
             decimal shortBid = 1.98m,
             int cap = 2,
-            HttpStatusCode orderResponse = HttpStatusCode.Created)
+            HttpStatusCode orderResponse = HttpStatusCode.Created,
+            IReadOnlyList<PositionSnapshot>? positions = null,
+            bool portfolioReadable = true,
+            int exitDteThreshold = 7)
         {
             Store = new FakeStore();
 
@@ -578,16 +611,45 @@ public sealed class PaperAutomationServiceTests
             { BaseAddress = new Uri("http://marketdata") };
 
             _gatewayHttp = new HttpClient(new StubHttpMessageHandler(request =>
-                request.RequestUri!.AbsolutePath == "/ibkr/status"
-                    ? Ok(new
+            {
+                if (request.RequestUri!.AbsolutePath == "/ibkr/status")
+                {
+                    return Ok(new
                     {
                         connected = true,
                         tradingPermitted = true,
                         tradingBlockedReason = (string?)null,
                         managedAccounts = new[] { "DUQ000001" },
                         marketDataType = 3,
-                    })
-                    : Ok(Chain())))
+                    });
+                }
+
+                if (request.RequestUri.AbsolutePath == "/ibkr/account/portfolio")
+                {
+                    PortfolioReads++;
+
+                    if (!portfolioReadable)
+                    {
+                        return new HttpResponseMessage(HttpStatusCode.ServiceUnavailable)
+                        {
+                            Content = new StringContent("{\"title\":\"Not connected to TWS.\"}"),
+                        };
+                    }
+
+                    return Ok(new
+                    {
+                        portfolio = new PortfolioSnapshot(
+                            "DUQ000001", 25_000m, 0m, GreeksVector.Zero, positions ?? []),
+                        capturedAt = time.GetUtcNow(),
+                        dailyPnLAvailable = true,
+                        greeksComplete = true,
+                        optionPositionCount = positions?.Count ?? 0,
+                        nonOptionPositionCount = 0,
+                    });
+                }
+
+                return Ok(Chain());
+            }))
             { BaseAddress = new Uri("http://gateway") };
 
             var options = Options.Create(new PaperAutomationOptions
@@ -598,6 +660,7 @@ public sealed class PaperAutomationServiceTests
                 SpreadWidthDollars = 1m,
                 MarketableBufferDollars = 0.05m,
                 MaxDebitDollars = 0.75m,
+                ExitDteThreshold = exitDteThreshold,
             });
 
             var marketDataClient = new MarketDataServiceClient(_marketDataHttp);
@@ -617,6 +680,7 @@ public sealed class PaperAutomationServiceTests
                     marketDataClient,
                     options,
                     NullLogger<SpyShortVolPlanner>.Instance),
+                new SpyExitPlanner(marketDataClient, options),
                 new ExecutionServiceClient(_executionHttp),
                 marketDataClient,
                 new IbkrGatewayClient(_gatewayHttp, NullLogger<IbkrGatewayClient>.Instance),
@@ -633,6 +697,8 @@ public sealed class PaperAutomationServiceTests
         public int QuoteRequests { get; private set; }
 
         public int SignalEvaluations { get; private set; }
+
+        public int PortfolioReads { get; private set; }
 
         public List<SubmitOrderRequest> SubmittedOrders { get; } = [];
 

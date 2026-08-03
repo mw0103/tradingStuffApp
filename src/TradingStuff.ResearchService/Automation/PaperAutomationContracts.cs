@@ -70,6 +70,13 @@ public static class SignalStates
 }
 
 /// <summary>What the evaluation did.</summary>
+/// <remarks>
+/// The four <c>exit-*</c> values mirror the entry three deliberately rather than reusing them. An
+/// entry and an exit are opposite transitions of the same position and a record that cannot tell them
+/// apart cannot answer "did the loop close what it opened?" — which is precisely the protocol's
+/// success criterion 3. The parallel naming is also load-bearing for the cap query: see
+/// <c>PaperAutomationStore.CountSubmittedOnAsync</c>, which counts BOTH unknown-outcome shapes.
+/// </remarks>
 public static class AutomationActions
 {
     /// <summary>Evaluated, and the answer was "do not trade". The overwhelmingly common row.</summary>
@@ -83,6 +90,32 @@ public static class AutomationActions
 
     /// <summary>An order was handed over and no outcome came back. It may exist at the venue.</summary>
     public const string OutcomeUnknown = "outcome-unknown";
+
+    /// <summary>A closing order was handed to ExecutionService for a position at or below the DTE threshold.</summary>
+    public const string ExitSubmitted = "exit-submitted";
+
+    /// <summary>
+    /// A position is due to be closed and the closing order could not be constructed or priced. The
+    /// position is still open; the next pass tries again.
+    /// </summary>
+    public const string ExitRefused = "exit-refused";
+
+    /// <summary>A closing order was handed over and no outcome came back. It may exist at the venue.</summary>
+    public const string ExitOutcomeUnknown = "exit-outcome-unknown";
+}
+
+/// <summary>
+/// The exit rules this build knows. There is one, and adding a second is a decision, not an edit.
+/// </summary>
+/// <remarks>
+/// Recorded verbatim at the head of every exit decision's <c>action_reason</c> and in its
+/// <c>detail</c>, so a row can never say "closed" without saying which rule closed it. See
+/// <see cref="PaperAutomationOptions.ExitDteThreshold"/> for why the list is one long.
+/// </remarks>
+public static class AutomationExitRules
+{
+    /// <summary>Calendar days to expiration at or below <see cref="PaperAutomationOptions.ExitDteThreshold"/>.</summary>
+    public const string Dte = "exit-dte";
 }
 
 /// <summary>One row of <c>research.paper_automation_decisions</c>.</summary>

@@ -22,6 +22,18 @@ public interface IPaperAutomationStore
     Task<IReadOnlyList<AutomationDecision>> RecentAsync(int limit, CancellationToken cancellationToken);
 
     Task<IReadOnlyList<AutomationDecision>> SubmittedOnAsync(DateOnly tradingDate, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// The exit keys already handed a closing order on this trading date.
+    /// </summary>
+    /// <remarks>
+    /// The durable half of the exit claim — the same shape as
+    /// <see cref="CountSubmittedOnAsync"/> and for the same reason. An in-memory set of what this
+    /// process has closed is emptied by a restart, and a loop that came back would submit a second
+    /// closing order for a position whose first one is resting at the venue. Measured on the table, it
+    /// is a fact about what was ordered.
+    /// </remarks>
+    Task<IReadOnlyList<string>> ExitKeysOrderedOnAsync(DateOnly tradingDate, CancellationToken cancellationToken);
 }
 
 /// <summary>
@@ -110,6 +122,14 @@ public sealed class PaperAutomationStore(IConfiguration configuration) : IPaperA
     /// with no id recorded here. Those rows are <c>action = 'outcome-unknown'</c> and they are counted
     /// too — a cap that ignored the ambiguous case would let a gateway timeout buy an extra order,
     /// which is the one direction a safety rail must not fail in.
+    /// <para>
+    /// <b>Closing orders are counted here as well</b>, by the same two clauses:
+    /// <c>exit-submitted</c> rows carry an order id so <c>order_submitted</c> already covers them, and
+    /// <c>exit-outcome-unknown</c> is named alongside its entry counterpart. This is a count of orders
+    /// this loop put at the venue, and an exit is one — the operator's "how many orders today?" must
+    /// not be answerable only for the half of the lifecycle that opens a position. What the count does
+    /// NOT do any more is stop an exit: see <c>PaperAutomationArming.PermitsExit</c>.
+    /// </para>
     /// </remarks>
     public async Task<int> CountSubmittedOnAsync(DateOnly tradingDate, CancellationToken cancellationToken)
     {
@@ -118,7 +138,8 @@ public sealed class PaperAutomationStore(IConfiguration configuration) : IPaperA
 
         await using var command = new NpgsqlCommand(
             "SELECT count(*) FROM research.paper_automation_decisions " +
-            "WHERE (order_submitted OR action = 'outcome-unknown') AND session_trading_date = $1",
+            "WHERE (order_submitted OR action IN ('outcome-unknown', 'exit-outcome-unknown')) " +
+            "  AND session_trading_date = $1",
             connection)
         {
             Parameters = { new() { Value = tradingDate, NpgsqlDbType = NpgsqlDbType.Date } },
@@ -127,12 +148,52 @@ public sealed class PaperAutomationStore(IConfiguration configuration) : IPaperA
         return (int)(long)(await command.ExecuteScalarAsync(cancellationToken))!;
     }
 
+    /// <summary>
+    /// The exit keys already handed a closing order on this trading date.
+    /// </summary>
+    /// <remarks>
+    /// Read out of <c>detail</c> rather than a column of its own, because this plan adds no migration
+    /// (023 and 024 are spoken for) and <c>detail</c> is the jsonb column that exists for facts a
+    /// decision carries that the fixed columns do not name. Both order-bearing exit actions are
+    /// included for the reason the cap counts both: an <c>exit-outcome-unknown</c> closing order may
+    /// well be resting at the venue, and re-submitting one because its outcome was ambiguous is the
+    /// same defect as re-entering because a response was lost.
+    /// </remarks>
+    public async Task<IReadOnlyList<string>> ExitKeysOrderedOnAsync(
+        DateOnly tradingDate, CancellationToken cancellationToken)
+    {
+        await using var connection = new NpgsqlConnection(Required());
+        await connection.OpenAsync(cancellationToken);
+
+        await using var command = new NpgsqlCommand(
+            "SELECT detail->>'exitKey' FROM research.paper_automation_decisions " +
+            "WHERE session_trading_date = $1 " +
+            "  AND action IN ('exit-submitted', 'exit-outcome-unknown') " +
+            "  AND detail->>'exitKey' IS NOT NULL",
+            connection)
+        {
+            Parameters = { new() { Value = tradingDate, NpgsqlDbType = NpgsqlDbType.Date } },
+        };
+
+        var keys = new List<string>();
+
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+
+        while (await reader.ReadAsync(cancellationToken))
+        {
+            keys.Add(reader.GetString(0));
+        }
+
+        return keys;
+    }
+
     public Task<IReadOnlyList<AutomationDecision>> RecentAsync(int limit, CancellationToken cancellationToken) =>
         QueryAsync("ORDER BY decided_at DESC, decision_id DESC LIMIT $1", [new() { Value = limit }], cancellationToken);
 
     public Task<IReadOnlyList<AutomationDecision>> SubmittedOnAsync(DateOnly tradingDate, CancellationToken cancellationToken) =>
         QueryAsync(
-            "WHERE (order_submitted OR action = 'outcome-unknown') AND session_trading_date = $1 " +
+            "WHERE (order_submitted OR action IN ('outcome-unknown', 'exit-outcome-unknown')) " +
+            "  AND session_trading_date = $1 " +
             "ORDER BY decided_at DESC",
             [new() { Value = tradingDate, NpgsqlDbType = NpgsqlDbType.Date }],
             cancellationToken);

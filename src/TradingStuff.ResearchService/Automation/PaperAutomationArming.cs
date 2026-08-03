@@ -226,6 +226,29 @@ public static class PaperAutomationArming
             $"{orderCap - ordersThisSession} of {orderCap} orders remaining.");
     }
 
+    /// <summary>
+    /// Whether a verdict from <see cref="Evaluate"/> still permits a CLOSING order.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Exactly one refusal is passable, and it is the cap. Every other state means an order would not
+    /// mean what it appears to mean — a simulated router, fabricated quotes, an unknown account, a
+    /// gateway that will not answer — or that the operator has pressed stop, and none of those get
+    /// better because the order in question reduces exposure rather than adding it. The cap is
+    /// different in kind: it is a rail on how much NEW exposure one trading date may acquire, and
+    /// enforcing it against an exit would leave a position open into an expiration the loop cannot
+    /// handle. An uncloseable position is worse than an extra order, so the cap COUNTS exits (see
+    /// <c>PaperAutomationStore.CountSubmittedOnAsync</c>) and does not block them.
+    /// </para>
+    /// <para>
+    /// Deliberately a predicate over the one verdict rather than a second evaluation with the cap
+    /// dropped. Two orderings of the same rules that could disagree is worse than one — the same
+    /// reasoning the status endpoint records for re-deriving its own precedence.
+    /// </para>
+    /// </remarks>
+    public static bool PermitsExit(ArmingResult arming) =>
+        arming.Armed || string.Equals(arming.State, ArmStates.CapReached, StringComparison.Ordinal);
+
     /// <summary>Account numbers are never written whole to a log, a row, or an HTTP response.</summary>
     private static string Redact(string account) =>
         account.Length <= 3 ? "***" : $"***{account[^3..]}";

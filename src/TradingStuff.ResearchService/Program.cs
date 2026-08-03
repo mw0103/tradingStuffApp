@@ -189,6 +189,10 @@ builder.Services.AddSingleton<IPaperAutomationStore, PaperAutomationStore>();
 builder.Services.AddSingleton<IPaperRunDecisionStore, PaperRunDecisionStore>();
 builder.Services.AddSingleton<SpyVerticalPlanner>();
 builder.Services.AddSingleton<SpyShortVolPlanner>();
+
+// The exit side of the same loop. It selects nothing — it reverses whatever the account reports open
+// and prices it to cross — so it needs the quote client and the options, and no chain access at all.
+builder.Services.AddSingleton<SpyExitPlanner>();
 builder.Services.AddSingleton<TradingStuff.ResearchService.Studies.VrpConditioning.VolShadowMarkStore>();
 builder.Services.AddSingleton<TradingStuff.ResearchService.Studies.TermStructure.TermStructureStore>();
 builder.Services.AddSingleton<TradingStuff.ResearchService.Studies.TermStructure.TermStructureSeriesBuilder>();
