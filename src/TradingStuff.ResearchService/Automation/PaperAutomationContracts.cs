@@ -51,6 +51,20 @@ public static class SignalStates
     /// <summary>The signal is asking for a position.</summary>
     public const string Enter = "enter";
 
+    /// <summary>
+    /// No unrevoked <c>research.paper_run_decisions</c> row exists, so the paper run is not authorized
+    /// to proceed on dev-provenance infrastructure — see <see cref="ConstantExposureSignal"/>.
+    /// </summary>
+    public const string NoPaperDecision = "no-paper-decision";
+
+    /// <summary>
+    /// The decision table could not be read, so authorization is UNKNOWN. Distinct from
+    /// <see cref="NoPaperDecision"/> deliberately: both refuse entry, but only one of them is a fault
+    /// somebody has to fix, and a decision log that cannot tell them apart reports an outage as a
+    /// deliberate no-trade.
+    /// </summary>
+    public const string PaperDecisionUnreadable = "paper-decision-unreadable";
+
     /// <summary>The signal was deliberately not consulted (the manual endpoint).</summary>
     public const string NotEvaluated = "not-evaluated";
 }
