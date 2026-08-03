@@ -79,6 +79,10 @@ public sealed class SpyShortVolPlanner(
         decimal netLimit;
         string limitSource;
 
+        // The NBBO the limit was computed from, carried out to the persisted record. Null on the
+        // operator-supplied branch because no quote was read there — see PlannedOrder.LegQuotes.
+        IReadOnlyList<PlannedLegQuote>? legQuotes = null;
+
         if (operatorLimitPrice is { } supplied)
         {
             netLimit = supplied;
@@ -102,6 +106,10 @@ public sealed class SpyShortVolPlanner(
             // The shared signed convention: a credit received is a NEGATIVE net price.
             netLimit = -priced.Credit!.Value;
             limitSource = LimitPriceSources.ComputedMarketable;
+
+            // Captured AFTER pricing succeeded and from the same quote set the price came from, so
+            // the record cannot disagree with the limit it accompanies. Observation only.
+            legQuotes = CaptureLegQuotes(quotes.Quotes, shortLeg, longLeg);
         }
 
         if (netLimit >= 0m)
@@ -141,7 +149,53 @@ public sealed class SpyShortVolPlanner(
             limitSource,
             $"{settings.Underlying} {expiration:yyyy-MM-dd} {shortLeg.Strike:F0}/{longLeg.Strike:F0} put credit " +
             $"spread, {settings.Quantity} lot, net {netLimit:F2} (credit {-netLimit:F2}, max loss " +
-            $"{maxLossPerShare:F2}/share, spot reference {reference:F2})"));
+            $"{maxLossPerShare:F2}/share, spot reference {reference:F2})",
+            legQuotes));
+    }
+
+    /// <summary>
+    /// The two legs' NBBO as read, in short-then-long order. Pure.
+    /// </summary>
+    /// <remarks>
+    /// Only quotes that were actually matched to a leg are returned — a leg with no quote is absent
+    /// rather than represented by zeros, and it cannot happen on the path that calls this, since
+    /// <see cref="ComputeMarketableCredit"/> has already refused when either side is missing. The
+    /// side strings are the planner's own intent ("SELL" the short put, "BUY" the wing), because a
+    /// bid/ask pair means something different depending on which way the leg is going.
+    /// </remarks>
+    internal static IReadOnlyList<PlannedLegQuote> CaptureLegQuotes(
+        IReadOnlyList<QuoteSnapshot> quotes,
+        OptionContract shortLeg,
+        OptionContract longLeg)
+    {
+        var byKey = new Dictionary<OptionContractKey, QuoteSnapshot>();
+
+        foreach (var quote in quotes)
+        {
+            byKey[quote.Contract.Key()] = quote;
+        }
+
+        var captured = new List<PlannedLegQuote>(2);
+
+        foreach (var (leg, side) in new[] { (shortLeg, OrderSide.Sell), (longLeg, OrderSide.Buy) })
+        {
+            if (byKey.TryGetValue(leg.Key(), out var quote))
+            {
+                captured.Add(new PlannedLegQuote(
+                    leg.Underlying,
+                    leg.Expiration,
+                    leg.Strike,
+                    leg.Right.ToString(),
+                    side.ToString(),
+                    quote.Bid,
+                    quote.Ask,
+                    quote.Last,
+                    quote.CapturedAt,
+                    quote.Source));
+            }
+        }
+
+        return captured;
     }
 
     /// <summary>

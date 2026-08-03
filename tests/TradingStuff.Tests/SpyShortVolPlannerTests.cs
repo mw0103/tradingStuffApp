@@ -125,6 +125,83 @@ public sealed class SpyShortVolPlannerTests
         Assert.Contains("inverted or stale", failure);
     }
 
+    // ---- decision-time NBBO capture ---------------------------------------------------------------
+    // The paper-run protocol's shadow record item 7 needs the contemporaneous quote of each leg, and
+    // it is only knowable here: a quote reconstructed later measures a different moment. The planner
+    // already reads both legs to price the spread — these pin that the read is carried out to the
+    // record rather than discarded once the arithmetic is done. Nothing consumes it to decide.
+
+    [Fact]
+    public void Both_legs_nbbo_is_captured_short_first_with_the_side_it_was_read_for()
+    {
+        var shortLeg = Put(725);
+        var longLeg = Put(724);
+
+        var quotes = new[] { Quote(shortLeg, 1.37m, 1.40m), Quote(longLeg, 0.92m, 0.95m) };
+
+        var captured = SpyShortVolPlanner.CaptureLegQuotes(quotes, shortLeg, longLeg);
+
+        Assert.Equal(2, captured.Count);
+
+        Assert.Equal(725m, captured[0].Strike);
+        Assert.Equal("Sell", captured[0].Side);
+        Assert.Equal(1.37m, captured[0].Bid);
+        Assert.Equal(1.40m, captured[0].Ask);
+
+        Assert.Equal(724m, captured[1].Strike);
+        Assert.Equal("Buy", captured[1].Side);
+        Assert.Equal(0.92m, captured[1].Bid);
+        Assert.Equal(0.95m, captured[1].Ask);
+    }
+
+    [Fact]
+    public void The_captured_quote_is_the_one_the_credit_was_computed_from()
+    {
+        var shortLeg = Put(725);
+        var longLeg = Put(724);
+
+        var quotes = new[] { Quote(shortLeg, 1.37m, 1.40m), Quote(longLeg, 0.92m, 0.95m) };
+
+        var (credit, _) = SpyShortVolPlanner.ComputeMarketableCredit(quotes, shortLeg, longLeg, 0.05m);
+        var captured = SpyShortVolPlanner.CaptureLegQuotes(quotes, shortLeg, longLeg);
+
+        // Short bid minus long ask, less the buffer, floored — recomputed from the CAPTURED numbers.
+        // If the record could disagree with the limit it accompanies, item 7 would be unusable.
+        var natural = captured[0].Bid - captured[1].Ask;
+        Assert.Equal(credit, Math.Floor((natural - 0.05m) * 100m) / 100m);
+    }
+
+    [Fact]
+    public void The_capture_carries_the_quotes_own_provenance_not_the_planners()
+    {
+        var shortLeg = Put(725);
+        var longLeg = Put(724);
+
+        var quotes = new[] { Quote(shortLeg, 1.37m, 1.40m), Quote(longLeg, 0.92m, 0.95m) };
+
+        var captured = SpyShortVolPlanner.CaptureLegQuotes(quotes, shortLeg, longLeg);
+
+        // A delayed feed and a live one produce very different item-7 evidence, and the source
+        // string is the only thing that says which was read (docs/LESSONS.md §8).
+        Assert.Equal("ibkr-delayed", captured[0].Source);
+        Assert.Equal(quotes[0].CapturedAt, captured[0].CapturedAt);
+    }
+
+    [Fact]
+    public void A_leg_with_no_quote_is_absent_rather_than_a_row_of_zeros()
+    {
+        var shortLeg = Put(725);
+        var longLeg = Put(724);
+
+        var captured = SpyShortVolPlanner.CaptureLegQuotes([Quote(shortLeg, 1.37m, 1.40m)], shortLeg, longLeg);
+
+        // Unreachable on the planner's own path — ComputeMarketableCredit has already refused when a
+        // side is missing — but a zero bid/ask pair in the record would read as a leg with no market
+        // rather than as a leg nobody quoted.
+        Assert.Single(captured);
+        Assert.Equal(725m, captured[0].Strike);
+    }
+
     [Fact]
     public void A_credit_consumed_by_the_buffer_is_a_refusal()
     {

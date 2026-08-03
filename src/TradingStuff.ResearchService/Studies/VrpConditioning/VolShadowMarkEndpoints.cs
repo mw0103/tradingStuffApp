@@ -57,9 +57,7 @@ public static class VolShadowMarkEndpoints
             try
             {
                 var plan = await planner.PlanAsync("SHADOW", mark.MarkDate, null, cancellationToken);
-                plannerIntent = plan.Order is { } order
-                    ? new { planned = true, description = order.Description, netLimit = order.LimitPrice, limitSource = order.LimitPriceSource }
-                    : new { planned = false, refusal = plan.Failure };
+                plannerIntent = DescribeIntent(plan);
             }
             catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException)
             {
@@ -75,4 +73,31 @@ public static class VolShadowMarkEndpoints
             VolShadowMarkStore store, int? limit, CancellationToken cancellationToken) =>
             Results.Ok(await store.ListAsync(Math.Clamp(limit ?? 30, 1, 500), cancellationToken)));
     }
+
+    /// <summary>
+    /// The <c>planner_intent</c> document: what the planner would have built, or its named refusal.
+    /// </summary>
+    /// <remarks>
+    /// <c>legQuotes</c> carries the protocol's shadow record item 7 input — the contemporaneous NBBO
+    /// of each leg the planner selected — and it has to be written here because it is only knowable
+    /// here. A quote reconstructed later measures a different moment, and the planner reads both
+    /// legs anyway to compute the credit; this stops that read being discarded. It is null on an
+    /// operator-supplied price, where no quote was consulted, which is not the same as no market.
+    /// <para>
+    /// A static rather than inline in the endpoint so the persisted shape is pinnable by a test —
+    /// the item this closes is "the NBBO reaches the record", and a shape only an HTTP round trip
+    /// can see is one nothing checks.
+    /// </para>
+    /// </remarks>
+    internal static object DescribeIntent(OrderPlanResult plan) =>
+        plan.Order is { } order
+            ? new
+            {
+                planned = true,
+                description = order.Description,
+                netLimit = order.LimitPrice,
+                limitSource = order.LimitPriceSource,
+                legQuotes = order.LegQuotes,
+            }
+            : new { planned = false, refusal = plan.Failure };
 }
