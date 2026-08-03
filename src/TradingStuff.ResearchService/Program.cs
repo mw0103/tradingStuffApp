@@ -3,6 +3,7 @@ using Npgsql;
 using TradingStuff.ResearchContracts;
 using TradingStuff.ResearchService.Automation;
 using TradingStuff.ResearchService.Backfill;
+using TradingStuff.ResearchService.Capture;
 using TradingStuff.ResearchService.Gateway;
 using TradingStuff.ResearchService.OptionChains;
 using TradingStuff.ResearchService.Persistence;
@@ -235,6 +236,17 @@ builder.Services.AddSingleton<IAutomationSignal>(sp =>
 
 builder.Services.AddSingleton<PaperAutomationService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<PaperAutomationService>());
+
+// ---- raw paper capture ---------------------------------------------------------------------------
+// Reads the gateway's read-only account surface after each session close and writes the two
+// append-only tables from migration 024. It OBSERVES: no planner, no signal, no gate, no order path.
+// On by default, unlike PaperAutomation above, and PaperCaptureOptions says why — that opt-in guards
+// a surface that trades, this one guards a surface that only reads, and the session it fails to
+// capture cannot be captured later.
+builder.Services.Configure<PaperCaptureOptions>(builder.Configuration.GetSection("PaperCapture"));
+builder.Services.AddSingleton<PaperCaptureStore>();
+builder.Services.AddSingleton<PaperCaptureService>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<PaperCaptureService>());
 
 var app = builder.Build();
 
@@ -542,6 +554,7 @@ TradingStuff.ResearchService.Studies.TermStructure.TermStructureEndpoints.MapTer
 
 app.MapPaperAutomationEndpoints();
 app.MapPaperRunDecisionEndpoints();
+app.MapPaperCaptureEndpoints();
 
 app.MapDefaultEndpoints();
 
