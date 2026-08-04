@@ -27,6 +27,9 @@ public sealed class PaperCaptureProjectionTests
 
     private static readonly DateTimeOffset SnapshotAt = new(2026, 8, 6, 20, 15, 0, TimeSpan.Zero);
 
+    /// <summary>The next NYSE RTH open after <see cref="Session"/>: Friday 2026-08-07, 13:30 UTC.</summary>
+    private static readonly DateTimeOffset NextOpenUtc = new(2026, 8, 7, 13, 30, 0, TimeSpan.Zero);
+
     private static AccountSummaryRead Summary(params (string Tag, string Value, string Currency)[] tags) =>
         new("DU1234567", SnapshotAt, [.. tags.Select(t => new AccountSummaryTagRead(t.Tag, t.Value, t.Currency))]);
 
@@ -122,21 +125,107 @@ public sealed class PaperCaptureProjectionTests
     [Fact]
     public void Executions_outside_the_session_window_belong_to_a_different_trading_date()
     {
-        // TWS's filter takes a lower bound only, so recovering an older session also returns every
-        // later fill. Attributing those to the session being recovered would date them wrong, in a
-        // table whose entire purpose is reconstructing what happened when.
+        // TWS's filter takes a lower bound only — an over-fetched one at that — so recovering an
+        // older session also returns every later fill. Attributing those to the session being
+        // recovered would date them wrong, in a table whose entire purpose is reconstructing what
+        // happened when.
         var executions = new AccountExecutionsRead(
-            "DU1234567", SnapshotAt, Session.OpenUtc,
+            "DU1234567", SnapshotAt, Session.OpenUtc.AddHours(-12),
             [
                 Execution("in-session", Session.OpenUtc.AddHours(2)),
-                Execution("next-day", Session.CloseUtc.AddDays(1)),
+                Execution("next-session", NextOpenUtc.AddHours(1)),
+                Execution("at-next-open", NextOpenUtc),
                 Execution("before-open", Session.OpenUtc.AddHours(-2)),
             ],
             0);
 
+        var kept = PaperCaptureService
+            .SessionExecutions(Session, executions, NextOpenUtc).Select(e => e.ExecId).ToArray();
+
+        // Half-open: the next session's open belongs to the next session, so no instant is claimed
+        // twice and none is claimed by neither.
+        Assert.Equal(["in-session"], kept);
+    }
+
+    [Fact]
+    public void An_evening_report_after_the_close_is_captured_rather_than_dropped()
+    {
+        // Exercise and assignment reports post hours after the bell. For a short put spread held to
+        // expiry the assignment IS the protocol's item 6/9 input, and a window that stopped shortly
+        // after the close would drop it from EVERY capture, permanently — no session's predicate
+        // would match it, and the tables are append-only so it could never be added.
+        var executions = new AccountExecutionsRead(
+            "DU1234567", SnapshotAt, Session.OpenUtc.AddHours(-12),
+            [
+                Execution("assignment", Session.CloseUtc.AddHours(3)),
+                Execution("overnight", Session.CloseUtc.AddHours(10)),
+            ],
+            0);
+
+        var kept = PaperCaptureService
+            .SessionExecutions(Session, executions, NextOpenUtc).Select(e => e.ExecId).ToArray();
+
+        Assert.Equal(["assignment", "overnight"], kept);
+    }
+
+    [Fact]
+    public void Consecutive_session_windows_abut_so_no_instant_falls_between_them()
+    {
+        // The property, stated directly: every instant from this open to the next belongs to exactly
+        // one of the two sessions. A gap here is invisible — nothing errors, the fill simply never
+        // appears in any capture.
+        var nextSession = Session with
+        {
+            TradingDate = new DateOnly(2026, 8, 7),
+            OpenUtc = NextOpenUtc,
+            CloseUtc = new DateTimeOffset(2026, 8, 7, 20, 0, 0, TimeSpan.Zero),
+        };
+
+        DateTimeOffset[] instants =
+        [
+            Session.OpenUtc,
+            Session.CloseUtc.AddMinutes(1),
+            Session.CloseUtc.AddHours(6),   // the evening assignment window
+            NextOpenUtc.AddSeconds(-1),     // the last instant before the next bell
+            NextOpenUtc,
+            NextOpenUtc.AddHours(2),
+        ];
+
+        var executions = new AccountExecutionsRead(
+            "DU1234567", SnapshotAt, Session.OpenUtc.AddHours(-12),
+            [.. instants.Select((at, index) => Execution($"e{index}", at))],
+            0);
+
+        var claimedByThis = PaperCaptureService
+            .SessionExecutions(Session, executions, NextOpenUtc).Select(e => e.ExecId).ToHashSet();
+
+        var claimedByNext = PaperCaptureService
+            .SessionExecutions(nextSession, executions, NextOpenUtc.AddDays(3)).Select(e => e.ExecId).ToHashSet();
+
+        foreach (var execution in executions.Executions)
+        {
+            Assert.True(
+                claimedByThis.Contains(execution.ExecId) ^ claimedByNext.Contains(execution.ExecId),
+                $"{execution.ExecId} at {execution.ExecutedAt:O} was claimed by " +
+                $"{(claimedByThis.Contains(execution.ExecId) ? "both" : "neither")} session.");
+        }
+    }
+
+    [Fact]
+    public void With_no_next_session_known_the_window_still_runs_a_full_day_past_the_close()
+    {
+        var executions = new AccountExecutionsRead(
+            "DU1234567", SnapshotAt, Session.OpenUtc.AddHours(-12),
+            [
+                Execution("evening", Session.CloseUtc.AddHours(3)),
+                Execution("beyond", Session.CloseUtc.AddDays(1).AddMinutes(1)),
+            ],
+            0);
+
+        // The fallback for a calendar with nothing after this session. Still covers the evening.
         var kept = PaperCaptureService.SessionExecutions(Session, executions).Select(e => e.ExecId).ToArray();
 
-        Assert.Equal(["in-session"], kept);
+        Assert.Equal(["evening"], kept);
     }
 
     [Fact]
@@ -166,6 +255,57 @@ public sealed class PaperCaptureProjectionTests
 
         Assert.Equal(Session.TradingDate, capture.Fills[0].TradingDate);
         Assert.Equal(Session.TradingDate, capture.TradingDate);
+    }
+
+    // ---- late recovery ---------------------------------------------------------------------------
+
+    [Fact]
+    public void A_same_evening_snapshot_records_the_sessions_own_end_state()
+    {
+        Assert.False(PaperCaptureService.IsLate(Session, Session.CloseUtc.AddMinutes(15), 120));
+
+        var capture = PaperCaptureService.BuildCapture(
+            Session, SnapshotAt, Summary(("NetLiquidation", "1000", "USD")), NoPositions(), NoExecutions(),
+            NextOpenUtc, late: false);
+
+        Assert.Equal(CaptureSources.GatewayAccount, capture.CaptureSource);
+    }
+
+    [Fact]
+    public void A_recovery_snapshot_is_marked_late_so_it_is_never_read_as_the_close()
+    {
+        // The account read is always of NOW. A Monday pass recovering Friday writes Monday's net
+        // liquidation, margin and positions against Friday's trading date — permanently, because the
+        // table is append-only. The row is worth keeping (it is the only reading Friday will ever
+        // have) but anything computing item 8, margin AT the close, has to be able to exclude it,
+        // and capture_source is the only place that distinction can live.
+        var monday = Session.CloseUtc.AddDays(3);
+
+        Assert.True(PaperCaptureService.IsLate(Session, monday, 120));
+
+        var capture = PaperCaptureService.BuildCapture(
+            Session, monday, Summary(("NetLiquidation", "1000", "USD")), NoPositions(), NoExecutions(),
+            NextOpenUtc, late: true);
+
+        Assert.Equal(CaptureSources.GatewayAccountLate, capture.CaptureSource);
+    }
+
+    [Fact]
+    public void The_fills_on_a_late_capture_keep_their_own_exact_provenance()
+    {
+        // Only the SNAPSHOT is stale on a recovery pass. Each fill carries its own execution time
+        // from the broker, so it is exactly as good as one captured the same evening — marking the
+        // fills late too would misrepresent them.
+        var executions = new AccountExecutionsRead(
+            "DU1234567", SnapshotAt, Session.OpenUtc.AddHours(-12),
+            [Execution("one", Session.OpenUtc.AddHours(2))], 0);
+
+        var capture = PaperCaptureService.BuildCapture(
+            Session, Session.CloseUtc.AddDays(3), Summary(("NetLiquidation", "1000", "USD")),
+            NoPositions(), executions, NextOpenUtc, late: true);
+
+        Assert.Equal(CaptureSources.GatewayAccountLate, capture.CaptureSource);
+        Assert.Equal(CaptureSources.GatewayExecutions, capture.Fills[0].CaptureSource);
     }
 
     // ---- refusal classification ------------------------------------------------------------------
