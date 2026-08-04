@@ -251,6 +251,17 @@ builder.Services.AddSingleton<PaperCaptureStore>();
 builder.Services.AddSingleton<PaperCaptureService>();
 builder.Services.AddHostedService(sp => sp.GetRequiredService<PaperCaptureService>());
 
+// ---- the daily shadow mark -----------------------------------------------------------------------
+// The protocol's Phase 1 standing requirement is "one POST /research/shadow-marks/run per trading
+// day", and until now it had no owner: a missed day is not an error anywhere, it is simply a row that
+// never appears. This trigger fires the same run the endpoint does — one implementation, see
+// VolShadowMarkEndpoints.RunAsync — once per closed session. On by default for the reason
+// ShadowMarkTriggerOptions gives; the auxiliary ResearchService instances in the AppHost turn it off
+// so only one process pays for the bar load.
+builder.Services.Configure<ShadowMarkTriggerOptions>(builder.Configuration.GetSection("ShadowMarks"));
+builder.Services.AddSingleton<ShadowMarkTrigger>();
+builder.Services.AddHostedService(sp => sp.GetRequiredService<ShadowMarkTrigger>());
+
 var app = builder.Build();
 
 var spaFiles = new Microsoft.Extensions.FileProviders.PhysicalFileProvider(
