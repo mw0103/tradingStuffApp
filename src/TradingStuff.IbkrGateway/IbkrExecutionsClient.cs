@@ -156,7 +156,22 @@ public sealed class IbkrExecutionsClient(
     IOptions<IbkrOptions> options,
     ILogger<IbkrExecutionsClient> logger)
 {
-    /// <summary>The UTC form TWS documents for the <c>reqExecutions</c> filter, and the one it echoes back.</summary>
+    /// <summary>
+    /// The shape <c>ExecutionFilter.Time</c> is sent in. <b>Which clock TWS reads it against is NOT
+    /// established.</b>
+    /// </summary>
+    /// <remarks>
+    /// IBKR's own source comments the field as UTC, but TWS has historically interpreted it in the
+    /// timezone configured for the API, and no version guarantee is documented. The consequence of
+    /// guessing wrong is silent and unrecoverable: a bound sent as 13:30 UTC and read as 13:30 ET
+    /// excludes every fill before 09:30 ET — i.e. all of them — and the capture pass then marks the
+    /// date captured with zero fills, permanently, because the tables are append-only.
+    /// <para>
+    /// So this client does NOT resolve the ambiguity; callers must over-fetch past any plausible
+    /// offset and apply their own window client-side. <c>PaperCaptureService</c> sends the session
+    /// open less twelve hours for exactly that reason, and dedupes on exec_id.
+    /// </para>
+    /// </remarks>
     private const string FilterTimeFormat = "yyyyMMdd-HH:mm:ss";
 
     /// <summary>
@@ -180,10 +195,20 @@ public sealed class IbkrExecutionsClient(
     /// Optional. Must name a TWS-managed account when supplied; omit it for the account this gateway
     /// trades.
     /// </param>
+    /// <param name="sinceUtc">
+    /// Lower bound on execution time. <b>Over-fetch.</b> Which clock TWS reads it against is not
+    /// established — see <see cref="FilterTimeFormat"/> — so a caller that needs a specific window
+    /// must send a bound well past any plausible offset and narrow client-side.
+    /// </param>
     /// <remarks>
-    /// <c>ExecutionFilter.ClientId</c> is left at 0, which TWS reads as "any client". An execution
-    /// placed by hand in TWS, or by a previous run under a different client id, is still a fill on
-    /// the paper account and the capture layer's job is to see it.
+    /// <c>ExecutionFilter.ClientId</c> is left at 0. <b>What that returns is not verified here.</b>
+    /// IBKR documents executions as visible only to the API client that placed them, unless the
+    /// connecting client id is TWS's configured <i>Master API Client ID</i>, in which case every
+    /// client's executions are returned; a filter <c>ClientId</c> of 0 is then "do not filter by
+    /// client" rather than a guarantee of cross-client visibility. Establishing which applies needs
+    /// a socket, so it is recorded as an operational precondition in <c>docs/FOLLOWUP.md</c> §5
+    /// rather than asserted here. If it turns out to be own-client-only, a fill placed by hand in
+    /// TWS is invisible to the capture layer and the capture is incomplete without saying so.
     /// </remarks>
     public async Task<IbkrExecutionsReport> GetExecutionsAsync(
         string? accountId,
@@ -314,13 +339,23 @@ public sealed class IbkrExecutionsClient(
     /// The execution instant, or null when TWS's string was not a shape this adapter recognises.
     /// </summary>
     /// <remarks>
-    /// TWS reports execution times as a bare string with no offset, and which wall clock it means
-    /// depends on the API timezone configured in TWS. Two shapes are accepted: the hyphenated
-    /// <c>yyyyMMdd-HH:mm:ss</c> that IBKR documents as UTC (it is the format its own
-    /// <c>ExecutionFilter.Time</c> is specified in), and the space-separated legacy form. Anything
-    /// else parses to null and the caller keeps the verbatim string — a fill dated by guesswork is
-    /// worse than a fill whose timestamp is honestly unresolved, since the capture layer's whole
-    /// purpose is reconstructing what happened when.
+    /// <para>
+    /// ONE shape is accepted: the hyphenated <c>yyyyMMdd-HH:mm:ss</c> that TWS 10.x emits and that
+    /// IBKR's API specifies as UTC. The space-separated legacy form is deliberately NOT accepted,
+    /// even though parsing it would be trivial — that form predates the UTC specification and
+    /// carries TWS-local wall-clock time with no offset, so reading it as UTC would silently
+    /// mis-date every fill by the exchange's offset (four or five hours for a US account). A
+    /// mis-dated fill is worse than an undated one here: it lands inside a different session's
+    /// window and is attributed to the wrong trading date, in the table the protocol's items 6 and 9
+    /// are reconstructed from.
+    /// </para>
+    /// <para>
+    /// Anything unrecognised returns null, and the caller keeps the verbatim string in
+    /// <c>executed_at_raw</c>, so nothing is lost and a later reader can re-derive the instant once
+    /// the convention is known. <c>LiveTwsAccountCaptureTests</c> asserts against a real socket that
+    /// what TWS actually sends parses, so a TWS that reverts to the legacy form fails loudly and
+    /// names the fix rather than quietly producing wrong timestamps.
+    /// </para>
     /// </remarks>
     internal static DateTimeOffset? TryParseExecutionTime(string? raw)
     {
@@ -329,10 +364,8 @@ public sealed class IbkrExecutionsClient(
             return null;
         }
 
-        string[] formats = ["yyyyMMdd-HH:mm:ss", "yyyyMMdd  HH:mm:ss", "yyyyMMdd HH:mm:ss"];
-
         return DateTime.TryParseExact(
-            raw.Trim(), formats, CultureInfo.InvariantCulture,
+            raw.Trim(), "yyyyMMdd-HH:mm:ss", CultureInfo.InvariantCulture,
             DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal, out var parsed)
             ? new DateTimeOffset(parsed, TimeSpan.Zero)
             : null;

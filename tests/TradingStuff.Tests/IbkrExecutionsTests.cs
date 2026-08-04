@@ -90,6 +90,70 @@ public sealed class IbkrExecutionsTests
         Assert.Empty(tracker.All());
     }
 
+    /// <summary>A tracker holding one live 1x1 order (id 99) on the conId <see cref="SpyPut"/> uses.</summary>
+    private static IbkrOrderTracker TrackerWithLiveOrder()
+    {
+        var tracker = NewTracker();
+
+        Assert.True(tracker.TryTrack(
+            99, Guid.NewGuid(), Guid.NewGuid(),
+            new Dictionary<int, TrackedComboLeg> { [776_512_301] = new(0, 1) }));
+
+        return tracker;
+    }
+
+    [Fact]
+    public void A_live_order_keeps_its_fill_even_while_a_capture_pull_is_in_flight()
+    {
+        // Half one of exclusivity, and the direction that breaks TRADING if it is got wrong:
+        // an order this process placed fills while a capture pull happens to be open, and the fill
+        // must still reach the order. Losing it makes ExecutionService persist a filled order with
+        // an empty leg list — the exact defect WaitForSettlementAsync's fill grace exists to prevent.
+        var registry = new IbkrRequestRegistry();
+        var tracker = TrackerWithLiveOrder();
+        var wrapper = NewWrapper(registry, tracker, new ExecutionCommissionRouter());
+
+        var pull = new ExecutionsRequest();
+        registry.Register(20, pull);
+
+        // reqId -1 is what TWS uses for an unsolicited push; 20 belongs to the pull.
+        var execution = Fill("0011.abc.01");
+        execution.OrderId = 99;
+        wrapper.execDetails(-1, SpyPut(), execution);
+
+        var order = tracker.Get(99)!;
+        Assert.Single(order.Fills);
+        Assert.Equal(1.37m, order.Fills[0].Price);
+
+        Assert.Empty(pull.Snapshot());
+    }
+
+    [Fact]
+    public void A_capture_replay_of_a_live_orders_execution_never_reaches_that_order()
+    {
+        // Half two, and the direction that breaks OBSERVE-NEVER-INFLUENCE. The capture layer replays
+        // whole trading days, so a pull routinely returns executions belonging to orders this
+        // process placed and is still tracking. If those also reached the tracker, an observation
+        // surface would be writing into the live order path — re-settling an order, moving its fill
+        // list, changing what ExecutionService persists — purely because someone looked.
+        //
+        // Every other test in this file passes with exclusivity weakened to "feed both", because
+        // none of them has a tracked order to contaminate. This one does.
+        var registry = new IbkrRequestRegistry();
+        var tracker = TrackerWithLiveOrder();
+        var wrapper = NewWrapper(registry, tracker, new ExecutionCommissionRouter());
+
+        var pull = new ExecutionsRequest();
+        registry.Register(20, pull);
+
+        var execution = Fill("0012.abc.01");
+        execution.OrderId = 99;
+        wrapper.execDetails(20, SpyPut(), execution);
+
+        Assert.Single(pull.Snapshot());
+        Assert.Empty(tracker.Get(99)!.Fills);
+    }
+
     [Fact]
     public async Task A_replayed_execution_is_the_same_fill_not_a_second_one()
     {
@@ -239,16 +303,13 @@ public sealed class IbkrExecutionsTests
         Assert.Equal(100m, row.Quantity);
     }
 
-    [Theory]
-    [InlineData("20260904-19:45:12", 2026, 9, 4, 19, 45, 12)]
-    [InlineData("20260904  19:45:12", 2026, 9, 4, 19, 45, 12)]
-    public void A_recognised_execution_time_parses_to_the_utc_instant(
-        string raw, int year, int month, int day, int hour, int minute, int second)
+    [Fact]
+    public void The_hyphenated_execution_time_parses_to_the_utc_instant()
     {
-        var parsed = IbkrExecutionsClient.TryParseExecutionTime(raw);
-
+        // The only shape accepted: TWS 10.x emits it and IBKR's API specifies it as UTC.
         Assert.Equal(
-            new DateTimeOffset(year, month, day, hour, minute, second, TimeSpan.Zero), parsed);
+            new DateTimeOffset(2026, 9, 4, 19, 45, 12, TimeSpan.Zero),
+            IbkrExecutionsClient.TryParseExecutionTime("20260904-19:45:12"));
     }
 
     [Theory]
@@ -256,6 +317,14 @@ public sealed class IbkrExecutionsTests
     [InlineData("")]
     [InlineData("not-a-time")]
     [InlineData("2026-09-04T19:45:12Z")]
+    // The space-separated legacy forms are REFUSED on purpose, not by oversight. They predate the
+    // UTC specification and carry TWS-local wall-clock time with no offset, so parsing them as UTC
+    // would silently mis-date every fill by the exchange's offset — and a mis-dated fill lands in a
+    // different session's window and is attributed to the wrong trading date, which is worse than an
+    // undated one in the table items 6 and 9 are reconstructed from. Null plus executed_at_raw is
+    // the honest answer; LiveTwsAccountCaptureTests is what would catch TWS actually sending these.
+    [InlineData("20260904  19:45:12")]
+    [InlineData("20260904 19:45:12")]
     public void An_unrecognised_execution_time_is_null_and_the_raw_string_survives(string? raw)
     {
         // A fill dated by guesswork is worse than one whose timestamp is honestly unresolved: the
