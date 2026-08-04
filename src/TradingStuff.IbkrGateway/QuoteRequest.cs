@@ -285,6 +285,18 @@ internal sealed class QuoteRequest : ITickSink
         return true;
     }
 
+    /// <summary>
+    /// A contract's strike, or null when the contract has none.
+    /// </summary>
+    /// <remarks>
+    /// A non-option contract carries IBApi's unset marker (<see cref="double.MaxValue"/>), NOT zero,
+    /// so the obvious <c>strike == 0 ? null : (decimal)strike</c> throws on the first equity or
+    /// future it meets. That matters where it is used: the raw capture path would fail an entire
+    /// session's snapshot because the account happened to hold a share of stock.
+    /// </remarks>
+    internal static decimal? TryReadStrike(double strike) =>
+        TryConvertPrice(strike, out var value) && value != 0m ? value : null;
+
     private static bool IsUsable(double value) =>
         !double.IsNaN(value)
         && !double.IsInfinity(value)

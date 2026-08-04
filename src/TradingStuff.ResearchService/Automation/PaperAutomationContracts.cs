@@ -216,12 +216,40 @@ public sealed record ArmingResult(bool Armed, string State, string Reason)
     public static ArmingResult Refuse(string state, string reason) => new(false, state, reason);
 }
 
+/// <summary>
+/// The contemporaneous NBBO of one leg at the instant the plan was priced.
+/// </summary>
+/// <remarks>
+/// The paper-run protocol's shadow record item 7 is "simulated fill and the contemporaneous market
+/// quote", and the quote half is only knowable at decision time — a quote reconstructed afterwards
+/// is a different measurement of a different moment. The planner already reads both legs to compute
+/// the credit; this carries what it read out to the persisted record instead of discarding it once
+/// the arithmetic is done. <b>Nothing consumes these fields to decide anything.</b>
+/// </remarks>
+public sealed record PlannedLegQuote(
+    string Symbol,
+    DateOnly Expiration,
+    decimal Strike,
+    string Right,
+    string Side,
+    decimal Bid,
+    decimal Ask,
+    decimal Last,
+    DateTimeOffset CapturedAt,
+    string Source);
+
 /// <summary>A constructed order plus the provenance of the price on it.</summary>
+/// <param name="LegQuotes">
+/// The per-leg NBBO the limit was computed from, or null when no quote was consulted (an
+/// operator-supplied price). Null is the honest answer in that case and must not be read as
+/// "the legs had no market".
+/// </param>
 public sealed record PlannedOrder(
     SubmitOrderRequest Request,
     decimal LimitPrice,
     string LimitPriceSource,
-    string Description);
+    string Description,
+    IReadOnlyList<PlannedLegQuote>? LegQuotes = null);
 
 /// <summary>Why an order could not be constructed. Never a fabricated fallback.</summary>
 public sealed record OrderPlanFailure(string Reason);

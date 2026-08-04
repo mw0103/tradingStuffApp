@@ -13,7 +13,8 @@ namespace TradingStuff.Tests;
 public sealed class IbkrHistoricalTests
 {
     private static IbkrClientWrapper NewWrapper(IbkrRequestRegistry registry) =>
-        new(registry, new IbkrOrderTracker(NullLogger<IbkrOrderTracker>.Instance), NullLogger<IbkrClientWrapper>.Instance);
+        new(registry, new IbkrOrderTracker(NullLogger<IbkrOrderTracker>.Instance),
+            new ExecutionCommissionRouter(), NullLogger<IbkrClientWrapper>.Instance);
 
     // ---- bar time parsing (formatDate=2) -----------------------------------------------------
 

@@ -49,7 +49,7 @@ public sealed class PacedSocketTests
     {
         var registry = new IbkrRequestRegistry();
         var tracker = new IbkrOrderTracker(NullLogger<IbkrOrderTracker>.Instance);
-        var wrapper = new IbkrClientWrapper(registry, tracker, NullLogger<IbkrClientWrapper>.Instance);
+        var wrapper = new IbkrClientWrapper(registry, tracker, new ExecutionCommissionRouter(), NullLogger<IbkrClientWrapper>.Instance);
 
         var governor = new IbkrPacingGovernor(
             Options.Create(new IbkrOptions { Pacing = pacing }),

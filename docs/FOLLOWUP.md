@@ -287,6 +287,20 @@ Also: the class comment in `tests/.../LiveThetaTerminalTests.cs` still says meas
 
 ## 5. Known, accepted, lower priority
 
+- **Paper capture may be blind to fills this gateway did not place — verify against paper TWS.**
+  `IbkrExecutionsClient` issues `reqExecutions` with `ExecutionFilter.ClientId = 0`. IBKR documents
+  executions as visible only to the API client that placed them, *unless* the connecting client id
+  is TWS's configured **Master API Client ID**, in which case every client's executions come back;
+  a filter `ClientId` of 0 then means "do not filter by client" rather than guaranteeing
+  cross-client visibility. Which applies here is **not established** — it cannot be without a
+  socket, and this was written without one. If it is own-client-only, a fill placed by hand in TWS,
+  or by an earlier run under a different client id, never reaches `research.paper_fills`, and the
+  capture is silently incomplete for the protocol's items 6 and 9.
+  **Operational precondition for the paper run (Plan D picks this up):** set TWS's *Master API
+  Client ID* to the gateway's configured `IBKR:ClientId` (confirm the value in `IbkrOptions` /
+  AppHost rather than assuming), then place one manual paper order in TWS and check it appears in
+  `GET /research/paper-capture/fills`. Until that check has been done, read the fill record as
+  "orders this gateway placed", not "everything the account traded".
 - **#41** the Postgres test harness leaks pools and never drops its test databases, producing
   `53300: too many clients` around ~96 tests and container segfaults at ~1,000 accumulated
   databases. Worked around with `-c max_connections=400`. It lies convincingly — see

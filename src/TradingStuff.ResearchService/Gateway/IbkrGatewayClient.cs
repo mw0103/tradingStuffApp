@@ -28,6 +28,96 @@ public sealed record GatewayStatus(
 public sealed record FuturesContractResolution(
     int ConId, DateOnly LastTradeDateOrContractMonth, string? TradingClass, string Exchange, string Currency);
 
+/// <summary>One account-summary tag as TWS reported it, matched by name against the gateway's DTO.</summary>
+public sealed record AccountSummaryTagRead(string Tag, string Value, string Currency);
+
+/// <summary>Every summary tag the gateway's open account stream is currently carrying.</summary>
+public sealed record AccountSummaryRead(
+    string Account, DateTimeOffset CapturedAt, IReadOnlyList<AccountSummaryTagRead> Tags);
+
+/// <summary>One open position exactly as <c>reqPositionsMulti</c> reported it. No Greeks, no marks.</summary>
+public sealed record AccountPositionRead(
+    int ConId,
+    string Symbol,
+    string SecType,
+    DateOnly? Expiration,
+    decimal? Strike,
+    string? Right,
+    string? TradingClass,
+    string? Currency,
+    string? Multiplier,
+    string? LocalSymbol,
+    decimal Quantity,
+    decimal? AverageCost);
+
+/// <summary>Every open position the gateway's account stream is currently carrying.</summary>
+public sealed record AccountPositionsRead(
+    string Account, DateTimeOffset CapturedAt, IReadOnlyList<AccountPositionRead> Positions);
+
+/// <summary>One execution report as TWS delivered it, plus its commission if one arrived in time.</summary>
+public sealed record AccountExecutionRead(
+    string ExecId,
+    long PermId,
+    int OrderId,
+    int ClientId,
+    string Account,
+    int ConId,
+    string Symbol,
+    string SecType,
+    DateOnly? Expiration,
+    decimal? Strike,
+    string? Right,
+    string? TradingClass,
+    int? Multiplier,
+    string? Exchange,
+    string Side,
+    decimal Quantity,
+    decimal Price,
+    string ExecutedAtRaw,
+    DateTimeOffset? ExecutedAt,
+    decimal? Commission,
+    string? CommissionCurrency,
+    decimal? RealizedPnL);
+
+/// <summary>The answer to one executions pull, and how much of it the commission callback did not cover.</summary>
+public sealed record AccountExecutionsRead(
+    string Account,
+    DateTimeOffset CapturedAt,
+    DateTimeOffset SinceUtc,
+    IReadOnlyList<AccountExecutionRead> Executions,
+    int CommissionsMissing);
+
+/// <summary>
+/// Stable short names for why a gateway read could not be made. Recorded verbatim in the capture
+/// tables, so they are constants rather than message text: an operator counting refusals by reason
+/// must not have that count split by an exception string that gained a port number.
+/// </summary>
+public static class GatewayRefusalKinds
+{
+    /// <summary>The request never reached the gateway process (connection refused, open circuit, DNS).</summary>
+    public const string GatewayUnreachable = "gateway-unreachable";
+
+    /// <summary>The gateway answered, and said its TWS socket is down (503).</summary>
+    public const string BrokerNotConnected = "broker-not-connected";
+
+    /// <summary>The gateway or TWS refused the request itself (a rejection, a timeout, a bad account).</summary>
+    public const string GatewayRefused = "gateway-refused";
+}
+
+/// <summary>
+/// A gateway read that could not be made, carrying the stable reason name the capture layer records.
+/// </summary>
+/// <remarks>
+/// Thrown rather than folded into a null the way <see cref="IbkrGatewayClient.ResolveUnderlyingAsync"/>
+/// does, because the caller's whole job is to write down WHY the read failed. A null would make an
+/// unreachable gateway indistinguishable from an account holding nothing, which is the exact
+/// absence-reads-as-health failure the capture tables exist to prevent.
+/// </remarks>
+public sealed class GatewayReadException(string refusalKind, string message) : Exception(message)
+{
+    public string RefusalKind { get; } = refusalKind;
+}
+
 /// <summary>
 /// Thin HTTP client for the parts of the IBKR gateway that recorder orchestration needs: underlying
 /// resolution, contract resolution, and standing-subscription leases. Option chains are fetched
@@ -204,6 +294,90 @@ public sealed class IbkrGatewayClient(HttpClient httpClient, ILogger<IbkrGateway
     {
         var response = await httpClient.DeleteAsync($"/ibkr/subscriptions/{leaseId}", cancellationToken);
         return response.IsSuccessStatusCode;
+    }
+
+    // ---- raw account capture ---------------------------------------------------------------------
+    // The paper capture layer's three reads. All read-only, all on the gateway's /ibkr/account/*
+    // surface, and all classified into a named refusal rather than a null: a capture pass that
+    // cannot read the broker has to record WHY, and "no answer" and "an empty account" must never
+    // arrive here looking the same.
+
+    public Task<AccountSummaryRead> GetAccountSummaryAsync(string? accountId, CancellationToken cancellationToken) =>
+        ReadAccountAsync<AccountSummaryRead>(
+            $"/ibkr/account/summary{AccountQuery(accountId)}", "account summary", cancellationToken);
+
+    public Task<AccountPositionsRead> GetPositionsAsync(string? accountId, CancellationToken cancellationToken) =>
+        ReadAccountAsync<AccountPositionsRead>(
+            $"/ibkr/account/positions{AccountQuery(accountId)}", "positions", cancellationToken);
+
+    /// <summary>
+    /// The account's executions since <paramref name="sinceUtc"/>. The bound is explicit because the
+    /// gateway requires it — see its endpoint's remarks.
+    /// </summary>
+    public Task<AccountExecutionsRead> GetExecutionsAsync(
+        string? accountId, DateTimeOffset sinceUtc, CancellationToken cancellationToken)
+    {
+        var since = Uri.EscapeDataString(sinceUtc.ToUniversalTime().ToString("O"));
+        var account = accountId is { Length: > 0 } id ? $"&accountId={Uri.EscapeDataString(id)}" : string.Empty;
+
+        return ReadAccountAsync<AccountExecutionsRead>(
+            $"/ibkr/account/executions?since={since}{account}", "executions", cancellationToken);
+    }
+
+    private static string AccountQuery(string? accountId) =>
+        accountId is { Length: > 0 } id ? $"?accountId={Uri.EscapeDataString(id)}" : string.Empty;
+
+    private async Task<T> ReadAccountAsync<T>(string path, string what, CancellationToken cancellationToken)
+    {
+        HttpResponseMessage response;
+
+        try
+        {
+            response = await httpClient.GetAsync(path, cancellationToken);
+        }
+        catch (Exception ex) when (IsTransportFailure(ex, cancellationToken))
+        {
+            // Reuses the send-side classifier the backfill path already depends on, so an open
+            // circuit and a refused connection land as unreachable rather than escaping unclassified.
+            var (outcome, detail) = ClassifyTransportFailure(ex);
+
+            throw new GatewayReadException(
+                outcome == GatewayOutcome.Unreachable
+                    ? GatewayRefusalKinds.GatewayUnreachable
+                    : GatewayRefusalKinds.GatewayRefused,
+                $"Could not read {what} from the IBKR gateway. {detail}");
+        }
+
+        using (response)
+        {
+            if (!response.IsSuccessStatusCode)
+            {
+                var (_, detail) = await ReadProblemAsync(response, cancellationToken);
+
+                throw new GatewayReadException(
+                    response.StatusCode == System.Net.HttpStatusCode.ServiceUnavailable
+                        ? GatewayRefusalKinds.BrokerNotConnected
+                        : GatewayRefusalKinds.GatewayRefused,
+                    $"The IBKR gateway refused the {what} read ({(int)response.StatusCode}). {detail}");
+            }
+
+            T? body;
+
+            try
+            {
+                body = await response.Content.ReadFromJsonAsync<T>(cancellationToken);
+            }
+            catch (Exception ex) when (IsBodyReadFailure(ex, cancellationToken))
+            {
+                throw new GatewayReadException(
+                    GatewayRefusalKinds.GatewayRefused,
+                    $"The IBKR gateway's {what} response body could not be read. {ex.Message}");
+            }
+
+            return body ?? throw new GatewayReadException(
+                GatewayRefusalKinds.GatewayRefused,
+                $"The IBKR gateway returned an empty {what} body.");
+        }
     }
 
     // ---- historical data ------------------------------------------------------------------------

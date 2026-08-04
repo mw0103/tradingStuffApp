@@ -411,7 +411,7 @@ public sealed class RecordingTickSinkTests
         // sink at all and is dropped, rather than landing on a subscription that no longer exists.
         var registry = new IbkrRequestRegistry();
         var wrapper = new IbkrClientWrapper(
-            registry, new IbkrOrderTracker(NullLogger<IbkrOrderTracker>.Instance),
+            registry, new IbkrOrderTracker(NullLogger<IbkrOrderTracker>.Instance), new ExecutionCommissionRouter(),
             NullLogger<IbkrClientWrapper>.Instance);
 
         var live = new FakeSink();

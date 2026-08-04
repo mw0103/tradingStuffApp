@@ -308,7 +308,7 @@ public sealed class IbkrAccountTests
         var options = Options.Create(new IbkrOptions());
         var registry = new IbkrRequestRegistry();
         var tracker = new IbkrOrderTracker(NullLogger<IbkrOrderTracker>.Instance);
-        var wrapper = new IbkrClientWrapper(registry, tracker, NullLogger<IbkrClientWrapper>.Instance);
+        var wrapper = new IbkrClientWrapper(registry, tracker, new ExecutionCommissionRouter(), NullLogger<IbkrClientWrapper>.Instance);
 
         var governor = new IbkrPacingGovernor(
             options,

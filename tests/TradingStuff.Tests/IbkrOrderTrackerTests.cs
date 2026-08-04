@@ -478,7 +478,8 @@ public sealed class IbkrOrderTrackerTests
         // just as happily with the wiring deleted, which makes it a test of the wrong thing.
         var tracker = TrackedOrder(42, out _);
         var wrapper = new IbkrClientWrapper(
-            new IbkrRequestRegistry(), tracker, LoggerFactory.Create(_ => { }).CreateLogger<IbkrClientWrapper>());
+            new IbkrRequestRegistry(), tracker, new ExecutionCommissionRouter(),
+            LoggerFactory.Create(_ => { }).CreateLogger<IbkrClientWrapper>());
 
         wrapper.openOrder(
             42,
