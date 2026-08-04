@@ -69,6 +69,15 @@ var paperCaptureEnabled = builder.AddParameter(
     builder.Configuration["Parameters:paper-capture-enabled"] ?? "true",
     publishValueAsDefault: true);
 
+// The daily shadow mark. Same opt-out shape and same parameter treatment as paper-capture-enabled
+// above, and for the same reason: a day nobody marked is a permanent hole in the protocol's Phase 1
+// record. Setting it explicitly also keeps this file's own rule — an unset key is indistinguishable
+// from a key set to its default, and the arming surface has to be READABLE off the running config.
+var shadowMarksEnabled = builder.AddParameter(
+    "shadow-marks-enabled",
+    builder.Configuration["Parameters:shadow-marks-enabled"] ?? "true",
+    publishValueAsDefault: true);
+
 // Empty means "the account the gateway is configured to trade", which is the intended setting on a
 // TWS session managing one account. Naming one matters only when TWS manages several.
 var paperCaptureAccountId = builder.AddParameter(
@@ -303,6 +312,12 @@ builder.AddProject(
     .WithEnvironment("PaperCapture__LookbackSessions", "3")
     .WithEnvironment("PaperCapture__TimelyWindowMinutes", "120")
     .WithEnvironment("PaperCapture__AccountId", paperCaptureAccountId)
+    // The frozen A4 snapshot time, set here as well as on the drainers. It is not a drainer-local
+    // knob: calling a value FROZEN and then letting one instance carry the library's 15:45 default
+    // is how "frozen" quietly becomes "whichever process happened to write the row". Any instance
+    // that can plan or serve a chain request has to agree on it. See the drainers for what changing
+    // it costs.
+    .WithEnvironment("ThetaData__SnapshotTimeOfDay", "15:30:00")
     // ---- the daily shadow mark ------------------------------------------------------------------
     // 00:10 UTC on the day after each session's close, and the 10 minutes are load-bearing: backfill
     // slices containing "now" are never claimed, so the same-evening VIX daily close arrives from the
@@ -310,6 +325,7 @@ builder.AddProject(
     // would produce the forecaster's "no VIX close" refusal every day. Move to
     // ShadowMarks__AfterCloseMinutes=20 (16:20 ET, DST-correct by construction) once the live
     // recorder demonstrably lands same-day closes — the runbook records the evidence to look for.
+    .WithEnvironment("ShadowMarks__Enabled", shadowMarksEnabled)
     .WithEnvironment("ShadowMarks__RunAtUtc", "00:10:00")
     .WithEnvironment("ShadowMarks__Calendar", "NYSE")
     .WithEnvironment("ShadowMarks__SessionLabel", "RTH")
@@ -327,9 +343,17 @@ builder.AddProject(
     // endpoints, which makes "nothing is listening" impossible; waiting on marketdataservice makes
     // "listening but not yet up" impossible too, on the cold start where it is most likely.
     //
+    // Read WaitFor precisely: no resource in this file declares a WithHttpHealthCheck, so for the
+    // PROJECTS it waits for the resource to reach Running — the process started — and not for
+    // /health to answer 200. (postgres is the exception: an Aspire Postgres resource brings its own
+    // health check, so WaitFor(postgres) genuinely waits for a reachable database.) That is enough
+    // for what this line is for — a listening socket where there was none — and it is deliberately
+    // not claimed to be more. A service that is Running but still warming up will still refuse, and
+    // the refusal is recorded.
+    //
     // marketdataservice is safe to wait on precisely because it waits for nothing itself (no
-    // WaitFor(ibkrGateway) — see its declaration), so it reaches healthy in seconds regardless of
-    // whether TWS is running. There is deliberately NO WaitFor(execution) here: executionservice
+    // WaitFor(ibkrGateway) — see its declaration), so it starts in seconds regardless of whether TWS
+    // is running. There is deliberately NO WaitFor(execution) here: executionservice
     // waits on keycloak and rabbitmq, and blocking the whole research plane — migrations, recorder,
     // backfill, chain drain — behind two containers that the research track does not use would be a
     // regression for the A4 path this AppHost also has to keep working.
@@ -380,6 +404,17 @@ builder.AddProject(
     .WithEnvironment("PaperCapture__Enabled", "false")
     .WithEnvironment("ShadowMarks__Enabled", "false")
     .WithEnvironment("Sessions__Enabled", "false")
+    // Injected here too, though these instances run no automation loop. Every ResearchService
+    // instance registers SpyShortVolPlanner and the /research/automation surface, so every instance
+    // carries ExecutionService:BaseUrl and MarketDataService:BaseUrl — and unset, those fall back to
+    // hardcoded localhost:5000/5001, which is EXACTLY the dangling default that produced the
+    // "MarketDataService down" planner refusals in production. Leaving them dangling on four of five
+    // instances would make the comment on researchservice above true only of the instance somebody
+    // happened to test.
+    .WithReference(execution)
+    .WithReference(marketData)
+    .WithEnvironment("ExecutionService__BaseUrl", execution.GetEndpoint("http"))
+    .WithEnvironment("MarketDataService__BaseUrl", marketData.GetEndpoint("http"))
     .WithReference(tradingDb)
     .WaitFor(postgres);
 
@@ -399,9 +434,22 @@ builder.AddProject(
     .WithEnvironment("Authentication__DevelopmentToken", devInternalToken)
     .WithEnvironment("IbkrGateway__BaseUrl", ibkrGateway.GetEndpoint("http"))
     .WithEnvironment("Backfill__Enabled", "true")
+    // One value for the frozen snapshot time on every instance — see researchservice above.
+    .WithEnvironment("ThetaData__SnapshotTimeOfDay", "15:30:00")
     .WithEnvironment("PaperCapture__Enabled", "false")
     .WithEnvironment("ShadowMarks__Enabled", "false")
     .WithEnvironment("Sessions__Enabled", "false")
+    // Injected here too, though these instances run no automation loop. Every ResearchService
+    // instance registers SpyShortVolPlanner and the /research/automation surface, so every instance
+    // carries ExecutionService:BaseUrl and MarketDataService:BaseUrl — and unset, those fall back to
+    // hardcoded localhost:5000/5001, which is EXACTLY the dangling default that produced the
+    // "MarketDataService down" planner refusals in production. Leaving them dangling on four of five
+    // instances would make the comment on researchservice above true only of the instance somebody
+    // happened to test.
+    .WithReference(execution)
+    .WithReference(marketData)
+    .WithEnvironment("ExecutionService__BaseUrl", execution.GetEndpoint("http"))
+    .WithEnvironment("MarketDataService__BaseUrl", marketData.GetEndpoint("http"))
     .WithReference(tradingDb)
     .WaitFor(postgres);
 
