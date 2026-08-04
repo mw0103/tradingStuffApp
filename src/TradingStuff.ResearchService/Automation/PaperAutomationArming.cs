@@ -75,6 +75,12 @@ public static class PaperAutomationArming
     /// <summary>The account prefix that identifies a simulated-money paper account.</summary>
     public const string PaperAccountPrefix = "DU";
 
+    /// <param name="signalKey">
+    /// The <see cref="IAutomationSignal.Key"/> of the signal that was actually resolved — NOT
+    /// <see cref="IAutomationSignal.Name"/>, and not the <c>PaperAutomation:Signal</c> string re-read
+    /// here. See that property's remarks for why the distinction is load-bearing.
+    /// </param>
+    /// <param name="structure">The <c>PaperAutomation:Structure</c> the planner switch will act on.</param>
     public static ArmingResult Evaluate(
         bool enabled,
         bool killSwitchEngaged,
@@ -84,7 +90,9 @@ public static class PaperAutomationArming
         BrokerFacts? broker,
         string? brokerError,
         int ordersThisSession,
-        int orderCap)
+        int orderCap,
+        string signalKey,
+        string structure)
     {
         if (!enabled)
         {
@@ -158,6 +166,36 @@ public static class PaperAutomationArming
                 "The execution plane's settings do not agree, so an order placed now would not mean what it " +
                 $"appears to mean: {string.Join("; ", faults)}. Measured: router='{executionPlane.Router}', " +
                 $"portfolio='{executionPlane.PortfolioSource}', marketData='{executionPlane.MarketDataSource}'.");
+        }
+
+        // The SECOND pair that is correct alone and wrong together, and it is the §9 shape one level
+        // in from the execution plane: the signal and the instrument disagree about what the run is.
+        //
+        // 'constant-exposure' asks for a position because the protocol mandates constant SHORT-vol
+        // exposure and for no other reason (ConstantExposureSignal). The default structure is
+        // 'debit-vertical', a LONG-vega call spread. Arming one without the other places long-vega
+        // orders while research.vol_shadow_marks, the capture tables and the protocol itself all label
+        // the run short-vol — every downstream record correct about a position nobody chose, and no
+        // component able to see the contradiction because each setting is individually valid.
+        //
+        // Placed after the execution-plane block on purpose. A simulated router means an order means
+        // NOTHING, which an operator must fix first; this means an order means the WRONG thing, which
+        // is one rung less urgent and reads as noise underneath the other.
+        if (string.Equals(signalKey, PaperAutomationOptions.Signals.ConstantExposure, StringComparison.Ordinal)
+            && !string.Equals(structure, PaperAutomationOptions.Structures.ShortVolCreditPut, StringComparison.Ordinal))
+        {
+            return ArmingResult.Refuse(
+                ArmStates.IncoherentConfiguration,
+                $"PaperAutomation:Signal is '{PaperAutomationOptions.Signals.ConstantExposure}' but " +
+                $"PaperAutomation:Structure is '{structure}'. The protocol's instrument is " +
+                $"'{PaperAutomationOptions.Structures.ShortVolCreditPut}' (docs/plans/paper-run-protocol.md " +
+                "§ Trading rule): the signal asks for constant SHORT-vol exposure while this structure would " +
+                "open a long-vega position, and every shadow mark and capture row would label it short-vol. " +
+                $"Resolve it by setting PaperAutomation__Structure={PaperAutomationOptions.Structures.ShortVolCreditPut} " +
+                $"to run the protocol's instrument, or PaperAutomation__Signal={PaperAutomationOptions.Signals.VolResidual} " +
+                "to stand entry down. Either is also how an OPEN position gets closed: like every other " +
+                "incoherent-configuration refusal this one stops the pass before the exit branch, so a misconfigured " +
+                "loop closes nothing until the pair agrees.");
         }
 
         if (brokerError is { } gatewayError)

@@ -145,6 +145,34 @@ public sealed class ConstantExposureSignalTests
 
     // ---- the configuration switch ----------------------------------------------------------------
 
+    /// <summary>
+    /// The signal's KEY is the configuration value that selected it, and it is NOT its display name.
+    /// </summary>
+    /// <remarks>
+    /// The trap <see cref="PaperAutomationArming"/>'s signal/structure check is written around, pinned
+    /// on the real component rather than restated as a literal inside the checker. <c>Name</c> is
+    /// <c>constant-exposure/paper-decision</c> — it names the source AND what it reads, for an
+    /// operator reading a status page — so a coherence check written as
+    /// <c>Name == "constant-exposure"</c> compiles, reads correctly, and matches nothing: the gate
+    /// would pass every misconfiguration, in the unsafe direction. This is the same mistake
+    /// <c>PaperAutomationArming.RequiredMarketDataProvider</c> records having been made once already
+    /// with <c>ibkr-live</c> against <c>ibkr-gateway</c>. A rename on either side fails here.
+    /// </remarks>
+    [Fact]
+    public void The_signal_reports_the_configuration_key_that_selected_it_not_its_display_name()
+    {
+        var signal = new ConstantExposureSignal(
+            new StubDecisionStore(null), NullLogger<ConstantExposureSignal>.Instance);
+
+        Assert.Equal(PaperAutomationOptions.Signals.ConstantExposure, signal.Key);
+        Assert.NotEqual(signal.Key, signal.Name);
+
+        // And the key round-trips through the resolution Program.cs performs, so the value arming
+        // compares is the value an operator sets.
+        Assert.Equal(signal.Key, PaperAutomationOptions.Signals.Select(signal.Key, out var recognised));
+        Assert.True(recognised);
+    }
+
     [Fact]
     public void The_default_signal_is_the_one_that_refuses_everything()
     {

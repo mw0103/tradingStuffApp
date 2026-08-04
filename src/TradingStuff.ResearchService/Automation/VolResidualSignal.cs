@@ -38,6 +38,8 @@ public sealed class VolResidualSignal(VolResidualStudyStore store, ILogger<VolRe
 {
     public string Name => "vol-residual/latest";
 
+    public string Key => PaperAutomationOptions.Signals.VolResidual;
+
     public async Task<SignalResult> EvaluateAsync(CancellationToken cancellationToken)
     {
         VolResidualRunResponse? latest;

@@ -266,7 +266,13 @@ public sealed class PaperAutomationService(
             broker,
             brokerError,
             ordersThisSession,
-            settings.MaxOrdersPerSession);
+            settings.MaxOrdersPerSession,
+            // The RESOLVED signal's own key, not settings.Signal. Re-reading the configuration string
+            // here would prove only how this service was configured, which is exactly the assumption
+            // the §9 incident was made of; signal.Key is what the component that will actually be
+            // asked reports about itself.
+            signal.Key,
+            settings.Structure);
 
         ReportArming(arming);
         _lastArmCheckedAt = now;
