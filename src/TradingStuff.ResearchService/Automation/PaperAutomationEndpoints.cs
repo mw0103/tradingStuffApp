@@ -73,6 +73,14 @@ public static class PaperAutomationEndpoints
         // Everything except the signal still applies: arming (a coherent execution plane, a connected
         // DU account), the kill switch, and the per-session cap. This bypasses the reason to trade,
         // not the permission to.
+        //
+        // It does not bypass the LIFECYCLE either, and an operator needs to know that before pressing
+        // it. A manual evaluation runs the same pass as a scheduled one, and the exit branch sits
+        // ahead of the entry logic: with a position at or below the DTE threshold this endpoint
+        // submits that position's CLOSING order, and the supplied limit price is not used at all — a
+        // closing order is priced from live quotes and there is no operator price on that path. With a
+        // position open but not yet due, the entry-when-flat guard records a no-trade row and submits
+        // nothing. The supplied limit reaches an order only when the account is flat.
         app.MapPost("/research/automation/manual-order", async (
                 ManualOrderRequest request,
                 PaperAutomationService automation,
@@ -82,8 +90,10 @@ public static class PaperAutomationEndpoints
                 {
                     return Results.Problem(
                         title: "A positive net debit is required.",
-                        detail: $"limitPrice was {request.LimitPrice}. This endpoint submits a long call vertical, " +
-                                "which is always a debit.",
+                        detail: $"limitPrice was {request.LimitPrice}. An operator-priced order from this endpoint " +
+                                "is an ENTRY in the configured structure, and the debit vertical it prices is " +
+                                "always a debit. It is also only reached when the account is flat: with a position " +
+                                "open this evaluation closes it or holds it, and this price is never consulted.",
                         statusCode: StatusCodes.Status400BadRequest);
                 }
 

@@ -147,4 +147,27 @@ public sealed class PaperAutomationOptions
     /// submission; the risk service recomputes its own version independently.
     /// </summary>
     public decimal ShortVolMaxRiskDollars { get; set; } = 0.85m;
+
+    /// <summary>
+    /// Calendar days to expiration at or below which an open managed spread is closed. The ENTIRE
+    /// exit rule.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>One rule, and it is time-based on purpose.</b> <c>docs/research/hedged-carry-menu.md</c> §6
+    /// records the standing suspicion of unwind rules: they are the most tunable item on the menu and
+    /// therefore the most overfittable. So v1 declares one exit, fixes its parameter in configuration,
+    /// and has no P&amp;L trigger, no volatility trigger, and no "unless" branch. A second condition
+    /// here would not be a refinement — it would be the first tuning knob, and the paper run's
+    /// success criteria (docs/plans/paper-run-protocol.md §Success) are about covering state
+    /// transitions, not about the unwind being clever.
+    /// </para>
+    /// <para>
+    /// <b>Seven days, because the point is to avoid expiration mechanics entirely.</b> SPY options are
+    /// American-style with physical settlement, so holding to expiry means assignment, exercise and a
+    /// share position this platform does not model. Closing a week out leaves five sessions of room
+    /// for a close that does not fill on its first attempt.
+    /// </para>
+    /// </remarks>
+    public int ExitDteThreshold { get; set; } = 7;
 }

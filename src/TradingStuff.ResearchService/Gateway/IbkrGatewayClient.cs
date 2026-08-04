@@ -60,6 +60,36 @@ public sealed class IbkrGatewayClient(HttpClient httpClient, ILogger<IbkrGateway
                ?? throw new HttpRequestException("The IBKR gateway returned an empty status body.");
     }
 
+    /// <summary>
+    /// The account's open positions, as the broker reports them.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// Read-only, and the same endpoint ExecutionService's <c>IbkrPortfolioProvider</c> reads for risk
+    /// — deliberately, so "what is open" means the same thing to the component that decides to close a
+    /// position and to the component that prices the closing order's risk. A second source would come
+    /// apart exactly when it mattered.
+    /// </para>
+    /// <para>
+    /// Throws rather than returning null, matching <see cref="GetStatusAsync"/> and for the same
+    /// reason: its caller is the exit branch, and "the account could not be read" must reach it as an
+    /// error it records and refuses on. Folded into an empty list it would read as a FLAT account —
+    /// which would both skip a due exit and unblock an entry, in one silent step.
+    /// </para>
+    /// </remarks>
+    public async Task<PortfolioSnapshot> GetPortfolioAsync(CancellationToken cancellationToken)
+    {
+        var response = await httpClient.GetAsync("/ibkr/account/portfolio", cancellationToken);
+
+        response.EnsureSuccessStatusCode();
+
+        var body = await response.Content.ReadFromJsonAsync<GatewayPortfolioResponse>(cancellationToken)
+                   ?? throw new HttpRequestException("The IBKR gateway returned an empty portfolio body.");
+
+        return body.Portfolio
+               ?? throw new HttpRequestException("The IBKR gateway returned a portfolio body with no portfolio in it.");
+    }
+
     public async Task<UnderlyingResolution?> ResolveUnderlyingAsync(string symbol, CancellationToken cancellationToken)
     {
         var response = await httpClient.GetAsync(
@@ -432,6 +462,17 @@ public sealed class IbkrGatewayClient(HttpClient httpClient, ILogger<IbkrGateway
             return (null, response.ReasonPhrase);
         }
     }
+
+    /// <summary>
+    /// Mirror of the gateway's portfolio response, matched by property name like every other DTO here.
+    /// </summary>
+    /// <remarks>
+    /// Only the portfolio itself is projected. The gateway's completeness flags (daily P&amp;L
+    /// availability, Greek coverage) are risk inputs and are already acted on by
+    /// <c>IbkrPortfolioProvider</c>; the exit branch reads positions and nothing else, and mirroring
+    /// fields it does not use would invite someone to start using them here instead of there.
+    /// </remarks>
+    private sealed record GatewayPortfolioResponse(PortfolioSnapshot? Portfolio);
 
     private sealed record ResolveContractsRequestDto(IReadOnlyList<OptionContract> Contracts);
 

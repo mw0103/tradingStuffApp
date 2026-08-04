@@ -1,5 +1,6 @@
 using System.Text.Json;
 using Microsoft.Extensions.Options;
+using TradingStuff.Contracts;
 using TradingStuff.ResearchContracts;
 using TradingStuff.ResearchService.Gateway;
 
@@ -29,6 +30,16 @@ public static class AutomationTriggers
 /// a backfill drain.
 /// </para>
 /// <para>
+/// <b>It also closes what it opens, by one declared rule.</b> Before any entry logic, every pass
+/// reads the account's open positions and submits a closing order for a managed spread at or below
+/// <see cref="PaperAutomationOptions.ExitDteThreshold"/> calendar days to expiration. That is the
+/// whole lifecycle: no roll, no P&amp;L exit, no volatility exit — see that option's remarks and
+/// docs/research/hedged-carry-menu.md §6 for why the rule is deliberately unimprovable in this build.
+/// Two consequences fall out of it rather than being separate features: entry is skipped while
+/// anything is open (constant exposure means one spread at a time, not stacking), and a
+/// close-then-re-enter is what a later pass does on its own once the account is flat again.
+/// </para>
+/// <para>
 /// <b>Off by default, and enabling it is nowhere near sufficient.</b>
 /// <c>PaperAutomation:Enabled</c> must be the exact string <c>true</c>, and then
 /// <see cref="PaperAutomationArming"/> must independently establish that ExecutionService resolved
@@ -51,6 +62,7 @@ public sealed class PaperAutomationService(
     IPaperAutomationStore store,
     SpyVerticalPlanner planner,
     SpyShortVolPlanner shortVolPlanner,
+    SpyExitPlanner exitPlanner,
     ExecutionServiceClient execution,
     MarketDataServiceClient marketData,
     IbkrGatewayClient gateway,
@@ -72,6 +84,16 @@ public sealed class PaperAutomationService(
     // on an order nobody can account for. That is the correct direction — the alternative is a cap
     // that a database hiccup can top up.
     private (DateOnly Date, int Pending) _claims = (DateOnly.MinValue, 0);
+
+    // The exit keys this process has handed a closing order for, held per trading date exactly like
+    // the cap claims above. The durable half lives in the decision log
+    // (IPaperAutomationStore.ExitKeysOrderedOnAsync); this covers the window between the order
+    // leaving and its row landing, and it is deliberately never released. A released exit claim
+    // whose row failed to write would let the very next pass — five minutes later, same position,
+    // same reason — send a second closing order for a spread whose first one is resting at the
+    // venue. Held, the position waits a day and is closed again with room to spare; refunded, it is
+    // closed twice and the second fill opens the opposite spread.
+    private (DateOnly Date, HashSet<string> Keys) _exitClaims = (DateOnly.MinValue, new HashSet<string>(StringComparer.Ordinal));
 
     private ArmingResult _lastArming = ArmingResult.Refuse(ArmStates.Disabled, "Not yet evaluated.");
     private DateTimeOffset? _lastArmCheckedAt;
@@ -102,11 +124,14 @@ public sealed class PaperAutomationService(
 
         logger.LogWarning(
             "Paper automation is ENABLED: every {Interval}s this service will evaluate the '{Signal}' signal and " +
-            "may submit up to {Cap} order(s) per trading date to ExecutionService. Arming still requires a " +
-            "coherent execution plane and a connected DU account.",
+            "may submit up to {Cap} order(s) per trading date to ExecutionService. Open positions are closed at " +
+            "{ExitDte} calendar day(s) to expiration — the only exit rule this build has, and closing orders are " +
+            "counted by the cap but never blocked by it. Arming still requires a coherent execution plane and a " +
+            "connected DU account.",
             settings.IntervalSeconds,
             signal.Name,
-            settings.MaxOrdersPerSession);
+            settings.MaxOrdersPerSession,
+            settings.ExitDteThreshold);
 
         using var timer = new PeriodicTimer(TimeSpan.FromSeconds(Math.Max(1, settings.IntervalSeconds)), timeProvider);
 
@@ -246,7 +271,13 @@ public sealed class PaperAutomationService(
         ReportArming(arming);
         _lastArmCheckedAt = now;
 
-        if (!arming.Armed)
+        // Consulted through PermitsExit rather than Armed, because a spent cap must still let a due
+        // position be closed — the cap is a rail on new exposure, and an uncloseable position is
+        // worse than an extra order. Every other refusal stops the pass here, exits included: a
+        // simulated router or fabricated quotes make a CLOSING order meaningless in exactly the way
+        // they make an opening one meaningless. The remaining cap check is below, in front of the
+        // entry logic and nothing else.
+        if (!PaperAutomationArming.PermitsExit(arming))
         {
             return await RecordAsync(
                 context.Build(arming, SignalStates.NotEvaluated, "The signal was not consulted: automation is not armed.",
@@ -265,6 +296,75 @@ public sealed class PaperAutomationService(
                     $"{now:yyyy-MM-dd HH:mm}Z is inside no {settings.Calendar} session. The next session's trading " +
                     $"date is {tradingDate:yyyy-MM-dd}. Automation acts only inside a session it can name.",
                     ordersThisSession),
+                cancellationToken);
+        }
+
+        // Armed or cap-reached are the only two verdicts that reach here, and both are decided after
+        // every broker check, so the account list is populated.
+        var accountId = broker!.ManagedAccounts[0];
+
+        // ---- lifecycle, ahead of everything about entering ------------------------------------------
+        // The account is read on EVERY pass, before the signal is consulted and whatever it would say.
+        // Exiting is not conditional on wanting to enter, and the same read answers both questions the
+        // pass has to settle: is anything due to be closed, and is the account flat enough to open
+        // something new.
+        var (positions, positionsError) = await ReadPositionsAsync(cancellationToken);
+
+        if (positionsError is { } accountError)
+        {
+            // An unreadable account is not a flat one. Folding the failure into an empty position list
+            // would skip a due exit AND unblock an entry in the same silent step — the two worst
+            // outcomes available here, reached by assuming the friendliest reading of a missing fact.
+            return await RecordAsync(
+                context.Build(arming, SignalStates.NotEvaluated,
+                    "The signal was not consulted: the account's open positions could not be read.",
+                    null, AutomationActions.NoTrade,
+                    "The account could not be read, so neither a due exit nor a flat account can be established: " +
+                    $"{accountError}. Nothing is submitted against an unknown position state; the next pass tries " +
+                    "again.",
+                    ordersThisSession),
+                cancellationToken);
+        }
+
+        var structures = SpyExitPlanner.ManagedStructures(positions!, settings.Underlying);
+
+        if (await EvaluateExitAsync(context, arming, accountId, structures, ordersThisSession, cancellationToken)
+            is { } exitDecision)
+        {
+            return exitDecision;
+        }
+
+        // Entry-when-flat. Constant one-vega exposure is ONE spread, not one spread per evaluation
+        // that felt like it: without this guard a signal that keeps saying enter stacks a position
+        // every pass until the cap stops it, and the run measures something nobody chose. Nothing here
+        // is a judgement about the open position — it is not due yet, so it is simply held.
+        if (structures.Count > 0)
+        {
+            var held = string.Join(
+                ", ",
+                structures.Select(s =>
+                    $"{s.Underlying} {s.Expiration:yyyy-MM-dd} ({SpyExitPlanner.DaysToExpiration(s.Expiration, tradingDate)}d)"));
+
+            return await RecordAsync(
+                context.Build(arming, SignalStates.NotEvaluated,
+                    "The signal was not consulted: a managed position is already open.",
+                    null, AutomationActions.NoTrade,
+                    $"Holding {structures.Count} open managed structure(s): {held}. None is at or below the " +
+                    $"{settings.ExitDteThreshold}-day exit threshold, and automation runs one spread at a time — " +
+                    "entry resumes on the pass after the account is flat.",
+                    ordersThisSession),
+                cancellationToken);
+        }
+
+        // The cap, applied to entries and to nothing else. It sits here rather than in the arming
+        // verdict because a spent cap must not stop the exit branch above it; PermitsExit is the other
+        // half of the same rule and the two are meant to be read together.
+        if (!arming.Armed)
+        {
+            return await RecordAsync(
+                context.Build(arming, SignalStates.NotEvaluated,
+                    "The signal was not consulted: automation is not armed for entry.",
+                    null, AutomationActions.NoTrade, arming.Reason, ordersThisSession),
                 cancellationToken);
         }
 
@@ -294,8 +394,6 @@ public sealed class PaperAutomationService(
                     cancellationToken);
             }
         }
-
-        var accountId = broker!.ManagedAccounts[0];
 
         // The structure switch: explicit, and an unknown value refuses rather than defaulting.
         // A loop configured for a structure this build does not know must not trade the one it does.
@@ -398,6 +496,251 @@ public sealed class PaperAutomationService(
         }
     }
 
+    /// <summary>
+    /// The exit branch: at most one closing order per pass, or null when nothing is due.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Null means "nothing was due", not "nothing happened".</b> Every other outcome — including
+    /// every failure — returns a recorded decision and ends the pass, because a position that is due
+    /// to close is a position the entry logic must not be reasoning about.
+    /// </para>
+    /// <para>
+    /// <b>One structure per pass, earliest expiration first.</b> Two due structures is not a state the
+    /// entry-when-flat guard can produce, but a manual order can; closing them one at a time keeps one
+    /// decision row per evaluation instead of making a pass's record depend on how many legs were
+    /// open, and the next pass takes the next one.
+    /// </para>
+    /// </remarks>
+    private async Task<AutomationDecision?> EvaluateExitAsync(
+        DecisionContext context,
+        ArmingResult arming,
+        string accountId,
+        IReadOnlyList<ManagedStructure> structures,
+        int ordersThisSession,
+        CancellationToken cancellationToken)
+    {
+        var settings = options.Value;
+
+        var due = structures.FirstOrDefault(
+            s => SpyExitPlanner.IsDue(s.Expiration, context.TradingDate, settings.ExitDteThreshold));
+
+        if (due is null)
+        {
+            return null;
+        }
+
+        var days = SpyExitPlanner.DaysToExpiration(due.Expiration, context.TradingDate);
+
+        // Every exit row starts with the rule that produced it. A row that says "closed" without
+        // saying which rule closed it is the first step towards a second rule nobody declared.
+        var rule =
+            $"{AutomationExitRules.Dte}: the open {due.Underlying} {due.Expiration:yyyy-MM-dd} structure is {days} " +
+            $"calendar day(s) from expiration, at or below the declared {settings.ExitDteThreshold}-day threshold";
+
+        // The signal has no part in this and is not asked. Recording it as consulted would put a
+        // signal state on a row whose order the signal did not ask for — the same reason the manual
+        // trigger refuses to read it.
+        const string signalReason =
+            "The signal was not consulted: the exit rule is time-based and unconditional. See " +
+            "PaperAutomationOptions.ExitDteThreshold.";
+
+        IReadOnlyList<string> alreadyOrdered;
+
+        try
+        {
+            alreadyOrdered = await store.ExitKeysOrderedOnAsync(context.TradingDate, cancellationToken);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            // Nothing is written, because the thing that failed IS the writer — the same shape as the
+            // cap read, and the same conclusion: an exit whose prior attempts cannot be read is an
+            // exit that might already be resting at the venue.
+            logger.LogCritical(
+                ex, "Paper automation could not read which positions it has already sent closing orders for, so it " +
+                    "cannot tell a first close from a second. No closing order will be submitted this pass.");
+
+            return context.Unrecorded(
+                arming, SignalStates.NotEvaluated, signalReason, AutomationActions.ExitRefused,
+                $"{rule}. The decision log could not be read, so a duplicate closing order cannot be ruled out: " +
+                $"{ex.Message}", ordersThisSession);
+        }
+
+        if (alreadyOrdered.Contains(due.ExitKey, StringComparer.Ordinal)
+            || IsExitClaimed(context.TradingDate, due.ExitKey))
+        {
+            return await RecordAsync(
+                context.Build(arming, SignalStates.NotEvaluated, signalReason, null, AutomationActions.NoTrade,
+                    $"{rule}, and a closing order for it was already accepted on this trading date — ExecutionService " +
+                    "did not report it dead, so it is either working at the venue or its outcome is unestablished. " +
+                    "It is not sent again today; if it does not fill, the next trading date closes the position it " +
+                    "still finds open.",
+                    ordersThisSession,
+                    detail: ExitDetail(due, days, settings)),
+                cancellationToken);
+        }
+
+        var plan = await exitPlanner.PlanCloseAsync(accountId, due, context.TradingDate, cancellationToken);
+
+        if (plan.Failure is { } planFailure)
+        {
+            // Recorded and left alone. A closing order that cannot be built or priced is retried on
+            // every subsequent pass, and a position that keeps refusing keeps producing rows saying so
+            // — the protocol's success criterion 3 is coverage of failure paths, which means they have
+            // to remain visible rather than be handled into silence.
+            return await RecordAsync(
+                context.Build(arming, SignalStates.NotEvaluated, signalReason, null, AutomationActions.ExitRefused,
+                    $"{rule}. {planFailure}",
+                    ordersThisSession,
+                    detail: ExitDetail(due, days, settings)),
+                cancellationToken);
+        }
+
+        var order = plan.Order!;
+
+        // Both claims BEFORE the order leaves this process, for the reason the entry path records: a
+        // lost response leaves the claim standing rather than refunded. The cap claim is released once
+        // its row is in the table; the exit claim is not released at all (see _exitClaims).
+        Claim(context.TradingDate);
+        ClaimExit(context.TradingDate, due.ExitKey);
+
+        try
+        {
+            var response = await execution.SubmitAsync(order.Request, cancellationToken);
+
+            // A 2xx is not a live order. ExecutionService answers 201 with RiskRejected when the risk
+            // service refuses, and 201 with Failed when the gateway does — a successful HTTP call
+            // reporting an unsuccessful order. Reading those as submitted would spend this position's
+            // one closing order per trading date on an attempt that reached no venue: the position
+            // would sit open until tomorrow because of a rejection that could have been retried five
+            // minutes later. So the dead statuses release BOTH claims and record a retryable action.
+            if (OrderOutcomes.IsDeadOnArrival(response.Status))
+            {
+                // Released because the answer is definitive, which is exactly what the exception path
+                // below does not have. Nothing rests at any venue under this order, so sending
+                // another closing order cannot double-close the position.
+                ReleaseExitClaim(context.TradingDate, due.ExitKey);
+                ReleaseClaim(context.TradingDate);
+
+                logger.LogCritical(
+                    "A CLOSING order for {Description} came back {Status} from ExecutionService and rests at no " +
+                    "venue. The position is still open and the next pass will try again. Risk decision: {Risk}.",
+                    order.Description, response.Status, response.RiskDecision?.Decision.ToString() ?? "(none)");
+
+                return await RecordAsync(
+                    context.Build(arming, SignalStates.NotEvaluated, signalReason, null,
+                        AutomationActions.ExitRejected,
+                        $"{rule}. {order.Description}. ExecutionService reports {response.Status}" +
+                        $"{DescribeBreaches(response)}, so the closing order rests at no venue and the position is " +
+                        "still open. The next pass tries again; this is not a claim on the position.",
+                        ordersThisSession + 1,
+                        orderSubmitted: true,
+                        orderId: response.OrderId,
+                        correlationId: response.CorrelationId,
+                        lifecycleStatus: response.Status.ToString(),
+                        limitPrice: order.LimitPrice,
+                        limitPriceSource: order.LimitPriceSource,
+                        detail: ExitDetail(due, days, settings, response)),
+                    cancellationToken);
+            }
+
+            var decision = await RecordAsync(
+                context.Build(arming, SignalStates.NotEvaluated, signalReason, null, AutomationActions.ExitSubmitted,
+                    $"{rule}. {order.Description}. ExecutionService reports {response.Status}.",
+                    ordersThisSession + 1,
+                    orderSubmitted: true,
+                    orderId: response.OrderId,
+                    correlationId: response.CorrelationId,
+                    lifecycleStatus: response.Status.ToString(),
+                    limitPrice: order.LimitPrice,
+                    limitPriceSource: order.LimitPriceSource,
+                    detail: ExitDetail(due, days, settings, response)),
+                cancellationToken);
+
+            if (decision.DecisionId != 0)
+            {
+                ReleaseClaim(context.TradingDate);
+            }
+
+            logger.LogWarning(
+                "Paper automation submitted CLOSING order {OrderId} ({Description}); ExecutionService reports " +
+                "{Status}. Rule: {Rule}.",
+                response.OrderId, order.Description, response.Status, AutomationExitRules.Dte);
+
+            return decision;
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            logger.LogCritical(
+                ex, "Paper automation handed a CLOSING order to ExecutionService and no outcome came back. It may be " +
+                    "live at the venue — reconcile against GET /orders and GET /ibkr/orders/open. The position is " +
+                    "not sent another closing order on this trading date.");
+
+            var unknown = await RecordAsync(
+                context.Build(arming, SignalStates.NotEvaluated, signalReason, null,
+                    AutomationActions.ExitOutcomeUnknown,
+                    $"{rule}. {order.Description}. The closing order was handed to ExecutionService and no outcome " +
+                    $"was established: {ex.Message}. It may be live at the venue; no order id was recorded here, so " +
+                    "reconcile against GET /orders and GET /ibkr/orders/open.",
+                    ordersThisSession + 1,
+                    limitPrice: order.LimitPrice,
+                    limitPriceSource: order.LimitPriceSource,
+                    detail: ExitDetail(due, days, settings)),
+                cancellationToken);
+
+            if (unknown.DecisionId != 0)
+            {
+                ReleaseClaim(context.TradingDate);
+            }
+
+            return unknown;
+        }
+    }
+
+    /// <summary>
+    /// The exit facts that no fixed column names, including the claim key.
+    /// </summary>
+    /// <remarks>
+    /// <c>exitKey</c> is what <see cref="IPaperAutomationStore.ExitKeysOrderedOnAsync"/> reads back,
+    /// and it is written on every exit row rather than only the submitted ones — the query filters on
+    /// the action, and a refused row that says which position it refused for is worth more to whoever
+    /// is reading the log than one that does not.
+    /// </remarks>
+    private static string ExitDetail(
+        ManagedStructure structure, int days, PaperAutomationOptions settings, SubmitOrderResponse? response = null) =>
+        JsonSerializer.Serialize(new
+        {
+            exitKey = structure.ExitKey,
+            rule = AutomationExitRules.Dte,
+            dteThreshold = settings.ExitDteThreshold,
+            daysToExpiration = days,
+            expiration = structure.Expiration,
+            risk = response?.RiskDecision?.Decision.ToString(),
+            breaches = response?.RiskDecision?.Breaches.Select(b => b.Code).ToArray() ?? [],
+            fills = response?.Fills.Count,
+            legs = structure.Legs.Select(leg => new
+            {
+                leg.Contract.Underlying, leg.Contract.Expiration, leg.Contract.Strike,
+                right = leg.Contract.Right.ToString(), leg.Quantity,
+            }),
+        }, DetailOptions);
+
+    /// <summary>The account's open positions, or why they could not be established. Never both.</summary>
+    private async Task<(IReadOnlyList<PositionSnapshot>? Positions, string? Error)> ReadPositionsAsync(
+        CancellationToken cancellationToken)
+    {
+        try
+        {
+            var portfolio = await gateway.GetPortfolioAsync(cancellationToken);
+
+            return (portfolio.Positions, null);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            return (null, ex.Message);
+        }
+    }
+
     private async Task<(ExecutionPlaneConfiguration? Plane, string? Error)> ReadExecutionPlaneAsync(
         CancellationToken cancellationToken)
     {
@@ -487,6 +830,48 @@ public sealed class PaperAutomationService(
             _claims = (tradingDate, _claims.Pending - 1);
         }
     }
+
+    private bool IsExitClaimed(DateOnly tradingDate, string exitKey) =>
+        _exitClaims.Date == tradingDate && _exitClaims.Keys.Contains(exitKey);
+
+    /// <summary>Records that a closing order for this position left the process on this trading date.</summary>
+    /// <remarks>
+    /// A date roll discards the set rather than merging it, so yesterday's closes cannot suppress
+    /// today's. There is no release: see <see cref="_exitClaims"/>.
+    /// </remarks>
+    private void ClaimExit(DateOnly tradingDate, string exitKey)
+    {
+        if (_exitClaims.Date != tradingDate)
+        {
+            _exitClaims = (tradingDate, new HashSet<string>(StringComparer.Ordinal));
+        }
+
+        _exitClaims.Keys.Add(exitKey);
+    }
+
+    /// <summary>
+    /// Drops the claim after a definitive answer that the closing order rests at no venue.
+    /// </summary>
+    /// <remarks>
+    /// The ONE release, and its precondition is the whole reason it is safe: a
+    /// <see cref="OrderOutcomes.IsDeadOnArrival"/> status is ExecutionService stating that this order
+    /// exists nowhere, so a second closing order cannot double-close the position. Every other outcome
+    /// — including, especially, no outcome at all — keeps the claim, because a claim released on an
+    /// ambiguity is a position closed twice and left inverted. Do not widen the caller.
+    /// </remarks>
+    private void ReleaseExitClaim(DateOnly tradingDate, string exitKey)
+    {
+        if (_exitClaims.Date == tradingDate)
+        {
+            _exitClaims.Keys.Remove(exitKey);
+        }
+    }
+
+    /// <summary>The risk breach codes on a rejection, so the row says WHY without a second lookup.</summary>
+    private static string DescribeBreaches(SubmitOrderResponse response) =>
+        response.RiskDecision?.Breaches is { Count: > 0 } breaches
+            ? $" ({string.Join(", ", breaches.Select(b => b.Code))})"
+            : string.Empty;
 
     public async Task<AutomationStatusReport> GetStatusAsync(int recentLimit, CancellationToken cancellationToken)
     {
