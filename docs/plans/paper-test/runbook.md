@@ -130,9 +130,11 @@ reads a day.
 | `ShadowMarks__RunAtUtc` | `00:10:00` | `00:10:00` |
 | `ShadowMarks__Calendar` | `NYSE` | `NYSE` |
 | `ShadowMarks__SessionLabel` | `RTH` | `RTH` |
-| `ShadowMarks__Enabled` | — (on) | on (opt-out, same shape as capture) |
+| `ShadowMarks__Enabled` | `Parameters:shadow-marks-enabled` → **`true`** | on (opt-out, same shape as capture) |
 | `ShadowMarks__AfterCloseMinutes` | — (null) | null |
 | `ShadowMarks__CatchUpWindowMinutes` | — | 720 |
+| `ShadowMarks__RefusalRetryMinutes` | — | 15 |
+| `ThetaData__SnapshotTimeOfDay` | `15:30:00` | 15:45 — see the ingestion table; the frozen value is set on **every** ResearchService instance, not just the drainers |
 
 See [§6](#6-the-daily-cadence) for why 00:10 UTC and when to move it.
 
@@ -143,10 +145,11 @@ See [§6](#6-the-daily-cadence) for why 00:10 UTC and when to move it.
 | `OptionChains__Enabled` | `true` | |
 | `OptionChains__LeaseSeconds` | `3600` | Default is 180. A single expiration's month-chunked walk against a cold Theta Terminal runs well past three minutes; a lease that expires mid-walk is reclaimed by a sibling and the expiration is fetched twice. |
 | `ThetaData__Timeout` | `00:30:00` | Default is 10 minutes. |
-| `ThetaData__SnapshotTimeOfDay` | `15:30:00` | **FROZEN.** The A4 term-structure construction on record was built from 15:30 ET snapshots. Changing this does not "improve" anything — it makes every row ingested afterwards incomparable with every row already in `research.option_chain_quotes`, silently, because nothing in the schema records the cut time. |
+| `ThetaData__SnapshotTimeOfDay` | `15:30:00` | **FROZEN**, and set identically on all three ResearchService resources. The A4 term-structure construction on record was built from 15:30 ET snapshots. Changing this does not "improve" anything — it makes every row ingested afterwards incomparable with every row already in `research.option_chain_quotes`, silently, because nothing in the schema records the cut time. A value called frozen that one instance carries at the library default of 15:45 is not frozen. |
 | `PaperCapture__Enabled` | `false` | One capture writer. |
 | `ShadowMarks__Enabled` | `false` | A second copy would be correct and would repeat a three-year bar load nightly for nothing. |
 | `Sessions__Enabled` | `false` | `SessionCalendarSynchronizer` is documented as `research.sessions`' only writer, and coverage denominators are read from what it writes. |
+| `ExecutionService__BaseUrl` / `MarketDataService__BaseUrl` | injected endpoints | These instances run no automation loop, but every ResearchService instance registers `SpyShortVolPlanner` and the `/research/automation` surface — so unset, both keys fall back to hardcoded `localhost:5000`/`5001`, which is exactly the dangling default behind the production "MarketDataService down" refusals. |
 
 ### Backfill (`research-backfill` ×1, plus `researchservice`)
 
@@ -154,6 +157,8 @@ See [§6](#6-the-daily-cadence) for why 00:10 UTC and when to move it.
 |---|---|
 | `Backfill__Enabled` | `true` on both `researchservice` (as it always has been) and `research-backfill` |
 | `PaperCapture__Enabled` / `ShadowMarks__Enabled` / `Sessions__Enabled` | `false` on `research-backfill` |
+| `ThetaData__SnapshotTimeOfDay` | `15:30:00` on `research-backfill` too — one frozen value everywhere |
+| `ExecutionService__BaseUrl` / `MarketDataService__BaseUrl` | injected, same reason as the drainers |
 
 Two coordinators is exactly what runs today. Concurrency is safe by construction: claims are leased
 under a per-process `OwnerId` and the request row is the only checkpoint. **Which jobs actually
@@ -168,7 +173,7 @@ drain is not decided by any of this** — see [§9](#9-pausing-and-resuming-inge
 | `MarketData__Source` | `ibkr-delayed` | `marketdataservice`, `executionservice` |
 | `Execution__Router` / `Portfolio__Source` | `ibkr` / `ibkr` | `executionservice` |
 | `IbkrGateway__BaseUrl` | injected endpoint | every ResearchService instance, `marketdataservice`, `executionservice` |
-| `MarketDataService__BaseUrl` / `ExecutionService__BaseUrl` | injected endpoints | `researchservice` |
+| `MarketDataService__BaseUrl` / `ExecutionService__BaseUrl` | injected endpoints | **every** ResearchService instance |
 
 ---
 
@@ -237,6 +242,20 @@ The gateway reports **unhealthy whenever TWS is down**, and that is why nothing 
 `marketdataservice` and every ResearchService instance start regardless, sit idle, and retry. A
 gateway showing unhealthy overnight is TWS being closed, not a fault.
 
+**Read `WaitFor` precisely.** No project resource in the AppHost declares a `WithHttpHealthCheck`, so
+for the projects `WaitFor` waits for **Running — the process started — not for `/health` to answer
+200**. `WaitFor(postgres)` is the exception: an Aspire Postgres resource brings its own health check,
+so that one genuinely waits for a reachable database. The `WaitFor(marketData)` on `researchservice`
+therefore guarantees a listening socket where there was none; it does not guarantee a warmed-up
+service, and it is not claimed to.
+
+**A cold start with arming on will produce exactly one refusal row, and that is correct.** The
+automation loop evaluates on a 300-second interval and writes a decision row every time, so an
+evaluation that lands while `executionservice` is still coming up records a named
+plane-unreachable refusal. It self-resolves on the next evaluation, within 300 seconds. A refusal
+row at start-up is the record being honest, not a failure to investigate — investigate it if it is
+still there after two evaluations.
+
 ---
 
 ## 5. Health checks
@@ -245,9 +264,9 @@ gateway showing unhealthy overnight is TWS being closed, not a fault.
 |---|---|---|
 | `$RESEARCH/health` | 200 | `migrations` check failing — a service with no schema must not answer 200. |
 | `$RESEARCH/research/status` | `migrations.status = "applied"`, the applied list ending at the highest migration in `Persistence/Migrations/` | A shorter list means this process applied an older set; check the binary, not the database. |
-| `$RESEARCH/research/options/status` | Jobs listed, `enabled: true` on a drainer's view, request counts advancing between polls | `enabled: false` means the coordinator is switched off, which must never be read as "nothing left to do". |
-| `$RESEARCH/research/backfill` | `enabled: true`, an `ownerId`, and **every** job listed — including one with zero request rows, which renders as 0% rather than being omitted | A job absent from the list is a query bug, not an idle job. |
-| `$RESEARCH/research/shadow-marks` | One row per trading date, newest first | A missing date is a real gap. It is not filled in later; that is the house rule. |
+| `$RESEARCH/research/options/status` | Jobs listed, and each job's `inflightCount` / `succeededCount` / `quotesLanded` advancing between polls | **`enabled` and `ownerId` are THIS process's own view, not the mesh's.** On `$RESEARCH` — the primary, which is not a drainer — `enabled` reads **`false` by design`**, and that is not a fault. Verified live. The jobs array is the shared `research.option_chain_jobs` rows, so it is the only part of this response that tells you whether the drain is running. |
+| `$RESEARCH/research/backfill` | Every job listed — including one with zero request rows, which renders as 0% rather than being omitted — with slice counts advancing | `enabled` and `ownerId` are again the answering process's own view. `$RESEARCH` happens to have `Backfill__Enabled=true`, so it reads `true` there; on a drainer it would not, and neither reading tells you about the other four instances. A job absent from the list is a query bug, not an idle job. |
+| `$RESEARCH/research/shadow-marks` | One row per trading date, newest first | A missing date is a real gap. A date still missing after its 12-hour catch-up window closed will not be retried — see [§6](#6-the-daily-cadence) for the two log lines that say which of the two causes it was. |
 | `$RESEARCH/research/term-structure` | The A4 series over the requested range | |
 | `$RESEARCH/research/paper-run/decision` | `active: null` until an operator signs one; `history` lists revoked decisions too | Revoked decisions stay listed on purpose — what authorized last Tuesday's orders is not answerable from a view showing only what is authorized now. |
 | `$RESEARCH/research/paper-capture` | One snapshot per closed trading date, `captureSource` = `gateway-account` | `gateway-account@late` means the snapshot was taken outside the 120-minute timely window and describes a *later* account state written against an older trading date. Real data, different measurement. |
@@ -267,10 +286,16 @@ curl -s -H "Authorization: Bearer $TOKEN" $GATEWAY/ibkr/account/summary
 ```
 
 `/research/*` is deliberately anonymous — it is a read-only diagnostic surface for a local-first
-operator UI. The two exceptions carry `.RequireAuthorization()` individually: `POST
-/research/automation/resume` and `POST /research/automation/manual-order`. The kill switch beside
-them (`POST /research/automation/kill`) is deliberately anonymous, because a kill switch behind a
-credential is one that does not get pressed.
+operator UI. **Three** endpoints carry `.RequireAuthorization()` individually: `POST
+/research/automation/resume`, `POST /research/automation/manual-order`, and `POST
+/research/paper-run/decision` (which is why [§7](#7-arming-phase-2-the-registered-decision-operator-human-only)
+sends a bearer token). Note that `POST /research/paper-run/decision/revoke` does **not** — withdrawing
+authorization is in the same class as the kill switch. The kill switch itself (`POST
+/research/automation/kill`) is deliberately anonymous too, because a kill switch behind a credential
+is one that does not get pressed.
+
+`src/TradingStuff.ResearchService/Program.cs` still carries a comment saying "two exceptions … both
+under /research/automation". It is one out of date; the third landed with Plan A.
 
 ---
 
@@ -298,6 +323,26 @@ boundary, so a process that started late still lands the mark against the same c
 00:10 run would have seen. Past the open the planner would quote a *live* market and upsert that
 over the prior date's intent: a different measurement wearing the same date. Missing the window
 leaves a visible gap instead.
+
+**A refusal is retried; a wrong-date mark is not accepted.** Two behaviours worth knowing before
+reading the logs:
+
+- If the run **refuses** (almost always "no VIX close for the mark date" — the backfill coordinator
+  has not drained that slice yet), the date is *not* settled. It is retried every
+  `ShadowMarks__RefusalRetryMinutes` (15) for as long as the catch-up window is open — roughly 48
+  attempts. That is what the window is for. `RunAtUtc` is the earliest instant the input can exist,
+  so a refusal at 00:10 is an expected first answer, not an incident.
+- If the run comes back with a mark whose date is **not** the date that was due, the trigger logs a
+  Warning and leaves the date unsettled. This means `research.bars` has no complete SPX session for
+  the due date, so the forecaster dated its mark from the previous session — and *rewrote that
+  earlier row on the way past*, with a fresh `planner_intent`. Chase the recorder and the backfill
+  drain for the missing session; the mark will land when its bars do.
+
+The corollary, since `planner_intent` is a live gateway read: **a re-run is idempotent for the mark
+but not for the intent.** Re-running a date during a gateway outage replaces a good recorded intent
+with a "Gateway unreachable" refusal. That is why the retry interval is 15 minutes rather than the
+60-second poll, and why a manual `POST /research/shadow-marks/run` on a date that already has a good
+row is not quite free.
 
 **When to move it to 16:20 ET.** The trigger is `ShadowMarks__AfterCloseMinutes=20`, which is
 expressed relative to the calendar's close rather than as a UTC clock time so it does not need
@@ -355,6 +400,11 @@ curl -s -X POST "$RESEARCH/research/paper-run/decision/revoke" \
 ```
 
 Revoked rows stay listed in `GET /research/paper-run/decision`'s `history`.
+
+Signal and structure must agree. The arming layer refuses an incoherent signal/structure pair —
+`constant-exposure` asking for the original MVP `debit-vertical` is not the instrument this protocol
+describes — so set both, as [§2](#2-the-configuration-matrix) shows, and read them back off
+`GET /research/automation` before signing anything.
 
 The decision is *necessary and nowhere near sufficient*. The full arming chain, in the order it
 fails: `PaperAutomation__Enabled=true` → the signal is `constant-exposure` → the decision stands →
@@ -503,14 +553,32 @@ leaves exactly one socket owner, which is the design.
    `/research/options/status` showing drainers claiming, `/research/backfill` showing an `ownerId`.
 5. **Only then** stop the ad-hoc processes, in this order: `:5711`, `:5712`, `:5713` (drainers),
    `:5714` (backfill), `:5710` (shadow marks), `:5100` (gateway — last, because the others use it).
-6. **Re-check** `/research/options/status` and `/research/backfill` after five minutes. Claim counts
-   must still be advancing. If they are not, the replacement is not doing the work and the ad-hoc
-   processes were retired too early.
+6. **Re-check** `/research/options/status` and `/research/backfill` after five minutes. Read the
+   **jobs array** — `inflightCount`, `succeededCount`, `quotesLanded`, and the backfill slice counts
+   — not the top-level `enabled`/`ownerId`, which describe only the process that answered
+   ([§5](#5-health-checks)). If those counts are not advancing, the replacement is not doing the
+   work and the ad-hoc processes were retired too early.
 7. **Confirm the shadow-mark trigger.** The AppHost's `researchservice` logs its schedule at
    startup: `The daily shadow-mark trigger is armed: 00:10 UTC on the day after each session close,
    calendar NYSE/RTH, catch-up window 720 minutes.` The next mark is due at the next 00:10 UTC;
    check `$RESEARCH/research/shadow-marks` after it. A redundant manual `POST
    /research/shadow-marks/run` in the meantime is harmless — the run is idempotent per date.
+
+**Keep the overlap window between steps 3 and 5 SHORT.** Two things make it costly:
+
+- **The line budget is already saturated** (finding 1: `researchInUse` 80 of an 80-line research
+  ceiling, `waiting` 5). Between steps 3 and 5 the attached process count roughly doubles across
+  *two* gateways contending for the same TWS, so lease grants will be refused or queued on both
+  sides. **Track B tick data not recorded during that window is unrecoverable by construction** —
+  there is no backfill for it. Do not leave the overlap running overnight or across an RTH session
+  if it can be helped; a weekend or a pre-open cutover costs nothing.
+- **Six session-calendar writers.** The AppHost's auxiliary instances set `Sessions__Enabled=false`,
+  but the ad-hoc processes do **not** — they were started before that switch was used. So between
+  steps 3 and 5 there are six `SessionCalendarSynchronizer` instances writing `research.sessions`,
+  against a component documented elsewhere in this file as that table's single writer. The write is
+  a bulk upsert of generated rows and every writer generates the same rows, so this is very probably
+  benign — but it is a real contradiction of the single-writer assertion, it is not something anyone
+  has tested, and it is another reason to keep the window short rather than to reason about it.
 
 ### 11.3 Do not skip
 
@@ -549,10 +617,20 @@ Plan D is not allowed to change application logic, so these are recorded rather 
    market-data lines from the shared gateway budget (~90 lines, ~57 of them the recording grid).
    This is *already* today's behaviour with the ad-hoc processes, so the AppHost is not a
    regression — but it is now multiplied by a replica count that is one config value away from
-   being raised. **Suggested fix, for the owner of that component:** a `Recorder:Enabled` flag in
-   the same opt-out shape as `PaperCapture:Enabled`, so an auxiliary instance can decline to
-   record. Until then, do not raise `Parameters__chain-drainer-replicas` without checking the
-   gateway's line ledger.
+   being raised, and **the budget is already exhausted at the default count.** Measured on the
+   ad-hoc gateway on 2026-08-03, at the same drainer count the AppHost defaults to:
+
+   ```
+   GET /ibkr/pacing  →  {"cap":90,"executionInUse":0,"researchInUse":80,
+                         "executionReserved":10,"waiting":5}
+   ```
+
+   `researchInUse` 80 against a research ceiling of 80 (`cap` 90 less `executionReserved` 10) is
+   **fully saturated**, with requests queued behind it. There is no headroom for a fourth drainer,
+   and a raised replica count buys queueing, not throughput. **Suggested fix, for the owner of that
+   component:** a `Recorder:Enabled` flag in the same opt-out shape as `PaperCapture:Enabled`, so an
+   auxiliary instance can decline to record. Until then, check `GET /ibkr/pacing` before touching
+   `Parameters__chain-drainer-replicas`, and expect `waiting` to be non-zero as the normal state.
 
 2. **The research plane has no stable port under Aspire.** Every project binds `http://localhost:0`
    via `launchSettings.json`, so `$RESEARCH` changes on every start and no health-check URL in this
