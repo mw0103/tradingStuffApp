@@ -293,11 +293,14 @@ public sealed class ShadowMarkTrigger(
             // never written it, and it would never be marked. The rewrite already happened and cannot
             // be undone here; leaving the date unclaimed is what lets it be marked when its bars land.
             case VolShadowMarkRunStatus.Recorded when outcome.Mark is { } other && other.MarkDate != tradingDate:
+                // Each placeholder appears ONCE. A message template counts occurrences positionally,
+                // so a repeated {TradingDate} needs a repeated argument — and this is the one
+                // diagnostic that tells an operator a date was skipped, so it has to render.
                 logger.LogWarning(
                     "The shadow-mark run fired for trading date {TradingDate} but produced a mark for " +
-                    "{MarkDate}: research.bars has no complete session for {TradingDate} yet, so {MarkDate}'s " +
-                    "row was rewritten instead. {TradingDate} is NOT recorded and stays due — check the " +
-                    "recorder and the backfill drain for that session.",
+                    "{MarkDate}, so research.bars has no complete session for the due date yet and the " +
+                    "earlier date's row was rewritten instead. The due date is NOT recorded and stays " +
+                    "due — check the recorder and the backfill drain for that session.",
                     tradingDate, other.MarkDate);
                 break;
 
