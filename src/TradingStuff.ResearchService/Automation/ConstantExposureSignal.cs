@@ -35,6 +35,8 @@ public sealed class ConstantExposureSignal(
 {
     public string Name => "constant-exposure/paper-decision";
 
+    public string Key => PaperAutomationOptions.Signals.ConstantExposure;
+
     public async Task<SignalResult> EvaluateAsync(CancellationToken cancellationToken)
     {
         PaperRunDecision? active;

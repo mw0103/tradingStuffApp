@@ -250,6 +250,110 @@ public sealed class PaperAutomationServiceTests
         Assert.Equal(0, harness.OrdersPosted);
     }
 
+    // ---- the signal and the instrument must agree ------------------------------------------------
+
+    /// <summary>
+    /// <c>Signal=constant-exposure</c> against the DEFAULT structure sends nothing, on the path that
+    /// would otherwise have sent a long-vega spread while calling it short-vol.
+    /// </summary>
+    /// <remarks>
+    /// The signal is set to Trade deliberately: with a refusing signal this test would pass against a
+    /// build with no coherence check at all, because nothing asked for a position in the first place.
+    /// The only version of this test that measures anything is one where every OTHER condition to
+    /// submit is met.
+    /// </remarks>
+    [Fact]
+    public async Task Constant_exposure_against_the_default_structure_refuses_and_sends_nothing()
+    {
+        using var harness = new Harness(
+            signal: Signals.Trade,
+            signalKey: PaperAutomationOptions.Signals.ConstantExposure,
+            structure: PaperAutomationOptions.Structures.DebitVertical);
+
+        var decision = await harness.EvaluateScheduledAsync();
+
+        Assert.False(decision.Armed);
+        Assert.Equal(ArmStates.IncoherentConfiguration, decision.ArmState);
+        Assert.Equal(AutomationActions.NoTrade, decision.Action);
+        Assert.False(decision.OrderSubmitted);
+        Assert.Equal(0, harness.OrdersPosted);
+
+        // A refusal that leaves no row is a silent no-op, and the row has to carry the reason: "what
+        // did automation do today?" is answered by counting rows and reading them.
+        var row = Assert.Single(harness.Store.Recorded);
+        Assert.Contains("PaperAutomation:Structure is 'debit-vertical'", row.ArmReason);
+        Assert.Contains("short-vol-credit-put", row.ArmReason);
+
+        // The signal was never consulted: the gate is in front of it, so a decision row cannot end up
+        // carrying an entry signal state next to an order nobody was allowed to place.
+        Assert.Equal(0, harness.SignalEvaluations);
+    }
+
+    /// <summary>
+    /// The same pair blocks the EXIT path too, with a position sitting due to be closed.
+    /// </summary>
+    /// <remarks>
+    /// Recorded rather than argued: <c>PermitsExit</c> whitelists armed and cap-reached only, so this
+    /// refusal stops the pass before the lifecycle branch. That is the intended reading — a loop that
+    /// disagrees with itself about its instrument should not keep trading in either direction — and
+    /// the operator's way out is the one-line configuration change the reason string names, which the
+    /// last assertion pins.
+    /// </remarks>
+    [Fact]
+    public async Task The_same_mismatch_also_stops_a_due_exit_and_the_row_says_how_to_clear_it()
+    {
+        using var harness = new Harness(
+            signal: Signals.Trade,
+            longAsk: 0.20m,
+            shortBid: 0.55m,
+            positions: PutCreditSpread(new DateOnly(2026, 8, 10)),
+            signalKey: PaperAutomationOptions.Signals.ConstantExposure,
+            structure: PaperAutomationOptions.Structures.DebitVertical);
+
+        var decision = await harness.EvaluateScheduledAsync();
+
+        Assert.Equal(ArmStates.IncoherentConfiguration, decision.ArmState);
+        Assert.NotEqual(AutomationActions.ExitSubmitted, decision.Action);
+        Assert.Equal(0, harness.OrdersPosted);
+
+        // The account was not even read: the gate is ahead of the position read, so nothing about this
+        // pass depends on the gateway answering.
+        Assert.Equal(0, harness.PortfolioReads);
+
+        Assert.Contains("closes nothing until the pair agrees", decision.ArmReason);
+        Assert.Contains("PaperAutomation__Structure=short-vol-credit-put", decision.ArmReason);
+    }
+
+    /// <summary>
+    /// The pair that IS coherent arms and reaches the signal, so the gate is not simply refusing
+    /// everything that names constant-exposure.
+    /// </summary>
+    /// <remarks>
+    /// Asserted up to the point the gate governs and no further. The pass then ends at the planner's
+    /// own refusal, because this harness's chain fixture lists CALLS around 739–742 — it prices the
+    /// debit vertical the other tests exercise, and the short-vol planner legitimately finds no put to
+    /// build from. That refusal belongs to <c>SpyShortVolPlannerTests</c>; asserting a submission here
+    /// would be asserting the fixture, and reshaping the fixture to produce one would rewrite the
+    /// inputs of every other test in this file.
+    /// </remarks>
+    [Fact]
+    public async Task Constant_exposure_with_the_protocols_structure_arms_and_consults_the_signal()
+    {
+        using var harness = new Harness(
+            signal: Signals.Trade,
+            signalKey: PaperAutomationOptions.Signals.ConstantExposure,
+            structure: PaperAutomationOptions.Structures.ShortVolCreditPut);
+
+        var decision = await harness.EvaluateScheduledAsync();
+
+        Assert.True(decision.Armed);
+        Assert.Equal(ArmStates.Armed, decision.ArmState);
+
+        // The signal WAS asked, which is the half the refusing case proves cannot happen.
+        Assert.Equal(1, harness.SignalEvaluations);
+        Assert.Equal(SignalStates.Enter, decision.SignalState);
+    }
+
     // ---- the lifecycle: one declared exit rule ---------------------------------------------------
 
     [Fact]
@@ -801,9 +905,15 @@ public sealed class PaperAutomationServiceTests
         public static SignalResult Trade => new(SignalStates.Enter, "A test signal asking for a position.", Trade: true);
     }
 
-    private sealed class FakeSignal(SignalResult result, Action onEvaluate) : IAutomationSignal
+    private sealed class FakeSignal(SignalResult result, Action onEvaluate, string key) : IAutomationSignal
     {
         public string Name => "test-signal";
+
+        /// <summary>
+        /// Separate from <see cref="Name"/> for the reason the interface documents, and settable so a
+        /// test can build the signal/structure pair the arming gate is meant to refuse.
+        /// </summary>
+        public string Key => key;
 
         public Task<SignalResult> EvaluateAsync(CancellationToken cancellationToken)
         {
@@ -902,7 +1012,9 @@ public sealed class PaperAutomationServiceTests
             int exitDteThreshold = 7,
             IPaperAutomationStore? store = null,
             OrderLifecycleStatus orderStatus = OrderLifecycleStatus.Submitted,
-            string? riskBreach = null)
+            string? riskBreach = null,
+            string signalKey = PaperAutomationOptions.Signals.VolResidual,
+            string? structure = null)
         {
             // The in-memory log is always constructed so Store is never null; it is simply unused
             // when a real one is supplied.
@@ -1034,13 +1146,14 @@ public sealed class PaperAutomationServiceTests
                 MarketableBufferDollars = 0.05m,
                 MaxDebitDollars = 0.75m,
                 ExitDteThreshold = exitDteThreshold,
+                Structure = structure ?? PaperAutomationOptions.Structures.DebitVertical,
             });
 
             var marketDataClient = new MarketDataServiceClient(_marketDataHttp);
 
             Service = new PaperAutomationService(
                 options,
-                new FakeSignal(signal ?? Signals.InsufficientData, () => SignalEvaluations++),
+                new FakeSignal(signal ?? Signals.InsufficientData, () => SignalEvaluations++, signalKey),
                 new SessionClock(),
                 store ?? Store,
                 new SpyVerticalPlanner(

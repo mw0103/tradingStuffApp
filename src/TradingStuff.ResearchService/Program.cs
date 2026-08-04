@@ -229,7 +229,10 @@ builder.Services.AddSingleton<IAutomationSignal>(sp =>
     logger.LogWarning(
         "PaperAutomation:Signal is 'constant-exposure': the loop will ask for a position whenever an unrevoked " +
         "research.paper_run_decisions row authorizes the paper run. No forecast is consulted — the protocol's " +
-        "exposure is constant by construction. Arming, the DU-only check, the session and the cap all still apply.");
+        "exposure is constant by construction. Arming, the DU-only check, the session and the cap all still " +
+        "apply, and so does PaperAutomation:Structure='{Structure}' — this signal asks for SHORT-vol exposure " +
+        "and the loop refuses to arm against any other instrument.",
+        PaperAutomationOptions.Structures.ShortVolCreditPut);
 
     return ActivatorUtilities.CreateInstance<ConstantExposureSignal>(sp);
 });

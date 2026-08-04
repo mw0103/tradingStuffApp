@@ -20,6 +20,9 @@ public sealed class PaperAutomationArmingTests
     private static ExecutionPlaneConfiguration CoherentPlane() =>
         new("ibkr", "ibkr", "ibkr-gateway", "ibkr-delayed");
 
+    // The signal/structure defaults are PaperAutomationOptions' OWN shipped defaults, so every test
+    // above and below keeps measuring what it measured, and the pairing cases state their pair
+    // explicitly rather than inheriting a coherent one by accident.
     private static ArmingResult Evaluate(
         bool enabled = true,
         bool killed = false,
@@ -28,12 +31,14 @@ public sealed class PaperAutomationArmingTests
         BrokerFacts? broker = null,
         string? brokerError = null,
         int ordersThisSession = 0,
-        int cap = 2) =>
+        int cap = 2,
+        string signalKey = PaperAutomationOptions.Signals.VolResidual,
+        string structure = PaperAutomationOptions.Structures.DebitVertical) =>
         PaperAutomationArming.Evaluate(
             enabled, killed, killed ? "operator stopped it" : null,
             plane ?? (planeError is null ? CoherentPlane() : null), planeError,
             broker ?? (brokerError is null ? HealthyBroker : null), brokerError,
-            ordersThisSession, cap);
+            ordersThisSession, cap, signalKey, structure);
 
     [Fact]
     public void Arms_when_every_condition_holds()
@@ -114,7 +119,8 @@ public sealed class PaperAutomationArmingTests
         // Neither a value nor an error. The one shape in which "we do not know" could quietly become
         // "it is fine" if the null check were missing.
         var result = PaperAutomationArming.Evaluate(
-            true, false, null, null, null, HealthyBroker, null, 0, 2);
+            true, false, null, null, null, HealthyBroker, null, 0, 2,
+            PaperAutomationOptions.Signals.VolResidual, PaperAutomationOptions.Structures.DebitVertical);
 
         Assert.False(result.Armed);
         Assert.Equal(ArmStates.PreflightFailed, result.State);
@@ -180,6 +186,75 @@ public sealed class PaperAutomationArmingTests
 
         Assert.DoesNotContain("U7654321", result.Reason);
         Assert.Contains("***321", result.Reason);
+    }
+
+    // ---- the signal and the instrument have to be talking about the same run ---------------------
+
+    /// <summary>
+    /// All four signal x structure pairs, because only one of them is wrong and the other three
+    /// must keep arming.
+    /// </summary>
+    /// <remarks>
+    /// <para>
+    /// The gap this closes: <c>Signal=constant-exposure</c> with the DEFAULT
+    /// <c>Structure=debit-vertical</c> submits long-vega call spreads while the shadow marks, the
+    /// capture tables and the protocol all label the run short-vol. Every setting individually valid,
+    /// the combination wrong, nothing able to see it — docs/LESSONS.md §9, the same shape as the
+    /// router/market-data pair one level out.
+    /// </para>
+    /// <para>
+    /// <c>vol-residual</c> pairs with anything because it never asks for a position: there is no
+    /// instrument to disagree with. Constraining it too would refuse to arm on the shipped defaults,
+    /// which is a refusal about nothing.
+    /// </para>
+    /// </remarks>
+    [Theory]
+    [InlineData("constant-exposure", "short-vol-credit-put", true)]
+    [InlineData("constant-exposure", "debit-vertical", false)]
+    [InlineData("vol-residual", "debit-vertical", true)]
+    [InlineData("vol-residual", "short-vol-credit-put", true)]
+    public void The_constant_exposure_signal_arms_only_against_the_protocols_instrument(
+        string signalKey, string structure, bool expectArmed)
+    {
+        var result = Evaluate(signalKey: signalKey, structure: structure);
+
+        Assert.Equal(expectArmed, result.Armed);
+
+        if (expectArmed)
+        {
+            return;
+        }
+
+        Assert.Equal(ArmStates.IncoherentConfiguration, result.State);
+
+        // Pinned wording, because this string IS the operator's instruction: it has to name both
+        // settings, the value that is wrong, and what to do about it. A refusal that only said
+        // "incoherent configuration" would send someone to check the router.
+        Assert.Contains("PaperAutomation:Signal is 'constant-exposure'", result.Reason);
+        Assert.Contains("PaperAutomation:Structure is 'debit-vertical'", result.Reason);
+        Assert.Contains("PaperAutomation__Structure=short-vol-credit-put", result.Reason);
+        Assert.Contains("PaperAutomation__Signal=vol-residual", result.Reason);
+    }
+
+    /// <summary>
+    /// The mismatch refusal blocks EXITS too, and that is deliberate rather than overlooked.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="PaperAutomationArming.PermitsExit"/> whitelists armed and cap-reached only, and this
+    /// refusal is neither. A loop that cannot agree with itself about what instrument it trades is not
+    /// one to let keep sending orders in either direction — and the resolution is a one-line
+    /// configuration change that immediately restores the exit path, which the reason string says.
+    /// Asserted so that a later widening of PermitsExit has to argue with a test rather than slip past.
+    /// </remarks>
+    [Fact]
+    public void The_mismatch_refusal_blocks_exits_and_the_reason_says_how_to_restore_them()
+    {
+        var result = Evaluate(
+            signalKey: PaperAutomationOptions.Signals.ConstantExposure,
+            structure: PaperAutomationOptions.Structures.DebitVertical);
+
+        Assert.False(PaperAutomationArming.PermitsExit(result));
+        Assert.Contains("closes nothing until the pair agrees", result.Reason);
     }
 
     [Fact]
