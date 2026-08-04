@@ -59,9 +59,13 @@ public sealed class PaperCaptureStore(IConfiguration configuration)
 
         await using var transaction = await connection.BeginTransactionAsync(cancellationToken);
 
-        // Fills first, so fill_count on the snapshot is a count of rows that are already in the
-        // transaction rather than an intention. ON CONFLICT DO NOTHING performs no UPDATE, so the
-        // append-only trigger is never reached — a replayed execution is skipped, not rewritten.
+        // Fills first, and fill_count is then a count(*) over the table INSIDE this transaction
+        // rather than the length of what this pass happened to pull. The two differ whenever TWS
+        // replays an execution an earlier pass already captured, and the count that reconciles
+        // against the fill rows is the one a later reader can actually check — a snapshot claiming
+        // five fills with three rows behind it is exactly the reconciliation problem this table
+        // exists to avoid. ON CONFLICT DO NOTHING performs no UPDATE, so the append-only trigger is
+        // never reached: a replayed execution is skipped, not rewritten.
         var written = 0;
 
         foreach (var fill in capture.Fills)
@@ -76,7 +80,8 @@ public sealed class PaperCaptureStore(IConfiguration configuration)
                 net_liquidation, maintenance_margin, init_margin, excess_liquidity,
                 available_funds, buying_power, gross_position_value, currency,
                 summary, positions, position_count, fill_count, capture_source)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            SELECT $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                   (SELECT count(*) FROM research.paper_fills WHERE trading_date = $1), $15
             ON CONFLICT DO NOTHING
             RETURNING snapshot_id
             """,
@@ -98,7 +103,6 @@ public sealed class PaperCaptureStore(IConfiguration configuration)
                 new() { Value = capture.SummaryJson, NpgsqlDbType = NpgsqlDbType.Jsonb },
                 new() { Value = capture.PositionsJson, NpgsqlDbType = NpgsqlDbType.Jsonb },
                 new() { Value = capture.PositionCount },
-                new() { Value = capture.Fills.Count },
                 new() { Value = capture.CaptureSource },
             },
         };

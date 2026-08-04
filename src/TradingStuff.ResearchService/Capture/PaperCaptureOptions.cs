@@ -55,6 +55,20 @@ public sealed class PaperCaptureOptions
     public int CloseDelayMinutes { get; set; } = 15;
 
     /// <summary>
+    /// How long after a session's close a snapshot still describes that session's END state. Past
+    /// it, the row is written with the <c>@late</c> capture source instead.
+    /// </summary>
+    /// <remarks>
+    /// Two hours: comfortably past the settle delay and the evening's exercise and assignment
+    /// reports, and nowhere near the next session. The account read is always of NOW, so a recovery
+    /// pass the following morning records THAT morning's margin and positions against an older
+    /// trading date — worth keeping, since it is the only reading of that date there will ever be,
+    /// but not the same measurement. Append-only means the distinction cannot be added afterwards,
+    /// so it has to be recorded at capture time. See <see cref="CaptureSources.GatewayAccountLate"/>.
+    /// </remarks>
+    public int TimelyWindowMinutes { get; set; } = 120;
+
+    /// <summary>
     /// How many closed SESSIONS back a pass will still try to capture.
     /// </summary>
     /// <remarks>

@@ -9,7 +9,23 @@ public static class CaptureSources
 {
     public const string GatewayExecutions = "ibkr-gateway/reqExecutions";
 
+    /// <summary>A snapshot taken while it still describes the session's own end state.</summary>
     public const string GatewayAccount = "ibkr-gateway/account-streams";
+
+    /// <summary>
+    /// A snapshot taken long enough after the close that it describes a LATER moment than the
+    /// trading date it is keyed to — a recovery pass after an outage.
+    /// </summary>
+    /// <remarks>
+    /// The account read is always of NOW, so a Monday pass recovering Friday writes Monday's net
+    /// liquidation, margin and positions against Friday's date. That row is worth keeping — it is
+    /// the only reading of that date there will ever be — but it must not be read as Friday's close,
+    /// and the tables are append-only so the distinction can never be added afterwards. A reader
+    /// computing the protocol's item 8 (margin AT the close) has to be able to exclude these; a
+    /// reader asking what the account last looked like wants them. Both are legitimate, which is
+    /// precisely why the row has to say which it is.
+    /// </remarks>
+    public const string GatewayAccountLate = "ibkr-gateway/account-streams@late";
 }
 
 /// <summary>

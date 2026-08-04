@@ -131,6 +131,35 @@ public sealed class PaperCapturePostgresTests
     }
 
     [Fact]
+    public async Task The_recorded_fill_count_reconciles_against_the_rows_not_against_what_the_pass_pulled()
+    {
+        if (ServerConnectionString is not { } server) return;
+
+        var connectionString = await PrepareAsync(server);
+        var store = new PaperCaptureStore(ConfigurationFor(connectionString));
+
+        // A fill for this date written from outside the pass — an earlier attempt, a second process,
+        // a later import. Whatever produced it, the snapshot's count has to be a claim a reader can
+        // reproduce with a query, because a snapshot claiming a number the rows contradict is the
+        // reconciliation problem the column comment forbids and append-only makes permanent.
+        await ExecuteAsync(
+            connectionString,
+            "INSERT INTO research.paper_fills " +
+            "(trading_date, account_id, exec_id, con_id, symbol, sec_type, side, quantity, price, " +
+            " executed_at_raw, capture_source) " +
+            "VALUES (DATE '2026-08-06', 'DU1234567', 'from-elsewhere', 776512301, 'SPY', 'OPT', " +
+            " 'BOT', 1, 1.02, '20260806-18:00:00', 'test')");
+
+        var outcome = await store.SaveAsync(Capture(fills: [Fill("exec-1")]), CancellationToken.None);
+
+        Assert.Equal(1, outcome.FillsWritten);
+
+        var snapshot = Assert.Single(await store.ListSnapshotsAsync(10, CancellationToken.None));
+        Assert.Equal(2, snapshot.FillCount);
+        Assert.Equal(2, (await store.ListFillsAsync(TradingDate, 100, CancellationToken.None)).Count);
+    }
+
+    [Fact]
     public async Task A_later_pass_adds_only_the_executions_the_first_one_did_not_see()
     {
         if (ServerConnectionString is not { } server) return;
@@ -317,28 +346,142 @@ public sealed class PaperCapturePostgresTests
         Assert.Single(await store.ListFillsAsync(TradingDate, 100, CancellationToken.None));
     }
 
+    [Fact]
+    public async Task The_executions_pull_over_fetches_past_any_timezone_TWS_might_read_the_bound_in()
+    {
+        if (ServerConnectionString is not { } server) return;
+
+        var connectionString = await PrepareAsync(server);
+        var store = new PaperCaptureStore(ConfigurationFor(connectionString));
+        var handler = new StubGatewayHandler();
+        var service = ServiceOver(store, handler);
+
+        await service.RunPassAsync(new DateTimeOffset(2026, 8, 6, 20, 20, 0, TimeSpan.Zero), CancellationToken.None);
+
+        var bound = Assert.Single(handler.ExecutionBounds);
+
+        // Which clock TWS reads ExecutionFilter.Time against is NOT established: IBKR's source
+        // comments it as UTC, TWS has historically used the API-configured timezone, and no version
+        // guarantee is documented. Sent as the 13:30 UTC session open and read as 13:30 ET, the
+        // bound excludes every fill before 09:30 ET — i.e. all of them — and the pass then writes a
+        // snapshot marking the date captured with zero fills, permanently, because the table is
+        // append-only. So the bound is over-fetched past any offset TWS could apply and the window
+        // is enforced client-side instead.
+        var sessionOpenUtc = new DateTimeOffset(2026, 8, 6, 13, 30, 0, TimeSpan.Zero);
+
+        Assert.True(
+            bound <= sessionOpenUtc.AddHours(-12),
+            $"The executions bound was {bound:O}, only {(sessionOpenUtc - bound).TotalHours:F1}h before the " +
+            $"{sessionOpenUtc:O} session open. It must clear every timezone TWS could read it in.");
+    }
+
+    [Fact]
+    public async Task A_recovery_pass_marks_the_older_sessions_snapshots_as_late()
+    {
+        if (ServerConnectionString is not { } server) return;
+
+        var connectionString = await PrepareAsync(server);
+        var store = new PaperCaptureStore(ConfigurationFor(connectionString));
+
+        var handler = new StubGatewayHandler();
+        handler.Executions.Clear();
+        handler.Executions.AddRange(
+        [
+            ("thu-intraday", new DateTimeOffset(2026, 8, 6, 17, 0, 0, TimeSpan.Zero)),
+            ("wed-intraday", new DateTimeOffset(2026, 8, 5, 17, 0, 0, TimeSpan.Zero)),
+            // Wednesday evening and Tuesday evening: assignment/exercise reports, hours after the
+            // bell. A window that stopped shortly after the close would drop both from every
+            // capture, and they are the protocol's item 6/9 inputs for an expiring short put spread.
+            ("wed-assignment", new DateTimeOffset(2026, 8, 5, 22, 30, 0, TimeSpan.Zero)),
+            ("tue-assignment", new DateTimeOffset(2026, 8, 4, 23, 0, 0, TimeSpan.Zero)),
+        ]);
+
+        var service = ServiceOver(store, handler, lookbackSessions: 3);
+
+        // Thursday 20:20 UTC: Thursday closed twenty minutes ago, Wednesday and Tuesday days ago.
+        await service.RunPassAsync(new DateTimeOffset(2026, 8, 6, 20, 20, 0, TimeSpan.Zero), CancellationToken.None);
+
+        var snapshots = (await store.ListSnapshotsAsync(10, CancellationToken.None))
+            .ToDictionary(row => row.TradingDate);
+
+        Assert.Equal(3, snapshots.Count);
+
+        // The account read is always of NOW. Thursday's snapshot IS Thursday's end state; the other
+        // two are Thursday-evening figures keyed to older dates, and the table is append-only so the
+        // distinction can never be added afterwards. Anything computing item 8 — margin AT the
+        // close — has to be able to exclude them, and capture_source is where that lives.
+        Assert.Equal(CaptureSources.GatewayAccount, snapshots[new DateOnly(2026, 8, 6)].CaptureSource);
+        Assert.Equal(CaptureSources.GatewayAccountLate, snapshots[new DateOnly(2026, 8, 5)].CaptureSource);
+        Assert.Equal(CaptureSources.GatewayAccountLate, snapshots[new DateOnly(2026, 8, 4)].CaptureSource);
+
+        // Each execution landed on the session whose window contains it — including the two evening
+        // reports, which fall after their session's close and before the next session's open.
+        Assert.Equal(
+            ["thu-intraday"],
+            (await store.ListFillsAsync(new DateOnly(2026, 8, 6), 100, CancellationToken.None))
+                .Select(fill => fill.ExecId));
+
+        Assert.Equal(
+            ["wed-assignment", "wed-intraday"],
+            (await store.ListFillsAsync(new DateOnly(2026, 8, 5), 100, CancellationToken.None))
+                .Select(fill => fill.ExecId).Order());
+
+        Assert.Equal(
+            ["tue-assignment"],
+            (await store.ListFillsAsync(new DateOnly(2026, 8, 4), 100, CancellationToken.None))
+                .Select(fill => fill.ExecId));
+
+        // fill_count is the TABLE's count for the date, not the four executions each pass pulled.
+        // A snapshot claiming four fills with one row behind it is the reconciliation problem the
+        // column comment forbids.
+        Assert.Equal(1, snapshots[new DateOnly(2026, 8, 6)].FillCount);
+        Assert.Equal(2, snapshots[new DateOnly(2026, 8, 5)].FillCount);
+        Assert.Equal(1, snapshots[new DateOnly(2026, 8, 4)].FillCount);
+    }
+
     // ---- fixtures ---------------------------------------------------------------------------------
 
-    private static PaperCaptureService ServiceOver(PaperCaptureStore store, StubGatewayHandler handler) =>
+    private static PaperCaptureService ServiceOver(
+        PaperCaptureStore store, StubGatewayHandler handler, int lookbackSessions = 1) =>
         new(new IbkrGatewayClient(
                 new HttpClient(handler) { BaseAddress = new Uri("http://localhost:5100") },
                 NullLogger<IbkrGatewayClient>.Instance),
             new SessionClock(),
             store,
-            Options.Create(new PaperCaptureOptions { LookbackSessions = 1 }),
+            Options.Create(new PaperCaptureOptions { LookbackSessions = lookbackSessions }),
             TimeProvider.System,
             NullLogger<PaperCaptureService>.Instance);
 
     /// <summary>
-    /// Answers the three <c>/ibkr/account/*</c> reads with fixed bodies, or a chosen failure status.
+    /// Answers the three <c>/ibkr/account/*</c> reads, or a chosen failure status, and records every
+    /// executions bound it was asked for.
     /// </summary>
+    /// <remarks>
+    /// The bound is recorded rather than honoured on purpose. TWS's own filter semantics are the
+    /// thing under test elsewhere; here the claim is about what the SERVICE asks for, and a stub
+    /// that filtered would hide an under-fetched bound behind its own correctness.
+    /// </remarks>
     private sealed class StubGatewayHandler : HttpMessageHandler
     {
         public HttpStatusCode Status { get; set; } = HttpStatusCode.OK;
 
+        /// <summary>Every <c>since</c> the service asked for, in request order.</summary>
+        public List<DateTimeOffset> ExecutionBounds { get; } = [];
+
+        /// <summary>Executions the gateway reports, as (execId, executed-at) pairs.</summary>
+        public List<(string ExecId, DateTimeOffset At)> Executions { get; } =
+            [("stub-exec-1", new DateTimeOffset(2026, 8, 6, 19, 45, 12, TimeSpan.Zero))];
+
         protected override Task<HttpResponseMessage> SendAsync(
             HttpRequestMessage request, CancellationToken cancellationToken)
         {
+            var path = request.RequestUri!.AbsolutePath;
+
+            if (path == "/ibkr/account/executions" && ReadSince(request.RequestUri.Query) is { } since)
+            {
+                ExecutionBounds.Add(since);
+            }
+
             if (Status != HttpStatusCode.OK)
             {
                 return Task.FromResult(new HttpResponseMessage(Status)
@@ -346,8 +489,6 @@ public sealed class PaperCapturePostgresTests
                     Content = new StringContent("{\"detail\":\"Not connected to TWS.\"}", Encoding.UTF8, "application/json"),
                 });
             }
-
-            var path = request.RequestUri!.AbsolutePath;
 
             var body = path switch
             {
@@ -368,17 +509,7 @@ public sealed class PaperCapturePostgresTests
                        "localSymbol":"SPY 260904P00725000","quantity":-1,"averageCost":137.0}]}
                     """,
 
-                "/ibkr/account/executions" =>
-                    """
-                    {"account":"DU1234567","capturedAt":"2026-08-06T20:20:00+00:00",
-                     "sinceUtc":"2026-08-06T13:30:00+00:00","commissionsMissing":0,"executions":[
-                      {"execId":"stub-exec-1","permId":1234567890,"orderId":42,"clientId":7,
-                       "account":"DU1234567","conId":776512301,"symbol":"SPY","secType":"OPT",
-                       "expiration":"2026-09-04","strike":725.0,"right":"P","tradingClass":"SPY",
-                       "multiplier":100,"exchange":"CBOE","side":"SLD","quantity":1,"price":1.37,
-                       "executedAtRaw":"20260806-19:45:12","executedAt":"2026-08-06T19:45:12+00:00",
-                       "commission":0.799346,"commissionCurrency":"USD","realizedPnL":null}]}
-                    """,
+                "/ibkr/account/executions" => ExecutionsBody(),
 
                 _ => "{}",
             };
@@ -387,6 +518,37 @@ public sealed class PaperCapturePostgresTests
             {
                 Content = new StringContent(body, Encoding.UTF8, "application/json"),
             });
+        }
+
+        private static DateTimeOffset? ReadSince(string query) =>
+            query.TrimStart('?')
+                .Split('&', StringSplitOptions.RemoveEmptyEntries)
+                .Select(pair => pair.Split('=', 2))
+                .Where(pair => pair.Length == 2 && pair[0] == "since")
+                .Select(pair => DateTimeOffset.Parse(
+                    Uri.UnescapeDataString(pair[1]),
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    System.Globalization.DateTimeStyles.RoundtripKind))
+                .Cast<DateTimeOffset?>()
+                .FirstOrDefault();
+
+        private string ExecutionsBody()
+        {
+            var rows = Executions.Select(execution =>
+                $$"""
+                  {"execId":"{{execution.ExecId}}","permId":1234567890,"orderId":42,"clientId":7,
+                   "account":"DU1234567","conId":776512301,"symbol":"SPY","secType":"OPT",
+                   "expiration":"2026-09-04","strike":725.0,"right":"P","tradingClass":"SPY",
+                   "multiplier":100,"exchange":"CBOE","side":"SLD","quantity":1,"price":1.37,
+                   "executedAtRaw":"{{execution.At:yyyyMMdd-HH:mm:ss}}","executedAt":"{{execution.At:O}}",
+                   "commission":0.799346,"commissionCurrency":"USD","realizedPnL":null}
+                  """);
+
+            return $$"""
+                     {"account":"DU1234567","capturedAt":"2026-08-06T20:20:00+00:00",
+                      "sinceUtc":"2026-08-06T13:30:00+00:00","commissionsMissing":0,
+                      "executions":[{{string.Join(",", rows)}}]}
+                     """;
         }
     }
 

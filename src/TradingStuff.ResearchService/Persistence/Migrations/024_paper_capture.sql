@@ -121,8 +121,11 @@ CREATE TABLE IF NOT EXISTS research.paper_account_snapshots (
     positions           jsonb,
     position_count      integer,
 
-    -- How many paper_fills rows this pass wrote. Zero is a real answer (a session with no trades)
-    -- and is not the same as a refusal.
+    -- How many paper_fills rows exist for this trading date, counted inside the capture's own
+    -- transaction. Deliberately the TABLE's count and not the number of executions the pass pulled:
+    -- the two differ whenever TWS replays an execution an earlier pass already captured, and only
+    -- the former is a claim a later reader can reconcile against the rows. Zero is a real answer (a
+    -- session with no trades) and is not the same as a refusal.
     fill_count          integer,
 
     -- A named refusal, or NULL on a capture. A pass that could not read the broker writes a row
@@ -132,6 +135,13 @@ CREATE TABLE IF NOT EXISTS research.paper_account_snapshots (
     refusal_kind        text,
     refusal             text,
 
+    -- Which read produced the row, and WHEN it was taken relative to the session it is keyed to.
+    -- 'ibkr-gateway/account-streams' is a snapshot that still describes the session's END state;
+    -- '...@late' is a recovery pass, whose account figures are of the moment it ran and not of that
+    -- session's close. The account read is always of NOW, so a Monday pass recovering Friday records
+    -- Monday's margin against Friday's date; that reading is worth keeping (it is the only one that
+    -- date will ever have) but must not be read as the close, and append-only means the distinction
+    -- cannot be added later. Anything computing margin AT the close filters on this column.
     capture_source      text        NOT NULL,
     schema_version      integer     NOT NULL DEFAULT 1,
 
