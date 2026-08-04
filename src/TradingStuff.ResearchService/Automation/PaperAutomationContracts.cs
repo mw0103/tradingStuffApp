@@ -102,6 +102,41 @@ public static class AutomationActions
 
     /// <summary>A closing order was handed over and no outcome came back. It may exist at the venue.</summary>
     public const string ExitOutcomeUnknown = "exit-outcome-unknown";
+
+    /// <summary>
+    /// A closing order reached ExecutionService and came back dead: risk-rejected, broker-rejected,
+    /// or failed to route. It rests at no venue, the position is still open, and the next pass tries
+    /// again.
+    /// </summary>
+    /// <remarks>
+    /// Deliberately NOT <see cref="ExitSubmitted"/>, and the distinction is the whole point.
+    /// ExecutionService answers 201 for a risk rejection (<c>ExecutionWorkflow</c>) and for a gateway
+    /// refusal (<c>IbkrOrderRouter</c>) alike — a successful HTTP call reporting an unsuccessful
+    /// order. Recording those as submitted would claim the exit key for the rest of the trading date
+    /// and buy the position exactly one doomed attempt per day, which is the opposite of the retry
+    /// this plan's failure path is supposed to have. Excluding this action from
+    /// <c>PaperAutomationStore.ExitKeysOrderedOnAsync</c> is what makes the retry structural rather
+    /// than something a later reader has to remember.
+    /// </remarks>
+    public const string ExitRejected = "exit-rejected";
+}
+
+/// <summary>
+/// What a lifecycle status reported at submission time means for a retry.
+/// </summary>
+/// <remarks>
+/// <see cref="OrderLifecycleStatus.Cancelled"/> is deliberately absent. It also rests at no venue,
+/// but it is a decision someone or something MADE about an order that was live, and re-sending the
+/// closing order on the next five-minute sweep would be automation arguing with whoever cancelled
+/// it. It keeps its claim for the trading date, and a position still open tomorrow is closed then.
+/// </remarks>
+public static class OrderOutcomes
+{
+    /// <summary>The order rests at no venue and never will: nothing to reconcile, safe to send again.</summary>
+    public static bool IsDeadOnArrival(OrderLifecycleStatus status) =>
+        status is OrderLifecycleStatus.RiskRejected
+            or OrderLifecycleStatus.Rejected
+            or OrderLifecycleStatus.Failed;
 }
 
 /// <summary>

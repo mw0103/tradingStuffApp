@@ -1,3 +1,4 @@
+using System.Globalization;
 using TradingStuff.Contracts;
 using TradingStuff.ResearchService.Automation;
 
@@ -121,6 +122,43 @@ public sealed class SpyExitPlannerTests
             [legs[0], Position("SPY", new DateOnly(2026, 8, 12), 739m, 0)], "SPY")[0];
 
         Assert.NotEqual(SpyExitPlanner.ManagedStructures(legs, "SPY")[0].ExitKey, partial.ExitKey);
+    }
+
+    [Fact]
+    public void The_exit_key_does_not_move_when_the_process_locale_does()
+    {
+        // The key is written to the decision log on one pass and compared against on a later one —
+        // possibly by a process that started with a different CurrentCulture after an image change or
+        // a host locale. Under de-DE the 739.50 strike formats as "739,50", and under ar-SA the year
+        // itself changes; the same open position would then hash to a key matching nothing already
+        // claimed, and the loop would send a second closing order for a spread whose first is resting
+        // at the venue. Suppression must not depend on where the process is running.
+        var legs = new[]
+        {
+            Position("SPY", new DateOnly(2026, 8, 12), 739.50m, 1),
+            Position("SPY", new DateOnly(2026, 8, 12), 740m, -1),
+        };
+
+        var invariant = SpyExitPlanner.ManagedStructures(legs, "SPY")[0].ExitKey;
+        var original = CultureInfo.CurrentCulture;
+
+        try
+        {
+            foreach (var culture in new[] { "de-DE", "fr-FR", "ar-SA" })
+            {
+                CultureInfo.CurrentCulture = new CultureInfo(culture);
+                Assert.Equal(invariant, SpyExitPlanner.ManagedStructures(legs, "SPY")[0].ExitKey);
+            }
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = original;
+        }
+
+        // The positive control: the key really does carry the two values a locale could mangle, so
+        // this is not passing because there is nothing culture-sensitive in it.
+        Assert.Contains("739.50", invariant);
+        Assert.Contains("2026-08-12", invariant);
     }
 
     // ---- the shape it will close -----------------------------------------------------------------

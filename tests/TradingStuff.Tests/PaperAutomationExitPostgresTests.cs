@@ -65,7 +65,7 @@ public sealed class PaperAutomationExitPostgresTests
         var second = await restarted.EvaluateScheduledAsync();
 
         Assert.Equal(AutomationActions.NoTrade, second.Action);
-        Assert.Contains("already submitted on this trading date", second.ActionReason);
+        Assert.Contains("already accepted on this trading date", second.ActionReason);
         Assert.Equal(0, restarted.OrdersPosted);
 
         // Measured on the table: two decisions, one order.
@@ -90,17 +90,21 @@ public sealed class PaperAutomationExitPostgresTests
         await store.RecordAsync(ExitRow(AutomationActions.ExitSubmitted, TradingDate, "key-a"), CancellationToken.None);
         await store.RecordAsync(ExitRow(AutomationActions.ExitOutcomeUnknown, TradingDate, "key-b"), CancellationToken.None);
         await store.RecordAsync(ExitRow(AutomationActions.ExitRefused, TradingDate, "key-c"), CancellationToken.None);
+        await store.RecordAsync(ExitRow(AutomationActions.ExitRejected, TradingDate, "key-d"), CancellationToken.None);
 
         // An exit-submitted row carries an order id, and an exit-outcome-unknown closing order may be
-        // resting at the venue: both are orders this loop put there and both count. A refusal placed
-        // no order and does not.
-        Assert.Equal(2, await store.CountSubmittedOnAsync(TradingDate, CancellationToken.None));
+        // resting at the venue: both are orders this loop put there and both count. An exit-rejected
+        // one also reached ExecutionService and has an id to reconcile against, so it counts too —
+        // the same treatment a risk-rejected ENTRY already gets, and the conservative direction for a
+        // rail on new exposure. A plan-time refusal placed no order and does not count.
+        Assert.Equal(3, await store.CountSubmittedOnAsync(TradingDate, CancellationToken.None));
 
         var submitted = await store.SubmittedOnAsync(TradingDate, CancellationToken.None);
-        Assert.Equal(2, submitted.Count);
+        Assert.Equal(3, submitted.Count);
 
-        // The claim query follows the same split, and for the same reason: a refused exit is retried
-        // next pass, an ordered one is not.
+        // The CLAIM query follows a different split, and this is the line that keeps a rejected close
+        // retryable: only an order that might exist at a venue suppresses the next attempt. Counting
+        // an order and claiming a position are separate questions and they answer differently here.
         var keys = await store.ExitKeysOrderedOnAsync(TradingDate, CancellationToken.None);
         Assert.Equal(["key-a", "key-b"], keys.OrderBy(k => k, StringComparer.Ordinal));
     }
@@ -154,6 +158,10 @@ public sealed class PaperAutomationExitPostgresTests
             GreeksVector.Zero);
 
     /// <summary>A hand-built exit row, so the store's queries can be tested without the loop.</summary>
+    /// <remarks>
+    /// The order id follows the schema's CHECK: exit-submitted and exit-rejected both reached
+    /// ExecutionService and have one; exit-outcome-unknown and exit-refused do not.
+    /// </remarks>
     private static AutomationDecision ExitRow(string action, DateOnly tradingDate, string exitKey) =>
         new(
             0,
@@ -163,8 +171,10 @@ public sealed class PaperAutomationExitPostgresTests
             "NYSE", "regular", tradingDate, true,
             SignalStates.NotEvaluated, "The exit rule is unconditional.", null,
             action, $"{AutomationExitRules.Dte}: seeded row.",
-            OrderSubmitted: action == AutomationActions.ExitSubmitted,
-            OrderId: action == AutomationActions.ExitSubmitted ? Guid.NewGuid() : null,
+            OrderSubmitted: action is AutomationActions.ExitSubmitted or AutomationActions.ExitRejected,
+            OrderId: action is AutomationActions.ExitSubmitted or AutomationActions.ExitRejected
+                ? Guid.NewGuid()
+                : null,
             CorrelationId: null,
             LifecycleStatus: null,
             LimitPrice: 0.46m,

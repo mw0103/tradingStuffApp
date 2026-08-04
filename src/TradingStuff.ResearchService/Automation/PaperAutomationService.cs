@@ -571,9 +571,10 @@ public sealed class PaperAutomationService(
         {
             return await RecordAsync(
                 context.Build(arming, SignalStates.NotEvaluated, signalReason, null, AutomationActions.NoTrade,
-                    $"{rule}, and a closing order for it was already submitted on this trading date. It is not sent " +
-                    "again while it may be resting at the venue; if it does not fill, the next trading date closes " +
-                    "the position it still finds open.",
+                    $"{rule}, and a closing order for it was already accepted on this trading date — ExecutionService " +
+                    "did not report it dead, so it is either working at the venue or its outcome is unestablished. " +
+                    "It is not sent again today; if it does not fill, the next trading date closes the position it " +
+                    "still finds open.",
                     ordersThisSession,
                     detail: ExitDetail(due, days, settings)),
                 cancellationToken);
@@ -606,6 +607,42 @@ public sealed class PaperAutomationService(
         try
         {
             var response = await execution.SubmitAsync(order.Request, cancellationToken);
+
+            // A 2xx is not a live order. ExecutionService answers 201 with RiskRejected when the risk
+            // service refuses, and 201 with Failed when the gateway does — a successful HTTP call
+            // reporting an unsuccessful order. Reading those as submitted would spend this position's
+            // one closing order per trading date on an attempt that reached no venue: the position
+            // would sit open until tomorrow because of a rejection that could have been retried five
+            // minutes later. So the dead statuses release BOTH claims and record a retryable action.
+            if (OrderOutcomes.IsDeadOnArrival(response.Status))
+            {
+                // Released because the answer is definitive, which is exactly what the exception path
+                // below does not have. Nothing rests at any venue under this order, so sending
+                // another closing order cannot double-close the position.
+                ReleaseExitClaim(context.TradingDate, due.ExitKey);
+                ReleaseClaim(context.TradingDate);
+
+                logger.LogCritical(
+                    "A CLOSING order for {Description} came back {Status} from ExecutionService and rests at no " +
+                    "venue. The position is still open and the next pass will try again. Risk decision: {Risk}.",
+                    order.Description, response.Status, response.RiskDecision?.Decision.ToString() ?? "(none)");
+
+                return await RecordAsync(
+                    context.Build(arming, SignalStates.NotEvaluated, signalReason, null,
+                        AutomationActions.ExitRejected,
+                        $"{rule}. {order.Description}. ExecutionService reports {response.Status}" +
+                        $"{DescribeBreaches(response)}, so the closing order rests at no venue and the position is " +
+                        "still open. The next pass tries again; this is not a claim on the position.",
+                        ordersThisSession + 1,
+                        orderSubmitted: true,
+                        orderId: response.OrderId,
+                        correlationId: response.CorrelationId,
+                        lifecycleStatus: response.Status.ToString(),
+                        limitPrice: order.LimitPrice,
+                        limitPriceSource: order.LimitPriceSource,
+                        detail: ExitDetail(due, days, settings, response)),
+                    cancellationToken);
+            }
 
             var decision = await RecordAsync(
                 context.Build(arming, SignalStates.NotEvaluated, signalReason, null, AutomationActions.ExitSubmitted,
@@ -811,6 +848,30 @@ public sealed class PaperAutomationService(
 
         _exitClaims.Keys.Add(exitKey);
     }
+
+    /// <summary>
+    /// Drops the claim after a definitive answer that the closing order rests at no venue.
+    /// </summary>
+    /// <remarks>
+    /// The ONE release, and its precondition is the whole reason it is safe: a
+    /// <see cref="OrderOutcomes.IsDeadOnArrival"/> status is ExecutionService stating that this order
+    /// exists nowhere, so a second closing order cannot double-close the position. Every other outcome
+    /// — including, especially, no outcome at all — keeps the claim, because a claim released on an
+    /// ambiguity is a position closed twice and left inverted. Do not widen the caller.
+    /// </remarks>
+    private void ReleaseExitClaim(DateOnly tradingDate, string exitKey)
+    {
+        if (_exitClaims.Date == tradingDate)
+        {
+            _exitClaims.Keys.Remove(exitKey);
+        }
+    }
+
+    /// <summary>The risk breach codes on a rejection, so the row says WHY without a second lookup.</summary>
+    private static string DescribeBreaches(SubmitOrderResponse response) =>
+        response.RiskDecision?.Breaches is { Count: > 0 } breaches
+            ? $" ({string.Join(", ", breaches.Select(b => b.Code))})"
+            : string.Empty;
 
     public async Task<AutomationStatusReport> GetStatusAsync(int recentLimit, CancellationToken cancellationToken)
     {

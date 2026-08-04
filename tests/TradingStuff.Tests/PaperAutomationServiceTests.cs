@@ -338,7 +338,7 @@ public sealed class PaperAutomationServiceTests
         Assert.Equal(AutomationActions.ExitSubmitted, first.Action);
 
         Assert.Equal(AutomationActions.NoTrade, second.Action);
-        Assert.Contains("already submitted on this trading date", second.ActionReason);
+        Assert.Contains("already accepted on this trading date", second.ActionReason);
 
         // The assertion that matters: the venue saw one closing order, not two.
         Assert.Equal(1, harness.OrdersPosted);
@@ -411,6 +411,74 @@ public sealed class PaperAutomationServiceTests
         Assert.StartsWith(AutomationExitRules.Dte, first.ActionReason);
         Assert.Equal(0, harness.OrdersPosted);
         Assert.Equal(2, harness.Store.Recorded.Count);
+    }
+
+    [Theory]
+    [InlineData(OrderLifecycleStatus.RiskRejected)]
+    [InlineData(OrderLifecycleStatus.Rejected)]
+    [InlineData(OrderLifecycleStatus.Failed)]
+    public async Task A_closing_order_that_comes_back_dead_is_retried_rather_than_claiming_the_day(
+        OrderLifecycleStatus status)
+    {
+        // ExecutionService answers 201 for a risk rejection and 201 for a gateway refusal alike: a
+        // successful HTTP call reporting an order that rests at no venue. Reading those as submitted
+        // would spend this position's one closing order per trading date on an attempt that reached
+        // nothing, and the position would sit open until tomorrow because of a rejection that could
+        // have been retried five minutes later.
+        using var harness = new Harness(
+            signal: Signals.Trade, cap: 5, longAsk: 0.20m, shortBid: 0.55m,
+            orderStatus: status, positions: PutCreditSpread(new DateOnly(2026, 8, 10)));
+
+        var first = await harness.EvaluateScheduledAsync();
+
+        Assert.Equal(AutomationActions.ExitRejected, first.Action);
+        Assert.Equal(status.ToString(), first.LifecycleStatus);
+        Assert.Contains("rests at no venue", first.ActionReason);
+        Assert.Contains("next pass tries again", first.ActionReason);
+
+        // The claim was not kept: the next pass sends another closing order rather than recording a
+        // suppression row and leaving the position open all day.
+        var second = await harness.EvaluateScheduledAsync();
+
+        Assert.Equal(AutomationActions.ExitRejected, second.Action);
+        Assert.Equal(2, harness.OrdersPosted);
+
+        // Neither half of the claim holds: the durable query is filtered on the action, and the
+        // in-process set was released on a definitive answer.
+        Assert.Empty(await harness.Store.ExitKeysOrderedOnAsync(new DateOnly(2026, 8, 5), CancellationToken.None));
+    }
+
+    [Fact]
+    public async Task A_risk_rejected_close_names_the_breach_that_stopped_it()
+    {
+        using var harness = new Harness(
+            signal: Signals.Trade, cap: 5, longAsk: 0.20m, shortBid: 0.55m,
+            orderStatus: OrderLifecycleStatus.RiskRejected, riskBreach: "MAX_LOSS_PER_ORDER",
+            positions: PutCreditSpread(new DateOnly(2026, 8, 10)));
+
+        var decision = await harness.EvaluateScheduledAsync();
+
+        // A position that cannot be closed because of a risk limit is an operational problem someone
+        // has to act on, and the row has to name which limit rather than only that there was one.
+        Assert.Contains("MAX_LOSS_PER_ORDER", decision.ActionReason);
+    }
+
+    [Fact]
+    public async Task A_closing_order_is_a_day_order_because_the_exit_claim_is_scoped_to_a_trading_date()
+    {
+        // The one property that keeps yesterday's unfilled closing order from meeting today's. The
+        // exit claim expires with the trading date, so a close that did not fill is sent again
+        // tomorrow; that is only safe because a Day order is dead at tonight's close. A
+        // GoodTillCanceled one would still be resting when the next arrived, and the pair would close
+        // the spread twice and leave the account holding the inverted position, unmonitored.
+        using var harness = new Harness(
+            signal: Signals.Trade, cap: 5, longAsk: 0.20m, shortBid: 0.55m,
+            positions: PutCreditSpread(new DateOnly(2026, 8, 10)));
+
+        var decision = await harness.EvaluateScheduledAsync();
+
+        Assert.Equal(AutomationActions.ExitSubmitted, decision.Action);
+        Assert.Equal(TimeInForce.Day, Assert.Single(harness.SubmittedOrders).TimeInForce);
     }
 
     [Fact]
@@ -832,7 +900,9 @@ public sealed class PaperAutomationServiceTests
             IReadOnlyList<PositionSnapshot>? positions = null,
             bool portfolioReadable = true,
             int exitDteThreshold = 7,
-            IPaperAutomationStore? store = null)
+            IPaperAutomationStore? store = null,
+            OrderLifecycleStatus orderStatus = OrderLifecycleStatus.Submitted,
+            string? riskBreach = null)
         {
             // The in-memory log is always constructed so Store is never null; it is simply unused
             // when a real one is supplied.
@@ -871,8 +941,19 @@ public sealed class PaperAutomationServiceTests
                     };
                 }
 
+                // 201 with a dead status is a REAL response shape, not a contrivance:
+                // ExecutionWorkflow answers 201/RiskRejected when risk refuses, and IbkrOrderRouter
+                // produces 201/Failed when the gateway does. A stub that could only return Submitted
+                // would make the loop untestable against the outcomes that actually happen.
+                var risk = riskBreach is null
+                    ? null
+                    : new RiskEvaluationResult(
+                        Guid.NewGuid(), RiskDecision.Rejected,
+                        [new RiskLimitBreach(riskBreach, "Seeded by the harness.", 1m, 0m)],
+                        GreeksVector.Zero, 0m, 0m, time.GetUtcNow());
+
                 return Ok(new SubmitOrderResponse(
-                    Guid.NewGuid(), Guid.NewGuid(), OrderLifecycleStatus.Submitted, null, []));
+                    Guid.NewGuid(), Guid.NewGuid(), orderStatus, risk, []));
             }))
             { BaseAddress = new Uri("http://execution") };
 

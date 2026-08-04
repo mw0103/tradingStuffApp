@@ -1,3 +1,4 @@
+using System.Globalization;
 using Microsoft.Extensions.Options;
 using TradingStuff.Contracts;
 
@@ -152,6 +153,13 @@ public sealed class SpyExitPlanner(
             accountId,
             StrategyKind.Vertical,
             OrderType.Limit,
+            // A SAFETY property here, not a default carried over from the entry planners, and asserted
+            // by test for exactly that reason. The exit claim is scoped to a TRADING DATE: a closing
+            // order that did not fill is claimed today and sent again tomorrow. That is only correct
+            // because a Day order is dead at tonight's close — a GoodTillCanceled one would still be
+            // resting at the venue when tomorrow's arrived, and the pair would close the spread twice
+            // and leave the account holding the inverted position with nothing watching it. The
+            // in-session-only submission is the other half of the same guarantee.
             TimeInForce.Day,
             legs,
             LimitPrice: netLimit,
@@ -162,8 +170,10 @@ public sealed class SpyExitPlanner(
             ClientOrderId: Guid.NewGuid(),
             SubmittedBy: "paper-automation");
 
+        // F2, not F0: SPY lists half-dollar strikes, and a 739.50 leg written as "740" in the audit
+        // record names a contract that is not the one being closed.
         var strikes = string.Join(
-            "/", structure.Legs.Select(leg => leg.Contract.Strike.ToString("F0")));
+            "/", structure.Legs.Select(leg => leg.Contract.Strike.ToString("F2", CultureInfo.InvariantCulture)));
 
         return OrderPlanResult.Planned(new PlannedOrder(
             request,
@@ -299,8 +309,20 @@ public sealed class SpyExitPlanner(
     /// The claim key: underlying, expiration, and every leg's right, strike and signed size.
     /// </summary>
     /// <remarks>
+    /// <para>
     /// Legs arrive in strike order, so the same position produces the same string on every pass and
     /// in every process. Nothing here is parsed back out — it exists only to be compared.
+    /// </para>
+    /// <para>
+    /// <b>Invariant culture, and it is load-bearing rather than a lint fix.</b> This string is written
+    /// to the decision log and compared against on a later pass, possibly by a process that started
+    /// with a different <c>CurrentCulture</c> — a container image change, a host locale, an
+    /// environment variable. Under a comma-decimal culture <c>739.00</c> becomes <c>739,00</c> and
+    /// under a non-Gregorian one the year itself changes, so the same open position would hash to a
+    /// key that matches nothing already claimed and the loop would send a second closing order for a
+    /// spread whose first is resting at the venue. The suppression must not depend on where the
+    /// process is running.
+    /// </para>
     /// </remarks>
     internal static string BuildExitKey(
         string underlying, DateOnly expiration, IReadOnlyList<PositionSnapshot> legs) =>
@@ -308,8 +330,9 @@ public sealed class SpyExitPlanner(
             '|',
             [
                 underlying.ToUpperInvariant(),
-                expiration.ToString("yyyy-MM-dd"),
-                .. legs.Select(leg =>
-                    $"{(leg.Contract.Right == OptionRight.Put ? 'P' : 'C')}{leg.Contract.Strike:F2}x{leg.Quantity}"),
+                expiration.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+                .. legs.Select(leg => string.Create(
+                    CultureInfo.InvariantCulture,
+                    $"{(leg.Contract.Right == OptionRight.Put ? 'P' : 'C')}{leg.Contract.Strike:F2}x{leg.Quantity}")),
             ]);
 }
