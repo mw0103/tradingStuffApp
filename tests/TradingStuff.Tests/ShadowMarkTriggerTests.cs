@@ -1,3 +1,7 @@
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Time.Testing;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using TradingStuff.ResearchService.Sessions;
 using TradingStuff.ResearchService.Studies.VrpConditioning;
 
@@ -225,5 +229,301 @@ public sealed class ShadowMarkTriggerTests
         Assert.Null(defaults.AfterCloseMinutes);
         Assert.Equal("NYSE", defaults.Calendar);
         Assert.Equal("RTH", defaults.SessionLabel);
+    }
+
+    // ---- TickAsync: which outcomes settle a date, and which leave it for the catch-up window -----
+    //
+    // Everything above drives the pure schedule arithmetic. Nothing above reaches TickAsync, which is
+    // where a day is actually lost or kept: both defects these tests pin — a refusal burning the date
+    // permanently, and a mark for the WRONG date claiming the right one — passed the whole schedule
+    // suite untouched. RunOverride stands in for the run so the outcome handling is reachable without
+    // a database, a gateway, or three years of bars.
+
+    /// <summary>Thursday 2026-08-06's mark falls due at 2026-08-07 00:10 UTC.</summary>
+    private static readonly DateTimeOffset Due = new(2026, 8, 7, 0, 10, 0, TimeSpan.Zero);
+
+    private static VrpShadowMark MarkFor(DateOnly markDate) =>
+        new(markDate, markDate.AddYears(-3), markDate, 710,
+            15.99, 0.0256, 0.021, 0.022, -0.0046, -0.0036, 0.0, 2, 2, 3, 0.5, 0.5, 1.0);
+
+    /// <summary>A trigger wired to a stand-in run, with a real scope factory it never resolves from.</summary>
+    private static ShadowMarkTrigger Trigger(
+        Func<CancellationToken, Task<VolShadowMarkRunOutcome>> run,
+        ShadowMarkTriggerOptions? settings = null,
+        TimeProvider? time = null)
+    {
+        var services = new ServiceCollection().BuildServiceProvider();
+
+        return new ShadowMarkTrigger(
+            services.GetRequiredService<IServiceScopeFactory>(),
+            new SessionClock(),
+            Options.Create(settings ?? Settings()),
+            time ?? TimeProvider.System,
+            NullLogger<ShadowMarkTrigger>.Instance)
+        {
+            RunOverride = (_, cancellationToken) => run(cancellationToken),
+        };
+    }
+
+    [Fact]
+    public async Task A_refused_date_is_attempted_again_and_settles_when_the_input_lands()
+    {
+        var attempts = 0;
+        var refuse = true;
+
+        var trigger = Trigger(_ =>
+        {
+            attempts++;
+
+            return Task.FromResult(refuse
+                ? new VolShadowMarkRunOutcome(VolShadowMarkRunStatus.Refused, null, null, "No VIX close for 2026-08-06.")
+                : new VolShadowMarkRunOutcome(VolShadowMarkRunStatus.Recorded, MarkFor(Thursday), new object(), null));
+        });
+
+        // 00:10 — due, and the daily-close slice has not drained yet. RunAtUtc is by construction the
+        // EARLIEST instant that input can exist, so a refusal here is the expected first answer.
+        await trigger.TickAsync(Due, CancellationToken.None);
+        Assert.Equal(1, attempts);
+
+        // Two minutes later: still due, but inside the retry spacing. A three-year bar load must not
+        // run on every 60-second poll.
+        await trigger.TickAsync(Due.AddMinutes(2), CancellationToken.None);
+        Assert.Equal(1, attempts);
+
+        // Sixteen minutes later: past RefusalRetryMinutes, so it tries again. THIS is the assertion
+        // that fails if a refusal claims the date — the whole 720-minute window exists for it.
+        await trigger.TickAsync(Due.AddMinutes(16), CancellationToken.None);
+        Assert.Equal(2, attempts);
+
+        // The backfill lands the close, and the next attempt records the mark.
+        refuse = false;
+        await trigger.TickAsync(Due.AddMinutes(32), CancellationToken.None);
+        Assert.Equal(3, attempts);
+
+        // Settled: a recorded date is claimed and is not run again for the rest of the window.
+        await trigger.TickAsync(Due.AddMinutes(48), CancellationToken.None);
+        await trigger.TickAsync(Due.AddHours(6), CancellationToken.None);
+        Assert.Equal(3, attempts);
+    }
+
+    [Fact]
+    public async Task A_refusal_retries_about_forty_eight_times_across_the_window_not_every_poll()
+    {
+        var attempts = 0;
+
+        var trigger = Trigger(_ =>
+        {
+            attempts++;
+            return Task.FromResult(
+                new VolShadowMarkRunOutcome(VolShadowMarkRunStatus.Refused, null, null, "No VIX close."));
+        });
+
+        // Drive a 60-second poll across the whole 720-minute window: 721 polls, and the spacing must
+        // turn them into ~48 attempts. Bounded retry is the point — an unbounded one would re-load
+        // three years of bars 721 times, and a claimed refusal would run exactly once and lose the day.
+        for (var minute = 0; minute <= 720; minute++)
+        {
+            await trigger.TickAsync(Due.AddMinutes(minute), CancellationToken.None);
+        }
+
+        Assert.Equal(48, attempts);
+    }
+
+    [Fact]
+    public async Task A_mark_for_a_different_date_does_not_settle_the_date_that_was_due()
+    {
+        var attempts = 0;
+        var landed = false;
+
+        var trigger = Trigger(_ =>
+        {
+            attempts++;
+
+            // research.bars has no complete session for Thursday yet, so the forecaster dates its
+            // mark from WEDNESDAY — and upserts Wednesday's row, rewriting a good record's
+            // planner_intent on the way past. Thursday is not what came back.
+            return Task.FromResult(new VolShadowMarkRunOutcome(
+                VolShadowMarkRunStatus.Recorded,
+                MarkFor(landed ? Thursday : Thursday.AddDays(-1)),
+                new object(),
+                null));
+        });
+
+        await trigger.TickAsync(Due, CancellationToken.None);
+        Assert.Equal(1, attempts);
+
+        // Thursday must still be due. Claiming it on the strength of Wednesday's row would retire it
+        // having never written it, and Thursday would never be marked at all.
+        await trigger.TickAsync(Due.AddMinutes(16), CancellationToken.None);
+        Assert.Equal(2, attempts);
+
+        landed = true;
+        await trigger.TickAsync(Due.AddMinutes(32), CancellationToken.None);
+        Assert.Equal(3, attempts);
+
+        // Now it matches, so it settles.
+        await trigger.TickAsync(Due.AddMinutes(48), CancellationToken.None);
+        Assert.Equal(3, attempts);
+    }
+
+    [Fact]
+    public async Task A_run_that_threw_settles_the_date_rather_than_flooding_the_window()
+    {
+        var attempts = 0;
+
+        var trigger = Trigger(_ =>
+        {
+            attempts++;
+            throw new InvalidOperationException("something unexplained");
+        });
+
+        // The throw propagates so ExecuteAsync logs it once. Unlike a refusal, an unexplained fault
+        // has no known remedy inside the window, and repeating it 48 times buries the one line that
+        // says what broke.
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => trigger.TickAsync(Due, CancellationToken.None));
+
+        await trigger.TickAsync(Due.AddMinutes(30), CancellationToken.None);
+        await trigger.TickAsync(Due.AddHours(6), CancellationToken.None);
+        Assert.Equal(1, attempts);
+    }
+
+    [Fact]
+    public async Task A_shutdown_cancellation_does_not_settle_the_date()
+    {
+        var attempts = 0;
+        using var cancelled = new CancellationTokenSource();
+        await cancelled.CancelAsync();
+
+        var trigger = Trigger(token =>
+        {
+            attempts++;
+            token.ThrowIfCancellationRequested();
+            return Task.FromResult(
+                new VolShadowMarkRunOutcome(VolShadowMarkRunStatus.Recorded, MarkFor(Thursday), null, null));
+        });
+
+        await Assert.ThrowsAsync<OperationCanceledException>(
+            () => trigger.TickAsync(Due, cancelled.Token));
+
+        // A date abandoned because the process is stopping was never attempted in any meaningful
+        // sense; claiming it would be a claim made by a process that no longer exists.
+        Assert.Equal(1, attempts);
+        Assert.Null(typeof(ShadowMarkTrigger)
+            .GetField("_lastFired", System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic)!
+            .GetValue(trigger));
+    }
+
+    [Fact]
+    public async Task A_missing_connection_string_settles_the_date_because_it_cannot_resolve_in_the_window()
+    {
+        var attempts = 0;
+
+        var trigger = Trigger(_ =>
+        {
+            attempts++;
+            return Task.FromResult(
+                new VolShadowMarkRunOutcome(VolShadowMarkRunStatus.NotConfigured, null, null, null));
+        });
+
+        await trigger.TickAsync(Due, CancellationToken.None);
+        await trigger.TickAsync(Due.AddMinutes(30), CancellationToken.None);
+        Assert.Equal(1, attempts);
+    }
+
+    [Fact]
+    public async Task A_restart_re_runs_a_date_it_already_marked_and_that_is_the_accepted_cost()
+    {
+        var attempts = 0;
+
+        Func<ShadowMarkTrigger> fresh = () => Trigger(_ =>
+        {
+            attempts++;
+            return Task.FromResult(
+                new VolShadowMarkRunOutcome(VolShadowMarkRunStatus.Recorded, MarkFor(Thursday), null, null));
+        });
+
+        var before = fresh();
+        await before.TickAsync(Due, CancellationToken.None);
+        await before.TickAsync(Due.AddHours(2), CancellationToken.None);
+        Assert.Equal(1, attempts);
+
+        // The claim is in memory and deliberately not persisted, so a restart inside the window runs
+        // the date again. The upsert makes that safe for the mark itself; it is NOT free, because
+        // planner_intent is a live gateway read and the second run replaces it with whatever the
+        // gateway says now. That is why the retry interval is minutes and not the poll interval.
+        var after = fresh();
+        await after.TickAsync(Due.AddHours(3), CancellationToken.None);
+        Assert.Equal(2, attempts);
+    }
+
+    [Fact]
+    public async Task Nothing_runs_when_no_date_is_due()
+    {
+        var attempts = 0;
+
+        var trigger = Trigger(_ =>
+        {
+            attempts++;
+            return Task.FromResult(
+                new VolShadowMarkRunOutcome(VolShadowMarkRunStatus.Recorded, MarkFor(Thursday), null, null));
+        });
+
+        // 30 minutes after the US close: due is 00:10 the following day, so there is nothing to do
+        // and the run must not be reached at all.
+        await trigger.TickAsync(ThursdayCloseUtc.AddMinutes(30), CancellationToken.None);
+        Assert.Equal(0, attempts);
+    }
+
+    [Fact]
+    public async Task A_dependency_timeout_does_not_silently_kill_the_loop_for_the_life_of_the_process()
+    {
+        var attempts = 0;
+        var time = new FakeTimeProvider(Due.AddSeconds(-30));
+
+        // The planner's quote read goes out over HttpClient, and an HttpClient timeout surfaces as
+        // TaskCanceledException — which derives from OperationCanceledException. A catch filter of
+        // `ex is not OperationCanceledException` lets that escape ExecuteAsync, and because
+        // Program.cs sets BackgroundServiceExceptionBehavior.Ignore, the host does NOT fall over: the
+        // trigger simply stops, silently, and the shadow record stops growing with nothing logged.
+        var trigger = Trigger(
+            _ =>
+            {
+                attempts++;
+                throw new TaskCanceledException("The request was canceled due to the configured HttpClient.Timeout.");
+            },
+            new ShadowMarkTriggerOptions
+            {
+                Calendar = "NYSE",
+                SessionLabel = "RTH",
+                RunAtUtc = TimeSpan.FromMinutes(10),
+                CatchUpWindowMinutes = 720,
+                // One minute apart, so the second attempt is a different DAY's mark rather than a
+                // retry of the same one — the claim on a thrown run is working as intended.
+                RefusalRetryMinutes = 1,
+                PollSeconds = 60,
+            },
+            time);
+
+        await trigger.StartAsync(CancellationToken.None);
+
+        // One poll that lands on a due date. The run throws a TaskCanceledException.
+        time.Advance(TimeSpan.FromMinutes(1));
+        await Task.Delay(100);
+
+        Assert.Equal(1, attempts);
+
+        // THE assertion, and it is deliberately "is the loop still alive?" rather than "did it
+        // fault?": an OperationCanceledException escaping an async method completes its Task as
+        // CANCELLED, not faulted, so IsFaulted stays false either way and a test asking that question
+        // passes against the defect. Under `ex is not OperationCanceledException` this task is
+        // Canceled here and the daily mark is over for the life of the process.
+        Assert.False(
+            trigger.ExecuteTask!.IsCompleted,
+            $"a dependency timeout ended the trigger loop ({trigger.ExecuteTask.Status}); under " +
+            "BackgroundServiceExceptionBehavior.Ignore that stops the daily mark for the life of the " +
+            "process with nothing logged");
+
+        await trigger.StopAsync(CancellationToken.None);
     }
 }

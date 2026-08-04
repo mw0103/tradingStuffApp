@@ -82,6 +82,19 @@ public sealed class ShadowMarkTriggerOptions
 
     /// <summary>Seconds between checks. A check with nothing due does no work and no I/O.</summary>
     public int PollSeconds { get; set; } = 60;
+
+    /// <summary>
+    /// How long to wait before attempting a date again after a run REFUSED it.
+    /// </summary>
+    /// <remarks>
+    /// A refusal is the one outcome the catch-up window exists for, and it must not be terminal.
+    /// <see cref="RunAtUtc"/> is by construction the EARLIEST instant this mark's input can exist —
+    /// the moment the daily-close backfill slice becomes claimable — so a refusal at 00:10 most often
+    /// means the coordinator has not drained that slice yet, which is a matter of minutes, not of
+    /// days. Fifteen minutes gives roughly 48 attempts across the 720-minute window without polling
+    /// a three-year bar load every 60 seconds. Retrying costs a bar load; NOT retrying costs the day.
+    /// </remarks>
+    public int RefusalRetryMinutes { get; set; } = 15;
 }
 
 /// <summary>
@@ -95,10 +108,20 @@ public sealed class ShadowMarkTriggerOptions
 /// case and DST cannot shift the schedule under it.
 /// </para>
 /// <para>
-/// <b>Idempotent, so a redundant fire is harmless.</b> The run upserts one row per mark date. The
-/// in-memory <c>_lastFired</c> only stops this process re-running a date it already did inside the
-/// catch-up window; it is not the idempotency guarantee and is deliberately not persisted — a
-/// restart that re-runs a date costs one bar load and rewrites the same row.
+/// <b>A date is CLAIMED only when the run demonstrably produced that date's row.</b> Three outcomes
+/// deliberately do not claim it, because in each the mark this trigger was firing for still does not
+/// exist and the catch-up window is exactly the budget for trying again: a refusal (the missing
+/// daily close usually lands minutes later), a mark whose <c>MarkDate</c> is not the date that was
+/// due (see <see cref="TickAsync"/>), and — indirectly — a process restart. A run that THREW does
+/// claim: an unexplained failure repeated 48 times is a log flood, not a recovery.
+/// </para>
+/// <para>
+/// <b>Idempotent per mark date, but a re-run is not free.</b> The run upserts one row per mark date,
+/// so a redundant fire cannot duplicate anything. It is not, however, a no-op: <c>planner_intent</c>
+/// is a LIVE gateway read taken at run time, so a second run replaces the stored intent with
+/// whatever the gateway says now — and a re-run during an outage can overwrite a good recorded
+/// intent with a "Gateway unreachable" refusal. That is the cost the retry policy above is priced
+/// against, and it is why the retry interval is minutes rather than the poll interval.
 /// </para>
 /// <para>
 /// <b>Exactly one instance should run this.</b> The auxiliary ResearchService instances in the
@@ -116,8 +139,28 @@ public sealed class ShadowMarkTrigger(
 {
     private readonly ShadowMarkTriggerOptions _settings = options.Value;
 
-    /// <summary>The last trading date this process ran. Not the idempotency guarantee — see the remarks.</summary>
+    /// <summary>The last trading date this process CLAIMED. Not the idempotency guarantee — see the remarks.</summary>
     private DateOnly? _lastFired;
+
+    /// <summary>
+    /// The last attempt at a date that was not claimed, so a refusal retries on a spacing of its own
+    /// rather than on the poll interval. Scoped to the date: a new date is attempted immediately.
+    /// </summary>
+    private (DateOnly Date, DateTimeOffset At)? _lastAttempt;
+
+    /// <summary>
+    /// Test seam: the run this trigger drives. Production leaves it null and calls
+    /// <see cref="VolShadowMarkEndpoints.RunAsync"/>, which is the same code path
+    /// <c>POST /research/shadow-marks/run</c> takes.
+    /// </summary>
+    /// <remarks>
+    /// It exists because the outcome HANDLING — which outcomes claim a date and which leave it for
+    /// the catch-up window — is the part of this class that can silently lose a day, and it cannot be
+    /// exercised through a real run without a database, a gateway and three years of bars. Both
+    /// defects this seam was added to pin (a refusal burning the date; a mark for the wrong date
+    /// claiming the right one) were invisible to every test that drove only the schedule arithmetic.
+    /// </remarks>
+    internal Func<IServiceProvider, CancellationToken, Task<VolShadowMarkRunOutcome>>? RunOverride { get; init; }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
     {
@@ -148,7 +191,14 @@ public sealed class ShadowMarkTrigger(
             {
                 await TickAsync(timeProvider.GetUtcNow(), stoppingToken);
             }
-            catch (Exception ex) when (ex is not OperationCanceledException)
+            // Filtered on the STOPPING TOKEN, not on the exception type. An OperationCanceledException
+            // reaching here is usually not a shutdown at all — an HttpClient timeout inside the
+            // planner's quote read surfaces as TaskCanceledException, which derives from it — and
+            // `ex is not OperationCanceledException` would let that one escape, fault the service, and
+            // (under BackgroundServiceExceptionBehavior.Ignore, set in Program.cs) stop the trigger
+            // for the life of the process with nothing logged. The token is the only thing that
+            // actually distinguishes "we are shutting down" from "a dependency timed out".
+            catch (Exception ex) when (!stoppingToken.IsCancellationRequested)
             {
                 logger.LogError(ex, "The shadow-mark trigger failed; it will retry on the next poll.");
             }
@@ -164,7 +214,13 @@ public sealed class ShadowMarkTrigger(
         }
     }
 
-    /// <summary>One check: run the due mark, if there is one. Internal so a test can drive it without timers.</summary>
+    /// <summary>
+    /// One check: run the due mark, if there is one, and decide whether the date is now settled.
+    /// </summary>
+    /// <remarks>
+    /// Internal so a test can drive it without timers. The outcome handling below is the whole point
+    /// of the method — see <see cref="RunOverride"/> for why it is separately testable.
+    /// </remarks>
     internal async Task TickAsync(DateTimeOffset now, CancellationToken cancellationToken)
     {
         if (DueTradingDate(sessionClock, _settings, now, _lastFired) is not { } tradingDate)
@@ -172,47 +228,99 @@ public sealed class ShadowMarkTrigger(
             return;
         }
 
-        // Claimed BEFORE the run, not after: a run that throws must not be retried every poll for the
-        // rest of the catch-up window. The failure is logged, the date shows as a gap, and the next
-        // day's mark is unaffected — which is the honest outcome, and the one the protocol asks for.
-        _lastFired = tradingDate;
+        // Spacing between attempts at a date that is due but not yet settled. Without it an
+        // unsettled date would re-run a three-year bar load on every poll for the whole window.
+        if (_lastAttempt is { } previous
+            && previous.Date == tradingDate
+            && now < previous.At + TimeSpan.FromMinutes(Math.Max(_settings.RefusalRetryMinutes, 1)))
+        {
+            return;
+        }
+
+        _lastAttempt = (tradingDate, now);
 
         // A scope per run because the run's dependencies are resolved per use and this service is a
         // singleton; resolving them once at construction would pin them for the process's life.
         using var scope = scopeFactory.CreateScope();
-        var services = scope.ServiceProvider;
 
-        var outcome = await VolShadowMarkEndpoints.RunAsync(
-            services.GetRequiredService<VolResidualBarLoader>(),
-            sessionClock,
-            services.GetRequiredService<VolShadowMarkStore>(),
-            services.GetRequiredService<SpyShortVolPlanner>(),
-            logger,
-            cancellationToken);
+        VolShadowMarkRunOutcome outcome;
+
+        try
+        {
+            outcome = await RunAsync(scope.ServiceProvider, cancellationToken);
+        }
+        catch
+        {
+            // A run that THREW is claimed, unlike a run that refused. A refusal is an EXPLAINED
+            // absence with a known remedy — the missing input lands and the next attempt succeeds —
+            // whereas an unexplained fault repeated every 15 minutes for 12 hours is a log flood that
+            // buries the one line saying what broke. Shutdown claims nothing: the process is going.
+            if (!cancellationToken.IsCancellationRequested)
+            {
+                _lastFired = tradingDate;
+            }
+
+            throw;
+        }
 
         switch (outcome.Status)
         {
+            // Claimed: a missing connection string is fixed at startup and cannot resolve inside the
+            // window, so retrying it 48 times would only repeat the same warning.
             case VolShadowMarkRunStatus.NotConfigured:
+                _lastFired = tradingDate;
                 logger.LogWarning(
                     "The shadow mark for {TradingDate} could not run: no 'trading' connection string. " +
                     "That date will show as a gap in GET /research/shadow-marks.",
                     tradingDate);
                 break;
 
+            // NOT claimed. This is the outcome the catch-up window was built for: RunAtUtc is the
+            // earliest instant the daily close can exist, so the usual cause is that the backfill
+            // coordinator has not drained that slice yet — minutes away, not a lost day.
             case VolShadowMarkRunStatus.Refused:
                 logger.LogWarning(
-                    "The shadow mark for {TradingDate} was refused: {Refusal} Nothing was persisted; the date " +
-                    "shows as a gap until the missing input lands and an operator re-runs it.",
-                    tradingDate, outcome.Refusal);
+                    "The shadow mark for {TradingDate} was refused: {Refusal} Nothing was persisted. " +
+                    "Retrying in {RetryMinutes} minute(s) while the catch-up window is open.",
+                    tradingDate, outcome.Refusal, Math.Max(_settings.RefusalRetryMinutes, 1));
+                break;
+
+            // NOT claimed, and this one is the subtle case. The forecaster dates its mark from the
+            // last COMPLETE SPX session in research.bars, which is not necessarily the last session
+            // the CALENDAR closed: if the due date's bars have not landed, the run happily builds the
+            // PREVIOUS date's mark and upserts it — overwriting a good row with a fresh planner_intent
+            // in the process. Claiming the due date on the strength of that would retire it having
+            // never written it, and it would never be marked. The rewrite already happened and cannot
+            // be undone here; leaving the date unclaimed is what lets it be marked when its bars land.
+            case VolShadowMarkRunStatus.Recorded when outcome.Mark is { } other && other.MarkDate != tradingDate:
+                logger.LogWarning(
+                    "The shadow-mark run fired for trading date {TradingDate} but produced a mark for " +
+                    "{MarkDate}: research.bars has no complete session for {TradingDate} yet, so {MarkDate}'s " +
+                    "row was rewritten instead. {TradingDate} is NOT recorded and stays due — check the " +
+                    "recorder and the backfill drain for that session.",
+                    tradingDate, other.MarkDate);
                 break;
 
             default:
+                _lastFired = tradingDate;
                 logger.LogInformation(
-                    "Recorded the shadow mark for {MarkDate} (trigger fired for trading date {TradingDate}).",
-                    outcome.Mark?.MarkDate, tradingDate);
+                    "Recorded the shadow mark for {MarkDate}.", outcome.Mark?.MarkDate);
                 break;
         }
     }
+
+    /// <summary>The run itself, or the test seam standing in for it.</summary>
+    private Task<VolShadowMarkRunOutcome> RunAsync(
+        IServiceProvider services, CancellationToken cancellationToken) =>
+        RunOverride is { } run
+            ? run(services, cancellationToken)
+            : VolShadowMarkEndpoints.RunAsync(
+                services.GetRequiredService<VolResidualBarLoader>(),
+                sessionClock,
+                services.GetRequiredService<VolShadowMarkStore>(),
+                services.GetRequiredService<SpyShortVolPlanner>(),
+                logger,
+                cancellationToken);
 
     /// <summary>
     /// The trading date whose mark is due at <paramref name="now"/>, or null if none is.
