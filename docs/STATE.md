@@ -1009,6 +1009,61 @@ justifier, Fable arbiter; table wins ties, a deviation needs a named trigger):
   table has never been calibrated against. Prediction to check at review: defects, if any, will be
   definitional rather than arithmetic.
 
+**Build outcomes, per package** (each agent ran reintroduce-the-defect controls on its own tests;
+counts are theirs, re-run by the orchestrator only as the green suite after merge): WP3a 42 cases /
+39 mutations all caught; WP2 42 tests / 38 mutations, and its own controls surfaced two real defects
+(a corrupt acceptance date near `DateOnly`'s bounds killed the whole run — now refused per row as
+UNRESOLVED); WP4 37 tests / 6 mutations plus a real end-to-end run against an in-process Kestrel
+stub of the gateway; WP5 66 tests / 23 mutations (including resampling events instead of weeks);
+WP1 54 tests / 14 mutations. Cross-package checks the orchestrator ran itself: the trailing
+20-day scale is a fraction on both the producing (WP4) and consuming (WP2) side; `timing` then
+`compute` chained through the shared tables on the fixture; a verb re-run leaves one tally per
+(step, gate) — the append-only tally file would otherwise have double-counted the exclusion table,
+fixed centrally in the CLI before any package noticed; dual-class names (GOOG/GOOGL share a CIK)
+collapse to one kept event per quarter under the registered CIK-quarter dedup, with the tie now
+broken by symbol rather than seed-file order. Full solution builds; the platform's own suite is
+1,445/1,445 with the new projects in place.
+
+**Leakage review (Opus/high, executed rather than read — 8 findings, 1 critical).** The critical
+one was the question the orchestrator had put to the reviewer on launch: gate 09's price QA
+conditioned INCLUSION on the post-entry event move, i.e. on RF, the numerator of the primary
+statistic. Quantified on 6,000 clean synthetic events: the rule removed 3.1 % of events, and the
+removed set was the strongest PASS evidence in the sample (P(RF<IM) 0.946 against a population
+0.620); in a boundary population it flipped the verdict PASS → FAIL. The WP2 comment asserting the
+opposite direction was false — a false positive removes a small-RF event, which raises
+median(RF/IM) and lowers P(RF<IM), toward the FAIL that stops the program — so the rule defeated
+the registration's stated logic that every v0 bias points toward PASS. A pre-entry-only rule at
+the same threshold caught the same injected late filings and moved the statistics essentially
+not at all. Fix: the event-move conjunct is dropped; the decision uses pre-entry closes and the
+trailing scale only. Also found: `compute` and `timing` held different definitions of the event
+set (KeptAfterDedup vs InWindow && KeptAfterDedup), so a missing `event_timing.csv` row rendered as
+a gate-07 removal with the memo header contradicting its own exclusion table — class (c) exactly;
+the IM-collapse witness for gate 09 was written, tested and called by nothing (the same shape as
+`MigrationHealthCheck` in the Phase 1+2 review); the as-of shares pick admitted a fact filed after
+the close on the entry date (inclusive `<=`; now strict); the verdict line could print
+"1.000000 < 1"; the quarantine rate mixed two denominators. Checked and sound: the calendar
+resolution over every day 2022–2025 × 65 acceptance times (94,965 resolutions, zero look-ahead);
+the week-clustered bootstrap (3.39× wider than event-level under a common weekly shock,
+nearest-rank endpoints exact, byte-identical memo on re-run); the selection core over 20,000
+random ladders (zero edge clamps); decimal round-trips and null handling.
+
+One finding is about the registration itself, not the code: the registered PASS condition
+(median(RF/IM) < 1 and P(RF<IM) > 0.5) is also satisfied by a fairly priced market whenever
+median|move| < mean|move|, which holds for every symmetric distribution — a zero-edge calibration
+gave median 0.845 and P 0.575. The memo executes the registered rule unchanged and now says this
+in its limitations; the mean-based straddle hold-through diagnostic is the readout that speaks to
+a premium in expectation. The frozen file is not edited; whether C1 v2 should register a
+mean-based criterion is a ledger decision for the operator.
+
+**Calibration verdict on the arbitration record.** The prediction "definitional, not
+arithmetic" held for WP5 — every arithmetic path with an oracle came back clean — but the critical
+defect lived in WP2's rule, already escalated to Opus/high as class (b), and escalation found the
+rule's shape, not its direction: direction is invisible by reading and took a population to see.
+Durable correction, by class: any package whose acceptance criterion is a registered verdict gets a
+null-population run in review — a synthetic sample containing none of the contamination the rule
+targets — measuring what the rule does to the headline statistic. Reading a selection rule proves
+nothing about its selection effect.
+
 ## Left
 
 Milestone 2 (research platform — sequenced in `docs/plans/ibkr-edge-research-roadmap.md`):
