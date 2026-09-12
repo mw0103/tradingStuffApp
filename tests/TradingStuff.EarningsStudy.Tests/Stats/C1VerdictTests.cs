@@ -85,6 +85,60 @@ public sealed class C1VerdictTests
         Assert.Equal("contains", verdict.Side);
     }
 
+    /// <summary>
+    /// The comparison is made on the unrounded decimal, but the sentence is the only evidence the
+    /// reader gets. At six places, 0.9999996 renders as "1.000000", so the line read
+    /// "median(RF/IM) = 1.000000 &lt; 1" — a correct verdict whose printed evidence contradicts it.
+    /// </summary>
+    [Fact]
+    public void A_median_whose_rendering_collides_with_one_is_printed_unrounded_beside_it()
+    {
+        var verdict = C1Verdict.Decide(0.9999996m, Interval(0.6m, 0.7m));
+
+        Assert.True(verdict.Pass);
+        Assert.Contains("median(RF/IM) = 0.9999996 (shown unrounded: F6 would print 1.000000) < 1", verdict.Line);
+        Assert.DoesNotContain("= 1.000000 <", verdict.Line);
+    }
+
+    [Fact]
+    public void An_interval_endpoint_whose_rendering_collides_with_one_half_is_printed_unrounded_beside_it()
+    {
+        var below = C1Verdict.Decide(0.8m, Interval(0.3m, 0.4999996m));
+
+        Assert.True(below.IntervalExcludesHalf);
+        Assert.Contains("[0.300000, 0.4999996 (shown unrounded: F6 would print 0.500000)] excludes 0.5 (below it)", below.Line);
+
+        // The lower endpoint too, and in the contains-0.5 wording as well as the excludes wording.
+        var contains = C1Verdict.Decide(0.8m, Interval(0.4999996m, 0.7m));
+        Assert.False(contains.IntervalExcludesHalf);
+        Assert.Contains("[0.4999996 (shown unrounded: F6 would print 0.500000), 0.700000] contains 0.5", contains.Line);
+    }
+
+    [Fact]
+    public void A_value_that_really_is_the_boundary_is_printed_plainly_because_the_rendering_is_exact()
+    {
+        // The annotation exists for a rendering that lies. An exact 1 and an exact 0.5 do not lie, and
+        // the clause already says which side of the boundary they fall on.
+        var median = C1Verdict.Decide(1m, Interval(0.6m, 0.7m));
+        Assert.Contains("median(RF/IM) = 1.000000 >= 1", median.Line);
+        Assert.DoesNotContain("shown unrounded", median.Line);
+
+        var endpoint = C1Verdict.Decide(0.8m, Interval(0.5m, 0.7m));
+        Assert.Contains("[0.500000, 0.700000] contains 0.5", endpoint.Line);
+        Assert.DoesNotContain("shown unrounded", endpoint.Line);
+    }
+
+    [Fact]
+    public void A_value_nowhere_near_its_boundary_keeps_the_plain_six_place_rendering()
+    {
+        var verdict = C1Verdict.Decide(0.812345m, Interval(0.531m, 0.604m));
+
+        Assert.Equal(
+            "**VERDICT: PASS** — median(RF/IM) = 0.812345 < 1 and the 95% week-clustered interval for " +
+            "P(RF < IM) = [0.531000, 0.604000] excludes 0.5 (above it).",
+            verdict.Line);
+    }
+
     [Fact]
     public void A_missing_statistic_is_not_computed_rather_than_a_fail()
     {

@@ -78,8 +78,12 @@ public static class MemoWriter
         Line(memo, $"- Minimum entry close: {Money(C1Registration.MinimumEntryPrice)}. Tradable tier: combined ATM spread <= {Num(C1Registration.TradableSpreadFraction)} x straddle mid.");
         Line(memo, $"- Calendar: {C1Registration.Calendar}. Admitted primary listings: {string.Join(", ", C1Registration.AdmittedExchanges.Order(StringComparer.Ordinal))}.");
         Line(memo, $"- Universe table: {report.Measured.UniverseRows} seed symbols, {report.Measured.UniverseEligible} eligible after the name-level gates.");
-        Line(memo, $"- Events kept after dedup: {report.EventsKeptAfterDedup}. Entering `compute`: {report.EventsEnteringCompute}. " +
-                   $"Already removed by the timing step: {report.EventsStoppedBeforeCompute} (counted at gate 07, and still listed in the event table).");
+        Line(memo, $"- Events in window and kept after dedup: {report.EventsInWindowAndKept} — the same set the timing step considers at gate 07.");
+        Line(memo, $"- Entering `compute`: {report.EventsEnteringCompute}. Quarantined by the timing step: {report.EventsQuarantinedByTimingStep} " +
+                   "(those ARE the gate-07 removals, counted there and not again here, and still listed in the event table).");
+        Line(memo, $"- With no row at all in `event_timing.csv`: {report.EventsWithNoTimingRow}. Such an event is a pipeline");
+        Line(memo, "  discontinuity, not a gate-07 quarantine; it is never folded into that tally, because a missing row");
+        Line(memo, "  presented as a gate decision is how an absent record reads as a clean one.");
         Line(memo);
 
         Line(memo, "### 1.1 Definitions fixed before compute");
@@ -188,21 +192,34 @@ public static class MemoWriter
     {
         Line(memo, "## 3. Quarantine rate");
         Line(memo);
-        var q = report.Quarantine;
-        if (q.Computable)
-        {
-            Line(memo, $"Quarantined by the timing classification (gate 07): **{q.TimingQuarantined}**.");
-            Line(memo, $"Quarantined by the two-signal price QA (gate 09): **{q.PriceQaQuarantined}**.");
-            Line(memo, $"Events considered at gate 07: **{q.TimingConsidered}**.");
-            Line(memo);
-            Line(memo, $"Quarantine rate = ({q.TimingQuarantined} + {q.PriceQaQuarantined}) / {q.TimingConsidered} = **{Num(q.Rate)}**.");
-        }
-        else
-        {
-            Line(memo, $"**Not computable.** {Text(q.Note)}");
-            Line(memo, $"Quarantined by the price QA on this run (gate 09): {q.PriceQaQuarantined}.");
-        }
+        Line(memo, "Two quarantines, each reported against ITS OWN denominator. Gate 09 decides only on the events that");
+        Line(memo, "reached it, which is a strictly smaller set than gate 07 considered, so one rate over the gate-07");
+        Line(memo, "denominator would understate how often the price QA fires on the events it actually sees.");
         Line(memo);
+
+        var q = report.Quarantine;
+        Line(memo, q.TimingComputable
+            ? $"- Timing QA (gate 07): **{q.TimingQuarantined}** quarantined of **{q.TimingConsidered}** considered = **{Num(q.TimingRate)}**."
+            : $"- Timing QA (gate 07): **{q.TimingQuarantined}** quarantined; the rate is **not computable**.");
+        Line(memo, q.PriceQaComputable
+            ? $"- Price QA (gate 09): **{q.PriceQaQuarantined}** quarantined of **{q.PriceQaConsidered}** considered = **{Num(q.PriceQaRate)}**."
+            : $"- Price QA (gate 09): **{q.PriceQaQuarantined}** quarantined; the rate is **not computable**.");
+        Line(memo);
+
+        if (q.CombinedRate is not null)
+        {
+            Line(memo, $"Combined quarantine share of the gate-07 denominator = ({q.TimingQuarantined} + {q.PriceQaQuarantined}) / {q.TimingConsidered} = **{Num(q.CombinedRate)}**.");
+            Line(memo, "That figure adds two numerators measured on different sets, so it is the share of the gate-07");
+            Line(memo, "denominator that either quarantine removed and NOT the rate at which either rule fires. The two");
+            Line(memo, "rates above are the rates.");
+            Line(memo);
+        }
+
+        if (q.Note is { Length: > 0 })
+        {
+            Line(memo, $"**Not fully computable.** {Text(q.Note)}");
+            Line(memo);
+        }
     }
 
     private static void PrimaryStatisticsSection(StringBuilder memo, C1Report report)
@@ -365,6 +382,8 @@ public static class MemoWriter
         Line(memo);
         Line(memo, $"- Bootstrap: {report.Replications} replications, registered seed {report.Seed}, SplitMix64, percentile intervals at {Percent(C1Registration.ConfidenceLevel)}.");
         Line(memo, $"- Spot used for IM — {report.Primary.Title}: {TallyText(report.Primary.SpotSources)}. {report.Secondary.Title}: {TallyText(report.Secondary.SpotSources)}.");
+        Line(memo, $"- Official close source (`closes.source`), over the {report.EventsEnteringCompute} event(s) entering `compute`: {TallyText(report.Measured.PriceSources)}. " +
+                   "RF and the minimum-price gate are measured on these closes, so the price vendor is part of what the number depends on.");
 
         var parity = report.Measured.ParityCloseDeviation;
         Line(memo, $"- |parity spot - entry close| / entry close, over the events entering `compute` that have a parity spot " +
@@ -395,7 +414,77 @@ public static class MemoWriter
         Line(memo, "  ```");
         Line(memo);
 
+        GateNineSelectionEffect(memo, report);
+        ImCollapseSection(memo, report);
+
         foreach (var warning in report.Warnings) Line(memo, $"- {warning}");
+        Line(memo);
+
+        CriterionSection(memo);
+    }
+
+    /// <summary>
+    /// What gate 09 did to the sample, printed only when it removed something. The rule itself is
+    /// quoted just above from <c>TimingQa.Describe()</c> and is deliberately NOT restated here: a
+    /// paraphrase of a gate beside the gate's own words is a second, drifting definition, and the one
+    /// that drifts is always the paraphrase. What this says instead is the count, the INPUT SURFACE,
+    /// and where the independent witness is. The input surface is a guarantee of the delegate type
+    /// the gate is handed — a timing row and a closes row — so it holds whatever rule is plugged in,
+    /// which is what lets this paragraph be written without knowing the predicate.
+    /// </summary>
+    private static void GateNineSelectionEffect(StringBuilder memo, C1Report report)
+    {
+        var removed = report.Quarantine.PriceQaQuarantined;
+        if (removed <= 0) return;
+
+        Line(memo, $"- Gate-09 selection effect: the price QA removed {removed} event(s) from this study, so the sample the");
+        Line(memo, "  verdict is measured on is the set that survived a cut, not the registered universe. What that decision");
+        Line(memo, "  is given is the event's timing row and its row of official closes — the resolved measurement dates,");
+        Line(memo, "  the official closes at those dates, and the name's own trailing 20-day median absolute daily return;");
+        Line(memo, "  which of those it weighs is the rule quoted above, not restated here. No option price reaches it, so");
+        Line(memo, "  the ratio RF/IM this study reports is never itself the quantity selected on; but the closes that ARE");
+        Line(memo, "  inputs are correlated with volatility and so with IM, which is why these removals cannot be assumed");
+        Line(memo, "  random with respect to the claim. The IM-collapse cross-tab below is the independent, options-side");
+        Line(memo, "  witness: it is computed from option prices the gate never reads, so agreement is evidence the cut");
+        Line(memo, "  landed on events that were already priced out, and disagreement is evidence that it did not.");
+    }
+
+    /// <summary>
+    /// The agreement cross-tab. Reported whether or not the two agree — a witness produced only when
+    /// it corroborates is not a witness, it is a decoration.
+    /// </summary>
+    private static void ImCollapseSection(StringBuilder memo, C1Report report)
+    {
+        var a = report.Measured.ImCollapse;
+        Line(memo, $"- IM collapse vs the gate-09 decision, over the {a.Considered} event(s) gate 09 decided on. The diagnostic is");
+        Line(memo, "  `TimingQa.ImCollapseDiagnostic`: IM at the entry snapshot divided by IM at the pre-entry snapshot, from");
+        Line(memo, $"  option prices only. Below the reference {Num(a.Threshold)} the straddle had already collapsed INTO the entry");
+        Line(memo, "  snapshot — what a print that has already happened looks like from the options side. It gates nothing and");
+        Line(memo, $"  is not part of the registered rule. Not computable for {a.NotComputable} of them, which is a column here rather");
+        Line(memo, "  than a silent drop:");
+        Line(memo);
+        Line(memo, $"| gate 09 | IM collapse < {Num(a.Threshold)} | IM collapse >= {Num(a.Threshold)} | not computable | total |");
+        Line(memo, "|---|---:|---:|---:|---:|");
+        Line(memo, $"| quarantined | {a.QuarantinedCollapsed} | {a.QuarantinedNotCollapsed} | {a.QuarantinedNotComputable} | {a.Quarantined} |");
+        Line(memo, $"| not quarantined | {a.KeptCollapsed} | {a.KeptNotCollapsed} | {a.KeptNotComputable} | {a.Kept} |");
+        Line(memo);
+    }
+
+    /// <summary>
+    /// The arithmetic property of the registered PASS condition itself. Printed on every run, passing
+    /// or failing: it is a fact about the rule, not about the data, and it is the one caveat a reader
+    /// cannot recover from any number in this memo.
+    /// </summary>
+    private static void CriterionSection(StringBuilder memo)
+    {
+        Line(memo, "### 9.3 What the registered criterion does and does not establish");
+        Line(memo);
+        Line(memo, "For any move distribution whose median absolute move is below its mean absolute move — which is every");
+        Line(memo, "symmetric one — a straddle priced at exactly the mean absolute move, carrying no premium at all, already");
+        Line(memo, "gives median(RF/IM) < 1 and P(RF < IM) > 0.5, so the registered PASS condition is satisfied by a fairly");
+        Line(memo, "priced market and is not by itself evidence of a premium in expectation. This memo executes the");
+        Line(memo, "registered rule as written and does not reinterpret it; the mean-based straddle hold-through diagnostic");
+        Line(memo, "in section 7 is the readout that speaks to a premium in expectation.");
         Line(memo);
     }
 

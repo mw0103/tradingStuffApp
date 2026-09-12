@@ -74,6 +74,7 @@ internal sealed class StudyHarness : IDisposable
         string timingClass = "AMC",
         bool quarantinedAtTiming = false,
         bool keptAfterDedup = true,
+        bool inWindow = true,
         bool withTiming = true,
         bool withCloses = true,
         bool withMeasures = true,
@@ -103,7 +104,7 @@ internal sealed class StudyHarness : IDisposable
         var straddleMid = straddleMidOverride ?? im * 100m;
 
         Events.Add(new EventRow(id, cik, symbol, $"{id}-accession", "8-K", "2.02",
-            new DateOnly(2024, 2, 1), new DateOnly(2024, 2, 1), new DateTime(2024, 2, 1, 16, 30, 0), true, keptAfterDedup, null));
+            new DateOnly(2024, 2, 1), new DateOnly(2024, 2, 1), new DateTime(2024, 2, 1, 16, 30, 0), inWindow, keptAfterDedup, null));
 
         if (withTiming)
         {

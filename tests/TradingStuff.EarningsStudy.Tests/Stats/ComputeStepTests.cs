@@ -267,20 +267,26 @@ public sealed class ComputeStepTests
     }
 
     [Fact]
-    public async Task The_quarantine_rate_adds_the_timing_and_price_qa_quarantines_over_the_gate_07_denominator()
+    public async Task Each_quarantine_rate_is_reported_against_its_own_denominator()
     {
         using var study = new StudyHarness();
         study.PriceQa = (timing, _) => new TimingQaResult(timing.EventId == "q", "post-print entry", null, null);
-        study.AddEvent("q").AddEvent("a").AddEvent("b");
+        study.AddEvent("q").AddEvent("a").AddEvent("b").AddEvent("no-closes", withCloses: false);
 
         Assert.Equal(0, await study.RunAsync("--reps", "20"));
 
-        // The ledger says 4 quarantined by timing out of 100 considered; this run quarantined 1 more.
-        Assert.Contains("Quarantine rate = (4 + 1) / 100 = **0.050000**", study.Memo);
+        // The ledger says 4 quarantined by timing out of 100 considered. Gate 08 then removed the
+        // event with no closes, so gate 09 decided on 3 and quarantined 1 of THOSE — not 1 of 100.
+        Assert.Contains("- Timing QA (gate 07): **4** quarantined of **100** considered = **0.040000**.", study.Memo);
+        Assert.Contains("- Price QA (gate 09): **1** quarantined of **3** considered = **0.333333**.", study.Memo);
+
+        // The combined figure may stay, but only labelled as the share of the gate-07 denominator.
+        Assert.Contains("Combined quarantine share of the gate-07 denominator = (4 + 1) / 100 = **0.050000**.", study.Memo);
+        Assert.Contains("NOT the rate at which either rule fires", study.Memo);
     }
 
     [Fact]
-    public async Task Without_a_gate_07_row_the_quarantine_rate_is_absent_rather_than_zero()
+    public async Task Without_a_gate_07_row_the_timing_rate_is_absent_rather_than_zero_and_the_price_qa_rate_still_stands()
     {
         using var study = new StudyHarness();
         study.GateCounts.RemoveAll(c => c.Gate == Gates.TimingClassified);
@@ -288,10 +294,185 @@ public sealed class ComputeStepTests
 
         Assert.Equal(0, await study.RunAsync("--reps", "20"));
 
-        Assert.Contains("**Not computable.**", study.Memo);
+        Assert.Contains("- Timing QA (gate 07): **0** quarantined; the rate is **not computable**.", study.Memo);
+        Assert.Contains("- Price QA (gate 09): **0** quarantined of **2** considered = **0.000000**.", study.Memo);
         Assert.Contains("It is absent, not zero.", study.Memo);
+        Assert.DoesNotContain("Combined quarantine share", study.Memo);
         Assert.Contains("| 7 | `07_timing_classified_bmo_or_amc` | (not recorded) |", study.Memo);
         Assert.Contains("registered gate(s) have no row in gate_counts.csv", study.Memo);
+    }
+
+    [Fact]
+    public async Task With_nothing_reaching_gate_09_the_price_qa_rate_is_absent_rather_than_zero()
+    {
+        using var study = new StudyHarness();
+        study.AddEvent("no-closes", withCloses: false);
+
+        Assert.Equal(0, await study.RunAsync("--reps", "20"));
+
+        Assert.Contains("- Price QA (gate 09): **0** quarantined; the rate is **not computable**.", study.Memo);
+        Assert.Contains("gate 09 considered no events, so the price-QA rate has no denominator.", study.Memo);
+    }
+
+    [Fact]
+    public async Task The_im_collapse_diagnostic_is_computed_per_event_and_carried_with_its_two_pre_entry_inputs()
+    {
+        using var study = new StudyHarness();
+        study.AddEvent("collapsed").AddEvent("steady").AddEvent("not-computable");
+
+        // IM(entry) = 8/100 = 0.08. Pre-entry straddle 20 on a spot of 100 -> IM(pre-entry) = 0.20,
+        // so the ratio is 0.4: the straddle crushed into the entry snapshot.
+        SetPreEntry(study, "collapsed", 20m);
+        SetPreEntry(study, "steady", 8m);
+        SetPreEntry(study, "not-computable", null);
+
+        Assert.Equal(0, await study.RunAsync("--reps", "20"));
+
+        var collapsed = study.Row("collapsed");
+        Assert.Equal(20m, collapsed.StraddleMidPreEntry);
+        Assert.Equal(100m, collapsed.SpotParityPreEntry);
+        Assert.Equal(0.4m, collapsed.ImCollapseRatio);
+
+        Assert.Equal(1m, study.Row("steady").ImCollapseRatio);
+
+        // No pre-entry straddle: the diagnostic is null, not a default, and the column says so.
+        Assert.Null(study.Row("not-computable").ImCollapseRatio);
+        Assert.Null(study.Row("not-computable").StraddleMidPreEntry);
+
+        // The column is the same number TimingQa computes; this verb keeps no second copy of the rule.
+        Assert.Equal(TimingQa.ImCollapseDiagnostic(study.Measures[0]), collapsed.ImCollapseRatio);
+    }
+
+    [Fact]
+    public async Task The_im_collapse_cross_tab_counts_match_a_hand_built_table()
+    {
+        using var study = new StudyHarness();
+        study.PriceQa = (timing, _) => new TimingQaResult(
+            timing.EventId.StartsWith('q'), "late filing suspected", 0.09m, 0.01m);
+
+        // Gate 09 sees six events. Hand-built, with IM(entry) = 0.08 throughout and the reference 0.60:
+        //   q-collapsed      quarantined,     pre-entry IM 0.20 -> 0.400000  collapsed
+        //   q-steady         quarantined,     pre-entry IM 0.08 -> 1.000000  not collapsed
+        //   q-unknown        quarantined,     no pre-entry straddle -> null  not computable
+        //   k-collapsed      not quarantined, pre-entry IM 0.16 -> 0.500000  collapsed
+        //   k-steady-a       not quarantined, pre-entry IM 0.10 -> 0.800000  not collapsed
+        //   k-steady-b       not quarantined, pre-entry IM 0.08 -> 1.000000  not collapsed
+        // and one event that never reaches gate 09 at all, which must not appear in the table.
+        study.AddEvent("q-collapsed").AddEvent("q-steady").AddEvent("q-unknown")
+             .AddEvent("k-collapsed").AddEvent("k-steady-a").AddEvent("k-steady-b")
+             .AddEvent("never-reaches-gate-09", withCloses: false);
+
+        SetPreEntry(study, "q-collapsed", 20m);
+        SetPreEntry(study, "q-steady", 8m);
+        SetPreEntry(study, "q-unknown", null);
+        SetPreEntry(study, "k-collapsed", 16m);
+        SetPreEntry(study, "k-steady-a", 10m);
+        SetPreEntry(study, "k-steady-b", 8m);
+        SetPreEntry(study, "never-reaches-gate-09", 20m);
+
+        Assert.Equal(0, await study.RunAsync("--reps", "20"));
+
+        Assert.Contains("IM collapse vs the gate-09 decision, over the 6 event(s) gate 09 decided on.", study.Memo);
+        Assert.Contains("Not computable for 1 of them", study.Memo);
+        Assert.Contains("| gate 09 | IM collapse < 0.600000 | IM collapse >= 0.600000 | not computable | total |", study.Memo);
+        Assert.Contains("| quarantined | 1 | 1 | 1 | 3 |", study.Memo);
+        Assert.Contains("| not quarantined | 1 | 2 | 0 | 3 |", study.Memo);
+
+        // The cross-tab is recomputable from the event table, which is the point of carrying the columns.
+        var decided = study.EventTable.Where(r => r.PriceQa is "ok" or "quarantined").ToList();
+        Assert.Equal(6, decided.Count);
+        Assert.Equal(1, decided.Count(r => r.PriceQa == "quarantined" && r.ImCollapseRatio < 0.60m));
+        Assert.Equal(1, decided.Count(r => r.PriceQa == "quarantined" && r.ImCollapseRatio >= 0.60m));
+        Assert.Equal(1, decided.Count(r => r.PriceQa == "quarantined" && r.ImCollapseRatio is null));
+        Assert.Equal(1, decided.Count(r => r.PriceQa == "ok" && r.ImCollapseRatio < 0.60m));
+        Assert.Equal(2, decided.Count(r => r.PriceQa == "ok" && r.ImCollapseRatio >= 0.60m));
+        Assert.Equal(0, decided.Count(r => r.PriceQa == "ok" && r.ImCollapseRatio is null));
+    }
+
+    [Fact]
+    public async Task Gate_09_removing_an_event_puts_its_selection_effect_in_the_limitations()
+    {
+        using var study = new StudyHarness();
+        study.PriceQa = (timing, _) => new TimingQaResult(timing.EventId == "late", "late filing suspected", 0.09m, 0.01m);
+        study.AddEvent("late").AddEvent("a").AddEvent("b");
+
+        Assert.Equal(0, await study.RunAsync("--reps", "20"));
+
+        Assert.Contains("Gate-09 selection effect: the price QA removed 1 event(s) from this study", study.Memo);
+        Assert.Contains("which of those it weighs is the rule quoted above, not restated here", study.Memo);
+        Assert.Contains("The IM-collapse cross-tab below is the independent, options-side", study.Memo);
+
+        // The limitation states the rule's INPUTS, and leaves the predicate to the quoted sentence: a
+        // paraphrase here would be a second definition, and it is the paraphrase that drifts.
+        Assert.Contains("is given is the event's timing row and its row of official closes", study.Memo);
+        Assert.Contains("name's own trailing 20-day median absolute daily return", study.Memo);
+        Assert.Contains("No option price reaches it", study.Memo);
+
+        // The predicate appears in the memo exactly once, inside the quoted rule, and nowhere else.
+        Assert.DoesNotContain("larger than the absolute event move", study.Memo.Replace(TimingQa.Describe(), ""));
+    }
+
+    [Fact]
+    public async Task A_run_where_gate_09_removed_nothing_claims_no_selection_effect()
+    {
+        using var study = new StudyHarness();
+        study.AddEvent("a").AddEvent("b");
+
+        Assert.Equal(0, await study.RunAsync("--reps", "20"));
+
+        Assert.DoesNotContain("Gate-09 selection effect", study.Memo);
+
+        // The cross-tab is printed either way: a witness shown only when it agrees is not a witness.
+        Assert.Contains("IM collapse vs the gate-09 decision, over the 2 event(s) gate 09 decided on.", study.Memo);
+    }
+
+    [Fact]
+    public async Task The_memo_states_what_the_registered_criterion_does_not_establish()
+    {
+        using var study = new StudyHarness();
+        study.AddEvent("a").AddEvent("b");
+
+        Assert.Equal(0, await study.RunAsync("--reps", "20"));
+
+        Assert.Contains(
+            "For any move distribution whose median absolute move is below its mean absolute move — which is every\n" +
+            "symmetric one — a straddle priced at exactly the mean absolute move, carrying no premium at all, already\n" +
+            "gives median(RF/IM) < 1 and P(RF < IM) > 0.5, so the registered PASS condition is satisfied by a fairly\n" +
+            "priced market and is not by itself evidence of a premium in expectation. This memo executes the\n" +
+            "registered rule as written and does not reinterpret it; the mean-based straddle hold-through diagnostic\n" +
+            "in section 7 is the readout that speaks to a premium in expectation.",
+            study.Memo);
+    }
+
+    [Fact]
+    public async Task The_memo_names_the_source_of_the_official_closes()
+    {
+        using var study = new StudyHarness();
+        study.AddEvent("a").AddEvent("b").AddEvent("other-vendor").AddEvent("no-closes", withCloses: false);
+        study.Closes[2] = study.Closes[2] with { Source = "polygon" };
+
+        Assert.Equal(0, await study.RunAsync("--reps", "20"));
+
+        // Four events entering compute, and the tally sums to four: the event with no closes row is a
+        // named bucket rather than a row that quietly leaves the denominator.
+        Assert.Contains("Official close source (`closes.source`), over the 4 event(s) entering `compute`: " +
+                        "(no source recorded) 1, ibkr 2, polygon 1.", study.Memo);
+    }
+
+    /// <summary>
+    /// Gives one event the pre-entry snapshot the IM-collapse diagnostic needs. Both parity spots are
+    /// set: the diagnostic divides IM by IM, so it needs a spot at BOTH snapshots, and the harness's
+    /// default event is quoted off a feed spot with no parity spot at all.
+    /// </summary>
+    private static void SetPreEntry(StudyHarness study, string eventId, decimal? straddleMidPreEntry)
+    {
+        var index = study.Measures.FindIndex(m => m.EventId == eventId);
+        study.Measures[index] = study.Measures[index] with
+        {
+            StraddleMidPreEntry = straddleMidPreEntry,
+            SpotParityPreEntry = 100m,
+            SpotParityEntry = 100m
+        };
     }
 
     [Fact]
@@ -357,7 +538,8 @@ public sealed class ComputeStepTests
             "### 6.3 DTE <= 7 vs > 7",
             "### 6.4 BMO vs AMC",
             "### 9.1 Registered v0 biases",
-            "### 9.2 Measured in this run"
+            "### 9.2 Measured in this run",
+            "### 9.3 What the registered criterion does and does not establish"
         ], subheadings);
     }
 
@@ -495,7 +677,7 @@ public sealed class ComputeStepTests
         }
 
         Assert.Contains("this gate's tally is absent, not zero", study.Memo);
-        Assert.Contains("**Not computable.**", study.Memo);
+        Assert.Contains("- Timing QA (gate 07): **0** quarantined; the rate is **not computable**.", study.Memo);
         Assert.Equal(6, study.WrittenGateCounts.Count);
     }
 

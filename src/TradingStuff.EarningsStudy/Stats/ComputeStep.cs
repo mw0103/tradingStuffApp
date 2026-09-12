@@ -101,7 +101,14 @@ public sealed class ComputeStep(
         if (FirstDuplicate(closes.Select(c => c.EventId)) is { } dupClose) return Refuse(context, $"closes.csv has more than one row for event_id '{dupClose}'.");
         if (FirstDuplicate(measures.Select(m => m.EventId)) is { } dupMeasure) return Refuse(context, $"option_measures.csv has more than one row for event_id '{dupMeasure}'.");
 
-        var kept = events.Where(e => e.KeptAfterDedup).OrderBy(e => e.EventId, StringComparer.Ordinal).ToList();
+        // The SAME predicate TimingStep uses to pick its considered set. Filtering on KeptAfterDedup
+        // alone admits out-of-window events the timing step never wrote a row for, and this verb then
+        // reads that absence as a gate-07 removal — a missing row rendering as a gate decision
+        // (docs/STATE.md, class (c)). Gates 04-06 are the events verb's to tally; this set is what
+        // survived them.
+        var kept = events.Where(e => e is { InWindow: true, KeptAfterDedup: true })
+            .OrderBy(e => e.EventId, StringComparer.Ordinal)
+            .ToList();
         var timingById = timings.ToDictionary(t => t.EventId, StringComparer.Ordinal);
         var closesById = closes.ToDictionary(c => c.EventId, StringComparer.Ordinal);
         var measuresById = measures.ToDictionary(m => m.EventId, StringComparer.Ordinal);
@@ -119,24 +126,32 @@ public sealed class ComputeStep(
             works.Add(work);
         }
 
-        // The set that ENTERS compute: kept by the events verb and classified, un-quarantined, by the
-        // timing verb. Events the timing step already removed keep a row in the event table — their
-        // removal is tallied by that step at gate 07, so counting them again here would double-count.
+        // The set that ENTERS compute: carried in by the events verb and classified, un-quarantined,
+        // by the timing verb. The two ways of not entering are counted SEPARATELY and never summed
+        // into one figure:
+        //
+        //   quarantined  - the timing step wrote a row saying so. This IS a gate-07 removal and is
+        //                  tallied by that step, so counting it again here would double-count.
+        //   no timing row - the timing step wrote nothing for an event it should have considered.
+        //                  That is a pipeline discontinuity, not a decision anyone made; presenting
+        //                  it as a gate-07 removal turns a missing row into a clean-looking gate
+        //                  tally, which is how absence renders as health (docs/LESSONS.md §3).
         var entering = new List<EventWork>(works.Count);
-        var stoppedBeforeCompute = 0;
+        var quarantinedByTimingStep = 0;
+        var noTimingRow = 0;
         foreach (var work in works)
         {
             if (work.Timing is null)
             {
                 work.StopGate = Gates.TimingClassified;
                 work.AddNote("no row in event_timing.csv");
-                stoppedBeforeCompute++;
+                noTimingRow++;
             }
             else if (work.Timing.Quarantined)
             {
                 work.StopGate = Gates.TimingClassified;
                 work.AddNote($"quarantined by the timing step: {work.Timing.QuarantineReason ?? "no reason given"}");
-                stoppedBeforeCompute++;
+                quarantinedByTimingStep++;
             }
             else
             {
@@ -245,8 +260,8 @@ public sealed class ComputeStep(
 
         var gateCounts = priorGateCounts.Where(r => !string.Equals(r.Step, StepName, StringComparison.Ordinal)).Concat(counts).ToList();
         var report = BuildReport(
-            verdict, primary, secondary, gateCounts, required, universe, entering, timings, orphans,
-            options, qaDescription, stoppedBeforeCompute, kept.Count);
+            verdict, primary, secondary, gateCounts, required, universe, entering, afterCloses, timings, orphans,
+            options, qaDescription, quarantinedByTimingStep, noTimingRow, kept.Count);
 
         CsvFile.Write(paths.EventTable, works.Select(w => w.ToRow()));
         CsvFile.Write(paths.GateCounts, gateCounts);
@@ -256,6 +271,10 @@ public sealed class ComputeStep(
         {
             context.Log($"gate {row.Order} {row.Gate}: considered {row.Considered}, removed {row.Removed}, remaining {row.Remaining}");
         }
+
+        // The memo carries these too, but an operator watching the run should not have to open a file
+        // to learn that the pipeline did not reconcile.
+        foreach (var warning in report.Warnings) context.Log($"WARNING {warning}");
 
         context.Log($"event table: {paths.EventTable} ({works.Count} rows)");
         context.Log($"memo: {paths.Memo}");
@@ -338,6 +357,12 @@ public sealed class ComputeStep(
 
         if (work.Measures is { } m)
         {
+            // IM at entry / IM at pre-entry, from WP2's own function rather than a second copy of the
+            // arithmetic here. Diagnostic only: it gates nothing, and it is computed for every event
+            // that has an option_measures row whatever gate removed the event, because its whole use
+            // is to be compared against gate 09's decision on the events gate 09 decided.
+            work.ImCollapse = TimingQa.ImCollapseDiagnostic(m);
+
             if (m.SpotFeedEntry is { } feed)
             {
                 work.SpotForIm = feed;
@@ -550,27 +575,26 @@ public sealed class ComputeStep(
         (string Name, string Path)[] inputs,
         List<UniverseRow> universe,
         List<EventWork> entering,
+        List<EventWork> consideredAtPriceQa,
         List<EventTimingRow> timings,
         List<Tally> orphans,
         ComputeOptions options,
         string priceQaDescription,
-        int stoppedBeforeCompute,
-        int keptAfterDedup)
+        int quarantinedByTimingStep,
+        int noTimingRow,
+        int inWindowAndKept)
     {
         var recognised = gateCounts.Where(r => GateOrder(r.Gate) > 0).OrderBy(r => GateOrder(r.Gate)).ToList();
         var unrecognised = gateCounts.Where(r => GateOrder(r.Gate) == 0).ToList();
         var withoutCounts = Gates.InOrder.Where(g => !gateCounts.Any(r => string.Equals(r.Gate, g, StringComparison.Ordinal))).ToList();
 
         var timingGateRows = gateCounts.Where(r => string.Equals(r.Gate, Gates.TimingClassified, StringComparison.Ordinal)).ToList();
-        var priceQaQuarantined = gateCounts
+        var priceQaRows = gateCounts
             .Where(r => string.Equals(r.Step, StepName, StringComparison.Ordinal) && string.Equals(r.Gate, Gates.PriceQa, StringComparison.Ordinal))
-            .Sum(r => r.Removed);
+            .ToList();
 
         // The last row wins: a re-run of the timing verb appends a fresh tally rather than editing one.
-        var quarantine = timingGateRows.Count == 0
-            ? new QuarantineRate(false, 0, 0, priceQaQuarantined, null,
-                $"gate_counts.csv has no row for {Gates.TimingClassified}, so the denominator (events considered at gate 07) is not recorded. It is absent, not zero.")
-            : Rate(timingGateRows[^1], priceQaQuarantined);
+        var quarantine = Rate(timingGateRows.Count == 0 ? null : timingGateRows[^1], priceQaRows.Count == 0 ? null : priceQaRows[^1]);
 
         var measured = new MeasuredContext(
             entering.Where(w => w.Measures is not null)
@@ -581,6 +605,13 @@ public sealed class ComputeStep(
                 .GroupBy(w => w.Measures!.SnapshotTimeEt ?? "(none recorded)", StringComparer.Ordinal)
                 .OrderBy(g => g.Key, StringComparer.Ordinal)
                 .Select(g => new Tally(g.Key, g.Count())).ToList(),
+            // Every event entering compute is tallied, including the ones with no closes row: a source
+            // tally that silently covered only the events that HAVE a source would read as complete
+            // coverage of a partial table.
+            entering
+                .GroupBy(w => string.IsNullOrWhiteSpace(w.Closes?.Source) ? NoPriceSource : w.Closes!.Source, StringComparer.Ordinal)
+                .OrderBy(g => g.Key, StringComparer.Ordinal)
+                .Select(g => new Tally(g.Key, g.Count())).ToList(),
             Statistics.Quantiles([.. entering.Where(w => w.ParityCloseDeviation is not null).Select(w => w.ParityCloseDeviation!.Value)]),
             [.. timingGateRows.Where(r => !string.IsNullOrEmpty(r.Note)).Select(r => r.Note!)],
             timings.Where(t => t.Quarantined)
@@ -588,6 +619,7 @@ public sealed class ComputeStep(
                 .OrderBy(g => g.Key, StringComparer.Ordinal)
                 .Select(g => new Tally(g.Key, g.Count())).ToList(),
             orphans,
+            Agreement(consideredAtPriceQa),
             universe.Count,
             universe.Count(u => u.Eligible));
 
@@ -595,6 +627,25 @@ public sealed class ComputeStep(
         if (withoutCounts.Count > 0)
         {
             warnings.Add($"{withoutCounts.Count} registered gate(s) have no row in gate_counts.csv; the exclusion table shows them as absent rather than as zero.");
+        }
+
+        // An event this verb carried in but the timing step never wrote a row for. It is NOT a gate-07
+        // removal — nobody decided anything about it — and the two counts are never added together.
+        if (noTimingRow > 0)
+        {
+            warnings.Add($"{noTimingRow} event(s) in window and kept after dedup have NO row in event_timing.csv. " +
+                         "That is a pipeline discontinuity, not a gate-07 quarantine: it is reported separately in section 1 and " +
+                         "counted in neither the gate-07 tally nor the quarantine rate. Whatever produced it, event_timing.csv is " +
+                         "not the table this events.csv implies. Re-run the timing verb before reading the statistics.");
+        }
+
+        // The gate-07 ledger's own remaining count against what actually arrived here. They are the
+        // same set by construction, so a difference is a stale ledger or a lost row either way.
+        if (timingGateRows.Count > 0 && timingGateRows[^1].Remaining != entering.Count)
+        {
+            warnings.Add($"gate 07 records {timingGateRows[^1].Remaining} event(s) remaining, but {entering.Count} entered compute. " +
+                         "The exclusion table and this run disagree about the same set; the gate ledger is stale, or event_timing.csv " +
+                         "does not match events.csv. Neither number is silently preferred.");
         }
 
         if (primary.UnmeasurableEvents.Count > 0 || secondary.UnmeasurableEvents.Count > 0)
@@ -612,25 +663,90 @@ public sealed class ComputeStep(
             quarantine,
             [.. inputs.Select(i => new InputFile(i.Name, RowCount(i.Path), Sha256(i.Path)))],
             measured,
-            keptAfterDedup,
+            inWindowAndKept,
             entering.Count,
-            stoppedBeforeCompute,
+            quarantinedByTimingStep,
+            noTimingRow,
             options.Replications,
             options.Seed,
             priceQaDescription,
             warnings);
     }
 
-    private static QuarantineRate Rate(GateCountRow gate07, int priceQaQuarantined)
+    /// <summary>The tally key for an event with no <c>closes.csv</c> row, or one whose source cell is blank.</summary>
+    private const string NoPriceSource = "(no source recorded)";
+
+    /// <summary>
+    /// The two quarantine rates, each over its own denominator. Gate 09 only ever decides on the
+    /// events that reached it, so its removals divided by gate 07's denominator would be a smaller
+    /// number than the rate at which the rule fires — the two are measured apart and the combined
+    /// figure is labelled for what it is where the memo prints it.
+    /// </summary>
+    private static QuarantineRate Rate(GateCountRow? gate07, GateCountRow? gate09)
     {
-        if (gate07.Considered <= 0)
+        var notes = new List<string>();
+        if (gate07 is null)
         {
-            return new QuarantineRate(false, gate07.Considered, gate07.Removed, priceQaQuarantined, null,
-                "gate 07 considered no events, so the quarantine rate has no denominator.");
+            notes.Add($"gate_counts.csv has no row for {Gates.TimingClassified}, so the timing-QA denominator (events considered at gate 07) is not recorded. It is absent, not zero.");
+        }
+        else if (gate07.Considered <= 0)
+        {
+            notes.Add("gate 07 considered no events, so the timing-QA rate has no denominator.");
         }
 
-        return new QuarantineRate(true, gate07.Considered, gate07.Removed, priceQaQuarantined,
-            (decimal)(gate07.Removed + priceQaQuarantined) / gate07.Considered, null);
+        if (gate09 is null)
+        {
+            notes.Add($"this run wrote no row for {Gates.PriceQa}, so the price-QA rate has no denominator. It is absent, not zero.");
+        }
+        else if (gate09.Considered <= 0)
+        {
+            notes.Add("gate 09 considered no events, so the price-QA rate has no denominator.");
+        }
+
+        var timingComputable = gate07 is { Considered: > 0 };
+        var priceQaComputable = gate09 is { Considered: > 0 };
+
+        return new QuarantineRate(
+            timingComputable,
+            gate07?.Considered ?? 0,
+            gate07?.Removed ?? 0,
+            timingComputable ? (decimal)gate07!.Removed / gate07.Considered : null,
+            priceQaComputable,
+            gate09?.Considered ?? 0,
+            gate09?.Removed ?? 0,
+            priceQaComputable ? (decimal)gate09!.Removed / gate09.Considered : null,
+            timingComputable && gate09 is not null ? (decimal)(gate07!.Removed + gate09.Removed) / gate07.Considered : null,
+            notes.Count == 0 ? null : string.Join(" ", notes));
+    }
+
+    /// <summary>
+    /// The gate-09 decision against the options-side IM-collapse diagnostic, over the events gate 09
+    /// decided on and no others: an event that never reached the gate has no gate-09 decision to
+    /// agree or disagree with, so including it would invent one.
+    /// </summary>
+    private static ImCollapseAgreement Agreement(List<EventWork> consideredAtPriceQa)
+    {
+        int qCollapsed = 0, qNot = 0, qUnknown = 0, kCollapsed = 0, kNot = 0, kUnknown = 0;
+        foreach (var work in consideredAtPriceQa)
+        {
+            var quarantined = work.Qa?.Quarantined == true;
+            if (work.ImCollapse is not { } ratio)
+            {
+                if (quarantined) qUnknown++; else kUnknown++;
+            }
+            else if (ratio < TimingQa.ImCollapseThreshold)
+            {
+                if (quarantined) qCollapsed++; else kCollapsed++;
+            }
+            else
+            {
+                if (quarantined) qNot++; else kNot++;
+            }
+        }
+
+        return new ImCollapseAgreement(
+            consideredAtPriceQa.Count, TimingQa.ImCollapseThreshold,
+            qCollapsed, qNot, qUnknown, kCollapsed, kNot, kUnknown);
     }
 
     /// <summary>
@@ -680,6 +796,7 @@ public sealed class ComputeStep(
         public TimingQaResult? Qa { get; set; }
         public string SpotSource { get; set; } = "none";
         public decimal? SpotForIm { get; set; }
+        public decimal? ImCollapse { get; set; }
         public decimal? RealizedMove { get; set; }
         public decimal? ImpliedMove { get; set; }
         public decimal? Ratio { get; set; }
@@ -745,6 +862,9 @@ public sealed class ComputeStep(
             Measures?.StraddleMidEntry,
             Measures?.CombinedSpreadEntry,
             SpreadFraction,
+            Measures?.StraddleMidPreEntry,
+            Measures?.SpotParityPreEntry,
+            ImCollapse,
             Measures?.StraddleMidExit,
             StraddleReturn,
             RealizedMove,

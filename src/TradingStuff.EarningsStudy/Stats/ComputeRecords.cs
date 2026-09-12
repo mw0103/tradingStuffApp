@@ -14,6 +14,9 @@ namespace TradingStuff.EarningsStudy.Stats;
 /// <param name="ClusterKey">The bootstrap cluster: the earnings week, or <c>unknown-week:{event_id}</c> when the timing step recorded none — a singleton, counted and reported.</param>
 /// <param name="PriceQa">ok | quarantined | unknown | not_reached.</param>
 /// <param name="SpotSource">feed | parity | none — which spot the implied move was divided by.</param>
+/// <param name="StraddleMidPreEntry">The straddle mid at the PRE-ENTRY snapshot, carried so <paramref name="ImCollapseRatio"/> can be recomputed from this file by hand.</param>
+/// <param name="SpotParityPreEntry">The parity spot at the PRE-ENTRY snapshot, carried for the same reason.</param>
+/// <param name="ImCollapseRatio">IM at entry / IM at pre-entry (<c>TimingQa.ImCollapseDiagnostic</c>). Diagnostic only — it gates nothing. Null when any of the four inputs is missing or non-positive.</param>
 /// <param name="StopGate">The gate that removed the event; empty when it survived every gate.</param>
 /// <param name="Membership">primary | secondary | empty. The primary (tradable) sample is a SUBSET of the secondary (all-quotable) sample; <paramref name="InPrimary"/> and <paramref name="InSecondary"/> are the authoritative flags and a primary event has both set.</param>
 public sealed record C1EventRow(
@@ -53,6 +56,9 @@ public sealed record C1EventRow(
     decimal? StraddleMidEntry,
     decimal? CombinedSpreadEntry,
     decimal? SpreadFraction,
+    decimal? StraddleMidPreEntry,
+    decimal? SpotParityPreEntry,
+    decimal? ImCollapseRatio,
     decimal? StraddleMidExit,
     decimal? StraddleReturn,
     decimal? RealizedMove,
@@ -159,30 +165,74 @@ public sealed record SampleReport(
     IReadOnlyList<Tally> SpotSources,
     IReadOnlyList<SplitReport> Splits);
 
-/// <summary>The quarantine rate, with its parts kept visible so the memo never shows a bare ratio.</summary>
+/// <summary>
+/// The two quarantine rates, each against ITS OWN denominator, with the parts kept visible so the
+/// memo never shows a bare ratio.
+///
+/// Gate 09 decides only on the events that reached it, which is a strictly smaller set than gate 07
+/// considered (gates 07 and 08 come first). Dividing both numerators by the gate-07 denominator
+/// understates the price-QA rate by exactly the events it never saw, so the two are reported apart.
+/// <paramref name="CombinedRate"/> is kept for continuity and labelled in the memo as the share of
+/// the gate-07 denominator that either quarantine removed — a coverage headline, not a rate.
+/// </summary>
 public sealed record QuarantineRate(
-    bool Computable,
+    bool TimingComputable,
     int TimingConsidered,
     int TimingQuarantined,
+    decimal? TimingRate,
+    bool PriceQaComputable,
+    int PriceQaConsidered,
     int PriceQaQuarantined,
-    decimal? Rate,
+    decimal? PriceQaRate,
+    decimal? CombinedRate,
     string? Note);
+
+/// <summary>
+/// How often the registered gate-09 decision and the options-side IM-collapse diagnostic agree, over
+/// the events gate 09 actually decided on. A 2 x 2 with the not-computable column kept, so the rows
+/// sum to the events considered rather than quietly shedding the events the diagnostic could not
+/// measure (docs/LESSONS.md §3).
+/// </summary>
+/// <param name="Threshold">The reference below which the diagnostic reads as a collapse. Diagnostic only; no gate reads it.</param>
+public sealed record ImCollapseAgreement(
+    int Considered,
+    decimal Threshold,
+    int QuarantinedCollapsed,
+    int QuarantinedNotCollapsed,
+    int QuarantinedNotComputable,
+    int KeptCollapsed,
+    int KeptNotCollapsed,
+    int KeptNotComputable)
+{
+    public int Quarantined => QuarantinedCollapsed + QuarantinedNotCollapsed + QuarantinedNotComputable;
+
+    public int Kept => KeptCollapsed + KeptNotCollapsed + KeptNotComputable;
+
+    public int NotComputable => QuarantinedNotComputable + KeptNotComputable;
+}
 
 /// <summary>One input table's provenance line.</summary>
 public sealed record InputFile(string Name, int Rows, string Sha256);
 
 /// <summary>The measured limitations: what this run observed, as opposed to the registered ones.</summary>
+/// <param name="PriceSources">A tally of <c>closes.source</c> over the events entering compute, so the memo names where the official closes came from rather than leaving the reader to assume.</param>
+/// <param name="ImCollapse">The gate-09 / IM-collapse agreement cross-tab.</param>
 public sealed record MeasuredContext(
     IReadOnlyList<Tally> SnapshotKinds,
     IReadOnlyList<Tally> SnapshotTimes,
+    IReadOnlyList<Tally> PriceSources,
     QuantileSummary ParityCloseDeviation,
     IReadOnlyList<string> TimingGateNotes,
     IReadOnlyList<Tally> TimingQuarantineReasons,
     IReadOnlyList<Tally> OrphanRows,
+    ImCollapseAgreement ImCollapse,
     int UniverseRows,
     int UniverseEligible);
 
 /// <summary>The whole memo, assembled before a line of markdown is written.</summary>
+/// <param name="EventsInWindowAndKept">Rows of <c>events.csv</c> that are BOTH in window and kept after dedup — the same predicate the timing step considers at gate 07, so the two denominators are the same set.</param>
+/// <param name="EventsQuarantinedByTimingStep">Events whose <c>event_timing.csv</c> row says quarantined. These ARE the gate-07 removals and are tallied there, never again here.</param>
+/// <param name="EventsWithNoTimingRow">Events with no row in <c>event_timing.csv</c> at all. A pipeline discontinuity, warned about and reported separately: folding it into the gate-07 removal count would render a missing file as a gate decision (docs/STATE.md, class (c)).</param>
 public sealed record C1Report(
     C1Verdict Verdict,
     SampleReport Primary,
@@ -193,9 +243,10 @@ public sealed record C1Report(
     QuarantineRate Quarantine,
     IReadOnlyList<InputFile> Inputs,
     MeasuredContext Measured,
-    int EventsKeptAfterDedup,
+    int EventsInWindowAndKept,
     int EventsEnteringCompute,
-    int EventsStoppedBeforeCompute,
+    int EventsQuarantinedByTimingStep,
+    int EventsWithNoTimingRow,
     int Replications,
     int Seed,
     string PriceQaDescription,
