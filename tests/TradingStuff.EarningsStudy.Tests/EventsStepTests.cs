@@ -275,6 +275,10 @@ public sealed class EventsStepTests
         Assert.Equal(4, q1_2023.Count); // SAMP's F-A/F-B + SAMP2's F-A/F-B
         Assert.Equal(1, q1_2023.Count(e => e.KeptAfterDedup));
 
+        // The same filing under two share classes is an exact tie on acceptance; the kept class is
+        // the ordinal-lower symbol, not whichever the seed file listed first.
+        Assert.Equal("SAMP", q1_2023.Single(e => e.KeptAfterDedup).Symbol);
+
         // companyfacts is a property of the filer, not of the ticker: fetched/emitted once per CIK.
         Assert.Equal(2, sharesFacts.Count(r => r.Cik == 1000001));
     }

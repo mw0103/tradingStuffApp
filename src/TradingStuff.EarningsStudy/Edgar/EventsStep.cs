@@ -120,8 +120,9 @@ public sealed class EventsStep(
     /// specific case, equals the loser's own AccessionNumber — same filing, different Symbol row).
     /// Mutates by list index rather than an EventId-keyed lookup because EventId
     /// ($"{cik}:{accessionNumber}") is exactly the case that collides for that shared-CIK scenario.
-    /// Ties (identical acceptance instants) are broken by <c>OrderBy</c>'s stable sort, i.e. by
-    /// whichever row was encountered first — first filing wins, extended to an exact tie.
+    /// Ties (identical acceptance instants — in practice the same filing carried by two share
+    /// classes) are broken by ordinal symbol, so the kept class does not depend on the order the
+    /// seed file happened to list the symbols in.
     /// </summary>
     private static void ResolveDedup(List<EventRow> events)
     {
@@ -132,7 +133,7 @@ public sealed class EventsStep(
 
         foreach (var group in candidates)
         {
-            var ordered = group.OrderBy(x => x.Event.AcceptanceEt).ToList();
+            var ordered = group.OrderBy(x => x.Event.AcceptanceEt).ThenBy(x => x.Event.Symbol, StringComparer.Ordinal).ToList();
             var kept = ordered[0];
             events[kept.Index] = kept.Event with { KeptAfterDedup = true, DedupNote = null };
             foreach (var loser in ordered.Skip(1))
