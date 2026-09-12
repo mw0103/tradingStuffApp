@@ -76,7 +76,7 @@ Classifies each kept event as BMO, AMC, or INTRADAY from EDGAR acceptance time (
 dotnet run --project src/TradingStuff.EarningsStudy -p:SkipClientApp=true -- chains
 ```
 
-Pulls front-expiration chains from the Theta Terminal at pre-entry, entry, and exit dates (EOD report primary, 15:45 ET minute fallback), caches under `data/earnings-c1/raw/chains/`, computes IM and tier measures. For a smoke run, use `--limit 10` to test a few events; for full run, expect one Terminal request per event plus one per root, cached so reruns are offline. Reads `data/earnings-c1/event_timing.csv`, writes `data/earnings-c1/option_measures.csv`. Takes 5–30 minutes depending on `--limit`.
+Pulls front-expiration chains from the Theta Terminal at pre-entry, entry, and exit dates (EOD report primary, 15:45 ET minute fallback), caches under `data/earnings-c1/raw/chains/`, computes IM and tier measures. For a smoke run, use `--limit 10` to test a few events; for full run, expect one Terminal request per event plus one per root, cached so reruns are offline. Reads `data/earnings-c1/event_timing.csv`, writes `data/earnings-c1/option_measures.csv`. How long the full run takes depends on the Terminal's request rate on your subscription, which this repository has not measured: smoke-run with `--limit 10`, time it, and extrapolate to the event count before committing to the full pull.
 
 ### 5. closes
 
