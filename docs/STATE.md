@@ -955,6 +955,60 @@ Registered in the hypothesis ledger before any query execution, per the freeze-b
 Both files are registered verbatim as received (spec copy checksum-verified against the source).
 No query has been executed as of this registration.
 
+### Earnings study C1 — pipeline build (2026-09-12, in progress)
+
+`src/TradingStuff.EarningsStudy` — a batch CLI whose verbs run in pipeline order (`universe`,
+`events`, `timing`, `chains`, `closes`, `compute`), each reading the previous verb's CSV under
+`data/earnings-c1/`. The record contracts, gate keys and CSV mapper were fixed in a skeleton first so
+five packages could be built in parallel against one shape. The CBOE optionable directory as of
+2026-09-12 is frozen in the repo as the survivorship-logged seed (5,333 symbols). Stock prices are
+official IBKR daily closes via the gateway's history endpoint (no new data subscription); the spot
+in IM's denominator is the option feed's underlying price where the Terminal supplies one, else
+put-call parity at the ATM pair, with the parity-vs-close deviation reported as a diagnostic.
+
+**Where each verb must run.** EDGAR refuses this sandbox's requests ("Undeclared Automated Tool" —
+the SEC requires a declared contact in the User-Agent, and the operator's contact was not put into
+an outbound header without being asked), the Theta Terminal and TWS are on the operator's machine.
+Every verb that touches a network source (`universe` needs the SEC ticker file, `events`,
+`chains`, `closes`) is therefore built against fixtures plus `Category`-tagged live tests, and runs
+on the operator's machine; the sandbox verified the code paths on fixtures only.
+
+**Model arbitration for this build** (CLAUDE.md phase-start protocol: Opus attacker vs Opus
+justifier, Fable arbiter; table wins ties, a deviation needs a named trigger):
+
+- **WP1 EDGAR events/universe — Sonnet/high, held.** Both advocates agreed. Winning argument: every
+  gate is a boolean over fields EDGAR stamps, with an independent oracle (hand-check twenty CIKs).
+  Conceded: the as-of shares pick and the first-filing-wins dedup are selection/as-of semantics
+  outside the leakage reviewer's default remit — the as-of pick was moved into WP2's `AsOf` (the
+  study's one point-in-time function) and the review scope extended to WP1's dedup.
+- **WP2 timing/dates/QA rule — Opus/high, held.** Both agreed. Winning argument: the calendar is
+  reused, not manufactured, but the acceptance→BMO/AMC boundary and the late-filing quarantine rule
+  are invented here with no oracle but the memo's own quarantine line — class (b) verbatim.
+  Conceded: had the quarantine rule been descoped, this package falls to Sonnet/high.
+- **WP3 option measures — split.** The pure selection core (front expiry, parity spot, ATM pair,
+  tiers) **escalated to Opus/high**; the fetch/cache/assembly plumbing **held at Sonnet/high**.
+  Winning argument (calibration, not forecast): the repository's worst confirmed critical was
+  selection semantics written at Sonnet — the 54-node grid collapse — whose outputs were well-formed
+  and pointed at the wrong contracts, and this core defines the primary sample. Conceded (the
+  attacker's point, accepted): the justifier's named trigger, the decimal/double boundary, was
+  neutralised by design instead — prices are parsed to decimal from the feed's text, never through
+  the Volatility library's double quotes — and selection is fixture-assertable, so the escalation
+  rests on the calibration evidence alone. The bracketing guard from the Phase 1+2 fix is required.
+- **WP4 IBKR closes — Sonnet/medium, held.** The justifier argued the class (c) floor
+  ("a rerun adds nothing" is a negative claim). Winning argument: the claim is verified positively
+  downstream — `compute` counts a missing close as an exclusion, so absence renders as a number,
+  not as health. Conceded: resumability must never trust a partial file, so the step writes each
+  series atomically with a completion marker and re-fetches anything unmarked.
+- **WP5 statistics/memo — escalated Sonnet/high → Opus/high.** Named trigger: correctness hard to
+  cover with tests where the validating artifact is produced by the same code — the memo certifies
+  the verdict it computes, and the least-symptomatic defect (a bootstrap that ignores week
+  clustering narrows the interval) points at PASS. Conceded (the attacker's point, accepted):
+  consequence severity is not a trigger, and synthetic clustered data does give the resampling
+  arithmetic an oracle — the escalation rests on the definitional half (ties, trimming, even-n
+  median, ISO weeks, boundaries) that must be fixed before data is seen, on a package class the
+  table has never been calibrated against. Prediction to check at review: defects, if any, will be
+  definitional rather than arithmetic.
+
 ## Left
 
 Milestone 2 (research platform — sequenced in `docs/plans/ibkr-edge-research-roadmap.md`):
