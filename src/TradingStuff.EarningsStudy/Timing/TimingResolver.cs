@@ -24,15 +24,20 @@ public sealed record TimingResolution(
 /// </summary>
 /// <remarks>
 /// <para>
-/// <b>The window rule, and the one tie in it.</b> The pre-registration defines entry as the last
-/// close strictly before the print and exit as the first close strictly after. Implemented as: entry
-/// is the trading date of the last session whose close is <b>at or before</b> the acceptance instant,
-/// exit the trading date of the first session whose close is strictly after it. The "at or before"
-/// is not a loosening of the rule, it is the same boundary the classification uses — the
-/// pre-registration classifies <c>instant &gt;= close</c> as AMC, and AMC's entry is that day's own
-/// close, so a filing stamped exactly at the closing bell has that close on the entry side. Reading
-/// it the other way would classify a 16:00:00 filing AMC and then hand it the previous day's entry,
-/// which is two different rules for one instant.
+/// <b>The window rule, and the one tie in it.</b> The pre-registration does not state the window in
+/// those terms. What it says, in full, is <c>RF = |close(T+1 after print) / entry close - 1|</c> and,
+/// of the entry snapshot, <c>BMO -&gt; prior close, AMC -&gt; same-day close</c>. This resolver
+/// <i>interprets</i> that as: entry is the last close strictly before the print and exit the first
+/// close strictly after — which is what those two clauses come to on a trading day, and the reading
+/// the rest of this file is built on. It is an interpretation and not a quotation, so it is recorded
+/// as one; if it is ever judged the wrong reading, that is a C1-PREREG v2 event and not a code
+/// change. Implemented as: entry is the trading date of the last session whose close is <b>at or
+/// before</b> the acceptance instant, exit the trading date of the first session whose close is
+/// strictly after it. The "at or before" is not a loosening of the interpretation, it is the same
+/// boundary the classification uses — <c>instant &gt;= close</c> reads as AMC, and AMC's entry is
+/// that day's own close, so a filing stamped exactly at the closing bell has that close on the entry
+/// side. Reading it the other way would classify a 16:00:00 filing AMC and then hand it the previous
+/// day's entry, which is two different rules for one instant.
 /// </para>
 /// <para>
 /// Everything else follows from that single comparison, which is why it is the only one here. On a
@@ -40,7 +45,7 @@ public sealed record TimingResolution(
 /// previous session's close as the last close at or before it and the print day's close as the first
 /// after; a post-close acceptance (AMC) has the print day's close and the next session's. An
 /// acceptance inside the session gets the same dates as BMO — which is what the strictly-before /
-/// strictly-after rule says — and is quarantined anyway.
+/// strictly-after reading gives — and is quarantined anyway.
 /// </para>
 /// <para>
 /// <b>Why the calendar authority and not 09:30-16:00.</b> Session boundaries come from

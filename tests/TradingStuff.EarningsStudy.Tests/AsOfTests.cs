@@ -33,8 +33,14 @@ public sealed class AsOfTests
     }
 
     [Fact]
-    public void A_fact_filed_on_the_entry_date_is_in_force_at_that_close()
+    public void A_fact_filed_on_the_entry_date_is_refused_because_edgar_accepts_past_the_close()
     {
+        // `filed` is a date with no time on it, and EDGAR accepts submissions until 22:00 ET while
+        // still stamping the same filing date until 17:30. A 10-Q accepted at 16:30 therefore carries
+        // the entry date while having been unknowable at the 16:00 close the entry is measured at —
+        // and for a same-day 10-Q filer the entry date IS the print date, so that is the common case,
+        // not an edge one. The column cannot distinguish 09:00 from 16:30, so the point-in-time
+        // reading is the strict one.
         var facts = new[]
         {
             Fact(periodEnd: "2023-09-30", value: 15_552_752_000m, filed: "2023-11-03"),
@@ -44,7 +50,18 @@ public sealed class AsOfTests
         var pick = AsOf.SharesOutstanding(facts, new DateOnly(2024, 2, 1));
 
         Assert.NotNull(pick);
-        Assert.Equal(15_441_881_000m, pick.Value);
+        Assert.Equal(15_552_752_000m, pick.Value);
+        Assert.Equal(new DateOnly(2023, 11, 3), pick.Filed);
+
+        // The day before is admissible: a filing on 01-31 was public at the 02-01 close whatever time
+        // of day EDGAR stamped it. The boundary is a day wide, and this is the other side of it.
+        var dayBefore = new[]
+        {
+            Fact(periodEnd: "2023-09-30", value: 15_552_752_000m, filed: "2023-11-03"),
+            Fact(periodEnd: "2023-12-30", value: 15_441_881_000m, filed: "2024-01-31")
+        };
+
+        Assert.Equal(15_441_881_000m, AsOf.SharesOutstanding(dayBefore, new DateOnly(2024, 2, 1))!.Value);
     }
 
     [Fact]
@@ -62,7 +79,11 @@ public sealed class AsOfTests
         var facts = new List<SharesFactRow>
         {
             Fact(periodEnd: "2022-12-31", value: 1m, filed: "2023-02-03"),
-            Fact(periodEnd: "2023-12-30", value: 3m, filed: "2024-02-01"),
+
+            // Strictly before entry, so this is the pick. (It was filed ON the entry date until the
+            // as-of rule went strict; kept a day earlier here so this test stays about ordering and
+            // the boundary is pinned in one place.)
+            Fact(periodEnd: "2023-12-30", value: 3m, filed: "2024-01-31"),
             Fact(periodEnd: "2023-09-30", value: 2m, filed: "2023-11-03"),
             Fact(periodEnd: "2024-03-30", value: 4m, filed: "2024-05-03")
         };

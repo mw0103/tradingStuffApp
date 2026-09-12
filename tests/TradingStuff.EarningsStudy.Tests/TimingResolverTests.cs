@@ -77,7 +77,7 @@ public sealed class TimingResolverTests
         Assert.True(row.Quarantined);
         Assert.Equal(TimingResolver.IntradayReason, row.QuarantineReason);
 
-        // Quarantined, but complete: the strictly-before / strictly-after rule still names the window.
+        // Quarantined, but complete: the strictly-before / strictly-after reading still names the window.
         Assert.Equal(D(2024, 1, 30), row.PreEntryDate);
         Assert.Equal(D(2024, 1, 31), row.EntryDate);
         Assert.Equal(D(2024, 2, 1), row.ExitDate);
