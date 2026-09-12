@@ -26,7 +26,13 @@ public sealed class ComputeFixtureTests
 
         // 32 event rows, one not kept after dedup -> 31 rows in the event table, 30 entering compute.
         Assert.Equal(31, study.EventTable.Count);
-        Assert.Contains("Events kept after dedup: 31. Entering `compute`: 30.", memo);
+        Assert.Contains("Events in window and kept after dedup: 31 — the same set the timing step considers at gate 07.", memo);
+        Assert.Contains("Entering `compute`: 30. Quarantined by the timing step: 1", memo);
+        Assert.Contains("With no row at all in `event_timing.csv`: 0.", memo);
+
+        // Gate 07's ledger row and this run agree, so the fixture raises no accounting warning.
+        Assert.DoesNotContain("event(s) remaining, but", memo);
+        Assert.DoesNotContain("have NO row in event_timing.csv", memo);
 
         // Gate by gate: closes (e21), price QA (e22), price (e23), chain (e24), quotable (e25), tradable (e26).
         Assert.Equal(Gates.ClosesPresent, study.Row("e21").StopGate);
@@ -53,8 +59,10 @@ public sealed class ComputeFixtureTests
         Assert.Contains("| median(RF/IM) | 0.700000 |", memo);
         Assert.Contains("| P(RF < IM) | 0.720000 |", memo);
 
-        // (1 quarantined by timing + 1 by the price QA) / 31 considered at gate 07.
-        Assert.Contains("Quarantine rate = (1 + 1) / 31 = **0.064516**", memo);
+        // Each rate on its own denominator: gate 07 saw 31, gate 09 only the 29 that got past gate 08.
+        Assert.Contains("- Timing QA (gate 07): **1** quarantined of **31** considered = **0.032258**.", memo);
+        Assert.Contains("- Price QA (gate 09): **1** quarantined of **29** considered = **0.034483**.", memo);
+        Assert.Contains("Combined quarantine share of the gate-07 denominator = (1 + 1) / 31 = **0.064516**.", memo);
 
         // One event's realized move is exactly zero, so the logs run on 23 of the 24.
         Assert.True(study.Row("e09").ZeroRealizedMove);
@@ -74,6 +82,26 @@ public sealed class ComputeFixtureTests
 
         // The event with no earnings week is a singleton cluster.
         Assert.Equal("unknown-week:e28", study.Row("e28").ClusterKey);
+
+        // The IM-collapse witness, worked out by hand from option_measures.csv. Gate 09 decided on the
+        // 29 events that got past gate 08. Twelve of those carry a parity spot at BOTH snapshots and so
+        // have a computable diagnostic; the other 17 do not, and are a column rather than a drop:
+        //   e22  6.00/99.95 over 12.00/100.00 = 0.500250  collapsed, and gate 09 quarantined it
+        //   e09  6.00/99.95 over 15.00/100.00 = 0.400200  collapsed, and gate 09 did NOT
+        //   e01-e08, e10, e30                  >= 0.96    steady, and gate 09 did NOT
+        Assert.Contains("IM collapse vs the gate-09 decision, over the 29 event(s) gate 09 decided on.", memo);
+        Assert.Contains("Not computable for 17 of them", memo);
+        Assert.Contains("| quarantined | 1 | 0 | 0 | 1 |", memo);
+        Assert.Contains("| not quarantined | 1 | 10 | 17 | 28 |", memo);
+        Assert.Equal(0.500250m, Math.Round(study.Row("e22").ImCollapseRatio!.Value, 6));
+        Assert.Equal(0.400200m, Math.Round(study.Row("e09").ImCollapseRatio!.Value, 6));
+        Assert.Null(study.Row("e11").ImCollapseRatio);
+
+        // Gate 09 removed one event, so the memo owes the reader its selection effect.
+        Assert.Contains("Gate-09 selection effect: the price QA removed 1 event(s) from this study", memo);
+
+        // The price source, and the fact that every close in this fixture came from one vendor.
+        Assert.Contains("over the 30 event(s) entering `compute`: ibkr 30.", memo);
     }
 
     [Fact]
