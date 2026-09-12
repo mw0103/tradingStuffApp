@@ -1,0 +1,8 @@
+step,order,gate,considered,removed,remaining,note
+universe,1,01_seed_current_optionable_list,34,0,34,frozen CBOE optionable directory
+universe,2,02_cik_mapping_found,34,1,33,
+universe,3,03_primary_listing_nyse_nasdaq_nyse_american,33,1,32,
+events,4,04_8k_item_2_02_filed_in_window,40,6,34,
+events,5,05_not_8k_a,34,2,32,
+events,6,06_one_event_per_cik_quarter_first_wins,32,1,31,
+timing,7,07_timing_classified_bmo_or_amc,31,1,30,1 acceptance fell on a non-trading day and was resolved forward to the next session
