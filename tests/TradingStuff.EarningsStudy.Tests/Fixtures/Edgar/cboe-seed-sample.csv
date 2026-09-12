@@ -1,0 +1,10 @@
+Company Name, Stock Symbol, DPM Name, Post/Station, Global Trading Hours DPM
+"APPLE INC","AAPL","Some DPM LLC","1/1","-"
+"BERKSHIRE HATHAWAY INC DEL CL B NEW","BRK.B","Some DPM LLC","1/1","-"
+"BROWN FORMAN CORP CL B","BF.B","Some DPM LLC","1/1","-"
+"ALPHABET INC CL C","GOOG","Some DPM LLC","1/1","-"
+"ALPHABET INC CL A","GOOGL","Some DPM LLC","1/1","-"
+"NO MATCH IN SEC DATA CORP","ZNOMATCH","Some DPM LLC","1/1","-"
+"OTC LISTED CO","ZOTC","Some DPM LLC","1/1","-"
+"EMPTY EXCHANGE CO","ZEMPTY","Some DPM LLC","1/1","-"
+"AMBIGUOUS TICKER CO","ZAMBIG","Some DPM LLC","1/1","-"
