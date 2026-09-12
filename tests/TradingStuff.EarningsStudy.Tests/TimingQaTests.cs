@@ -24,7 +24,10 @@ public sealed class TimingQaTests
         Assert.True(result.Quarantined);
         Assert.Contains("late_filing_suspected", result.Reason);
         Assert.Equal(0.08m, Assert.IsType<decimal>(result.PreEntryMove), 6);
+
+        // EventMove is still computed and reported — the memo prints it — it just decides nothing.
         Assert.Equal(0.005m, Assert.IsType<decimal>(result.EventMove), 6);
+        Assert.DoesNotContain("event move", result.Reason);
     }
 
     [Fact]
@@ -39,17 +42,61 @@ public sealed class TimingQaTests
     }
 
     [Fact]
-    public void A_big_pre_entry_move_survives_when_the_event_move_is_bigger()
+    public void A_big_pre_entry_move_is_quarantined_however_large_the_event_move_was()
     {
-        // A run-up into the print is not a late filing: the event day still carries the larger move.
+        // The retired conjunct kept this row: 6% pre-entry against a 12% event move, so the event day
+        // "still carried the larger move". That reasoning reads RF to decide inclusion. The rule now
+        // sees only the pre-entry leg and the name's own scale, and 6% against a 3% threshold goes.
         var result = TimingQa.Evaluate(Timing(), Closes(100m, 106m, 118.72m, 0.01m));
 
-        Assert.False(result.Quarantined);
-        Assert.Null(result.Reason);
+        Assert.True(result.Quarantined);
+        Assert.Contains("late_filing_suspected", result.Reason);
+
+        // Still computed, still reported, just not consulted.
+        Assert.Equal(0.12m, Assert.IsType<decimal>(result.EventMove), 6);
+
+        // And the reason may not cite the event move, because the event move did not decide anything.
+        Assert.DoesNotContain("event move", result.Reason);
     }
 
     [Fact]
-    public void Both_thresholds_are_strict_at_the_boundary()
+    public void The_decision_cannot_see_anything_that_happens_after_the_entry_close()
+    {
+        // The defect this pins: gate 09 used to require preEntryMove > eventMove, which conditions
+        // INCLUSION on RF — the numerator of the study's primary statistic. Two rows identical up to
+        // and including the entry close, differing only in what happened afterwards, must be decided
+        // identically. (docs/LESSONS.md 2: reintroducing the conjunct makes this test fail.)
+        var quiet = TimingQa.Evaluate(Timing(), Closes(100m, 106m, 106.2968m, 0.01m));   // event +0.28%
+        var violent = TimingQa.Evaluate(Timing(), Closes(100m, 106m, 96.0042m, 0.01m));  // event -9.43%
+
+        // The reviewer's executed pair: identical pre-entry move, opposite outcomes.
+        Assert.Equal(0.06m, Assert.IsType<decimal>(quiet.PreEntryMove), 6);
+        Assert.Equal(0.06m, Assert.IsType<decimal>(violent.PreEntryMove), 6);
+        Assert.Equal(0.0028m, Assert.IsType<decimal>(quiet.EventMove), 6);
+        Assert.Equal(0.0943m, Assert.IsType<decimal>(violent.EventMove), 6);
+        Assert.NotEqual(quiet.EventMove, violent.EventMove);
+
+        Assert.Equal(quiet.Quarantined, violent.Quarantined);
+        Assert.Equal(quiet.Reason, violent.Reason);
+
+        // Sweep the exit close across two orders of magnitude and both signs: the decision is flat.
+        foreach (var exit in new[] { 1m, 53m, 100m, 105.9m, 106m, 106.01m, 120m, 500m, 10_000m })
+        {
+            var swept = TimingQa.Evaluate(Timing(), Closes(100m, 106m, exit, 0.01m));
+
+            Assert.True(swept.Quarantined, $"exit close {exit} changed the verdict");
+            Assert.Equal(quiet.Reason, swept.Reason);
+        }
+
+        // Same sweep below the threshold: still flat, and still the other way.
+        foreach (var exit in new[] { 1m, 100m, 102m, 500m })
+        {
+            Assert.False(TimingQa.Evaluate(Timing(), Closes(100m, 102m, exit, 0.01m)).Quarantined);
+        }
+    }
+
+    [Fact]
+    public void The_one_threshold_is_strict_at_the_boundary()
     {
         // Trailing median 1% ⇒ threshold exactly 3%. A pre-entry move of exactly 3% does not clear it.
         Assert.False(TimingQa.Evaluate(Timing(), Closes(100m, 103m, 100.5m, 0.01m)).Quarantined);
@@ -57,8 +104,9 @@ public sealed class TimingQaTests
         // A hair over does.
         Assert.True(TimingQa.Evaluate(Timing(), Closes(100m, 103.001m, 100.5m, 0.01m)).Quarantined);
 
-        // And equality on the first conjunct does not clear it either: 5% against 5%.
-        Assert.False(TimingQa.Evaluate(Timing(), Closes(100m, 105m, 110.25m, 0.01m)).Quarantined);
+        // Downwards too: the move is absolute, so -3% is on the same side of the boundary as +3%.
+        Assert.False(TimingQa.Evaluate(Timing(), Closes(100m, 97m, 100.5m, 0.01m)).Quarantined);
+        Assert.True(TimingQa.Evaluate(Timing(), Closes(100m, 96.999m, 100.5m, 0.01m)).Quarantined);
     }
 
     [Fact]
@@ -158,9 +206,15 @@ public sealed class TimingQaTests
 
         Assert.Contains("3 times the trailing 20-day median absolute daily return", sentence);
         Assert.Contains("4.00%", sentence);
-        Assert.Contains("larger than the absolute event move", sentence);
+        Assert.Contains("absolute pre-entry move", sentence);
         Assert.EndsWith(".", sentence);
         Assert.DoesNotContain(". ", sentence);
+
+        // The memo quotes this verbatim, so it is where a reader learns whether the gate can see the
+        // outcome. It states one threshold and does not mention the event move at all.
+        Assert.DoesNotContain("event move", sentence);
+        Assert.DoesNotContain("exit close", sentence);
+        Assert.DoesNotContain("both", sentence);
     }
 
     [Fact]

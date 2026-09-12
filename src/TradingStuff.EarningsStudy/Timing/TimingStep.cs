@@ -6,10 +6,12 @@ namespace TradingStuff.EarningsStudy.Timing;
 /// <summary>
 /// WP2. Classifies each kept event from its EDGAR acceptance time (Eastern wall clock) as BMO, AMC
 /// or INTRADAY, and resolves the measurement dates on the platform NYSE calendar: entry is the last
-/// close strictly before the acceptance instant, exit the first close strictly after, pre-entry the
-/// trading day before entry. Emits the earnings-week bootstrap key. Intraday and unresolvable
-/// acceptances are quarantined here and counted; the price-based QA runs in <c>compute</c> once
-/// closes exist, through <see cref="TimingQa"/>.
+/// close at or before the acceptance instant, exit the first close strictly after, pre-entry the
+/// trading day before entry. ("At or before", not "strictly before": a filing stamped exactly at the
+/// closing bell is AMC and takes that close as its entry. <see cref="TimingResolver"/> says why.)
+/// Emits the earnings-week bootstrap key. Intraday and unresolvable acceptances are quarantined here
+/// and counted; the price-based QA runs in <c>compute</c> once closes exist, through
+/// <see cref="TimingQa"/>.
 /// </summary>
 /// <remarks>
 /// All the judgement lives in <see cref="TimingResolver"/> and <see cref="EdgarAcceptance"/>; this
