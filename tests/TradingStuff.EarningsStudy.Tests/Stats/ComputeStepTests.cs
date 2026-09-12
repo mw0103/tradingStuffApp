@@ -516,56 +516,17 @@ public sealed class ComputeStepTests
         Assert.True(ComputeOptions.TryParse([], out var defaults, out _));
         Assert.Equal(C1Registration.BootstrapReplications, defaults.Replications);
         Assert.Equal(C1Registration.BootstrapSeed, defaults.Seed);
-        Assert.False(defaults.UnverifiedPriceQa);
 
-        Assert.True(ComputeOptions.TryParse(["--reps", "250", "--seed", "-3", "--unverified-price-qa"], out var given, out _));
+        Assert.True(ComputeOptions.TryParse(["--reps", "250", "--seed", "-3"], out var given, out _));
         Assert.Equal(250, given.Replications);
         Assert.Equal(-3, given.Seed);
-        Assert.True(given.UnverifiedPriceQa);
+        Assert.False(ComputeOptions.TryParse(["--unverified-price-qa"], out _, out var usage));
+        Assert.Contains("cannot read the option", usage);
 
         using var study = new StudyHarness();
         study.AddEvent("a").AddEvent("b");
         Assert.Equal(0, await study.RunAsync("--reps", "17", "--seed", "99"));
         Assert.Contains("17 replications, seed 99", study.Memo);
-    }
-
-    [Fact]
-    public async Task Without_the_price_qa_the_verb_refuses_and_only_an_explicit_flag_buys_a_memo_with_no_verdict()
-    {
-        using var refused = new StudyHarness();
-        refused.AddEvent("a").AddEvent("b");
-
-        Assert.Equal(1, await refused.RunWithRealStubsAsync("--reps", "20"));
-        Assert.Contains("TimingQa.Evaluate (WP2) is not implemented", refused.Output.ToString());
-        Assert.False(File.Exists(refused.Paths.Memo));
-
-        using var unverified = new StudyHarness();
-        unverified.AddEvent("a").AddEvent("b");
-
-        Assert.Equal(ComputeStep.NotARegisteredResult, await unverified.RunWithRealStubsAsync("--reps", "20", "--unverified-price-qa"));
-
-        var memo = unverified.Memo;
-        Assert.Contains("NOT A REGISTERED RESULT", memo);
-        Assert.Contains("**VERDICT: NOT COMPUTED**", memo);
-        Assert.DoesNotContain("VERDICT: PASS", memo);
-        Assert.DoesNotContain("VERDICT: FAIL", memo);
-        Assert.Contains("NOT APPLIED: TimingQa.Evaluate is not implemented", memo);
-        Assert.All(unverified.EventTable.Where(r => r.StopGate.Length == 0), r => Assert.Equal("unknown", r.PriceQa));
-
-        // The as-of shares selection is not implemented either: every market cap is unknown, and the
-        // memo says so rather than showing an empty split as though it had been measured.
-        Assert.Contains("Market capitalisation is unavailable on this run", memo);
-        Assert.All(unverified.EventTable, r => Assert.Null(r.MarketCap));
-    }
-
-    [Fact]
-    public async Task The_flag_is_refused_once_the_price_qa_is_actually_implemented()
-    {
-        using var study = new StudyHarness();
-        study.AddEvent("a").AddEvent("b");
-
-        Assert.Equal(2, await study.RunAsync("--reps", "20", "--unverified-price-qa"));
-        Assert.Contains("Remove the flag and run the registered gate", study.Output.ToString());
     }
 
     [Fact]
@@ -577,8 +538,26 @@ public sealed class ComputeStepTests
 
         Assert.Equal(0, await study.RunAsync("--reps", "20"));
         Assert.Contains("QUARANTINE when |pre-entry move| > 4 x median |daily move|.", study.Memo);
+    }
 
-        // Until WP2 lands, the absence is stated rather than filled in with a plausible rule.
-        Assert.Contains("not present in this build", TimingQaDescription.Resolve());
+    [Fact]
+    public async Task The_real_timing_qa_and_as_of_selection_are_what_the_verb_applies_by_default()
+    {
+        using var study = new StudyHarness();
+        // A clean event, and one whose move landed the day BEFORE the entry close — the late-filing
+        // signature WP2's rule exists for: pre-entry move 8 % against a 0.5 % event move and a 1 %
+        // trailing scale.
+        study.AddEvent("clean").AddEvent("late", closePreEntry: 92m, closeEntryOverride: 100m, closeExitOverride: 100.5m);
+
+        Assert.Equal(0, await study.RunWithRealDefaultsAsync("--reps", "20"));
+
+        Assert.Contains(TimingQa.Describe(), study.Memo);
+        Assert.Contains("VERDICT:", study.Memo);
+        Assert.Equal("quarantined", study.Row("late").PriceQa);
+        Assert.Equal("ok", study.Row("clean").PriceQa);
+        Assert.Equal(1, study.WrittenGateCounts.Single(c => c.Gate == Gates.PriceQa).Removed);
+
+        // The real as-of pick found the harness's fact (filed 2024-01-15, entry 2024-01-31).
+        Assert.NotNull(study.Row("clean").MarketCap);
     }
 }

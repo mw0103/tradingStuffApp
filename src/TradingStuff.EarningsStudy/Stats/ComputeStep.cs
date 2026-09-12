@@ -1,5 +1,4 @@
 using System.Globalization;
-using System.Reflection;
 using System.Security.Cryptography;
 using System.Text;
 using TradingStuff.EarningsStudy.Csv;
@@ -38,12 +37,9 @@ public sealed class ComputeStep(
     /// <summary>The <see cref="GateCountRow.Step"/> this verb owns. Its rows are replaced on a re-run, never appended twice.</summary>
     public const string StepName = "compute";
 
-    /// <summary>Exit code for a memo that was written but is not a registered result (a gate was not applied).</summary>
-    public const int NotARegisteredResult = 3;
-
     private readonly Func<EventTimingRow, ClosesRow, TimingQaResult> priceQa = priceQa ?? TimingQa.Evaluate;
     private readonly Func<IEnumerable<SharesFactRow>, DateOnly, SharesFactRow?> sharesAsOf = sharesAsOf ?? AsOf.SharesOutstanding;
-    private readonly Func<string> describePriceQa = describePriceQa ?? TimingQaDescription.Resolve;
+    private readonly Func<string> describePriceQa = describePriceQa ?? TimingQa.Describe;
 
     public string Verb => "compute";
     public string Description => "Apply the gates, compute the registered statistics and write the memo.";
@@ -160,26 +156,13 @@ public sealed class ComputeStep(
             return null;
         });
 
-        var qaMode = ProbePriceQa(afterCloses, options, out var qaRefusal);
-        if (qaRefusal is not null)
+        var afterQa = ApplyGate(afterCloses, Gates.PriceQa, counts, work =>
         {
-            context.Output.WriteLine(qaRefusal);
-            return qaMode == PriceQaMode.Refused ? 1 : 2;
-        }
-
-        var afterQa = qaMode == PriceQaMode.Applied
-            ? ApplyGate(afterCloses, Gates.PriceQa, counts, work =>
-            {
-                var result = this.priceQa(work.Timing!, work.Closes!);
-                work.Qa = result;
-                work.PriceQa = result.Quarantined ? "quarantined" : "ok";
-                return result.Quarantined ? $"quarantined: {result.Reason ?? "no reason given"}" : null;
-            })
-            : ApplyGate(afterCloses, Gates.PriceQa, counts, work =>
-            {
-                work.PriceQa = "unknown";
-                return null;
-            }, gateNote: "NOT APPLIED: TimingQa.Evaluate is not implemented in this build and --unverified-price-qa was passed");
+            var result = this.priceQa(work.Timing!, work.Closes!);
+            work.Qa = result;
+            work.PriceQa = result.Quarantined ? "quarantined" : "ok";
+            return result.Quarantined ? $"quarantined: {result.Reason ?? "no reason given"}" : null;
+        });
 
         var afterPrice = ApplyGate(afterQa, Gates.MinimumPrice, counts, work =>
             work.Closes!.CloseEntry!.Value >= C1Registration.MinimumEntryPrice
@@ -218,7 +201,7 @@ public sealed class ComputeStep(
 
         foreach (var work in works) Measure(work);
 
-        var sharesApplied = ApplyMarketCaps(works, factsByCik);
+        ApplyMarketCaps(works, factsByCik);
 
         foreach (var work in afterQuotable)
         {
@@ -255,20 +238,15 @@ public sealed class ComputeStep(
             cancellationToken,
             (eventId, split, label) => StampQuintile(byId[eventId], "secondary", split, label));
 
-        var verdict = qaMode == PriceQaMode.Applied
-            ? C1Verdict.Decide(primary.Median, primary.Bootstrap?.ProportionLess)
-            : C1Verdict.Decide(null, null, "gate 09 (price QA) was not applied on this run, so no sample is the registered sample");
-
-        var qaDescription = qaMode == PriceQaMode.Applied
-            ? this.describePriceQa()
-            : "Gate 09 was not applied on this run, so no price-QA rule was in force.";
+        var verdict = C1Verdict.Decide(primary.Median, primary.Bootstrap?.ProportionLess);
+        var qaDescription = this.describePriceQa();
 
         var orphans = OrphanCounts(timings, closes, measures, works.Select(w => w.Event.EventId).ToHashSet(StringComparer.Ordinal));
 
         var gateCounts = priorGateCounts.Where(r => !string.Equals(r.Step, StepName, StringComparison.Ordinal)).Concat(counts).ToList();
         var report = BuildReport(
             verdict, primary, secondary, gateCounts, required, universe, entering, timings, orphans,
-            options, qaMode, qaDescription, sharesApplied, stoppedBeforeCompute, kept.Count);
+            options, qaDescription, stoppedBeforeCompute, kept.Count);
 
         CsvFile.Write(paths.EventTable, works.Select(w => w.ToRow()));
         CsvFile.Write(paths.GateCounts, gateCounts);
@@ -282,7 +260,7 @@ public sealed class ComputeStep(
         context.Log($"event table: {paths.EventTable} ({works.Count} rows)");
         context.Log($"memo: {paths.Memo}");
         context.Log(verdict.Line.Replace("**", ""));
-        return qaMode == PriceQaMode.Applied ? 0 : NotARegisteredResult;
+        return 0;
     }
 
     private static int Refuse(StudyContext context, string message)
@@ -346,43 +324,6 @@ public sealed class ComputeStep(
         return parts.Count == 0 ? null : string.Join("; ", parts);
     }
 
-    private enum PriceQaMode { Applied, Unknown, Refused }
-
-    /// <summary>
-    /// Decides whether gate 09 can be applied, by calling the injected QA once. If it is not
-    /// implemented, the operator must say so on the command line and the run produces a memo with no
-    /// verdict: treating an unimplemented QA as "nothing was quarantined" would be exactly the
-    /// absence-renders-as-health defect the registration's quarantine accounting exists to prevent.
-    /// </summary>
-    private PriceQaMode ProbePriceQa(List<EventWork> candidates, ComputeOptions options, out string? refusal)
-    {
-        refusal = null;
-        if (candidates.Count == 0)
-        {
-            return options.UnverifiedPriceQa ? PriceQaMode.Unknown : PriceQaMode.Applied;
-        }
-
-        try
-        {
-            _ = this.priceQa(candidates[0].Timing!, candidates[0].Closes!);
-        }
-        catch (NotImplementedException)
-        {
-            if (options.UnverifiedPriceQa) return PriceQaMode.Unknown;
-            refusal = "compute: TimingQa.Evaluate (WP2) is not implemented, so gate 09 cannot be applied. " +
-                      "Pass --unverified-price-qa to write a memo that applies no price QA and carries NO verdict. Nothing was written.";
-            return PriceQaMode.Refused;
-        }
-
-        if (options.UnverifiedPriceQa)
-        {
-            refusal = "compute: --unverified-price-qa was passed but TimingQa.Evaluate is implemented. Remove the flag and run the registered gate.";
-            return PriceQaMode.Unknown;
-        }
-
-        return PriceQaMode.Applied;
-    }
-
     /// <summary>
     /// The per-event measures, for every event that reached this verb whatever gate removed it — a
     /// realized move is worth recording even for an event with no chain, and the event table is the
@@ -434,24 +375,13 @@ public sealed class ComputeStep(
     }
 
     /// <summary>
-    /// Market capitalisation from the as-of shares fact and the entry close. Returns false when WP2's
-    /// as-of selection is not implemented, in which case every market cap is unknown, the split says
-    /// so, and the memo records it — the split is a readout, not a gate, so the verdict is unaffected.
+    /// Market capitalisation from the as-of shares fact and the entry close. An event with no fact in
+    /// force at its entry date keeps a null market cap and lands in the split's unknown bucket — the
+    /// split is a readout, not a gate, so the verdict is unaffected.
     /// </summary>
-    private bool ApplyMarketCaps(List<EventWork> works, Dictionary<long, IReadOnlyList<SharesFactRow>> factsByCik)
+    private void ApplyMarketCaps(List<EventWork> works, Dictionary<long, IReadOnlyList<SharesFactRow>> factsByCik)
     {
         var candidates = works.Where(w => w.Timing?.EntryDate is not null).ToList();
-        if (candidates.Count == 0) return true;
-
-        try
-        {
-            _ = this.sharesAsOf(factsByCik.GetValueOrDefault(candidates[0].Event.Cik, []), candidates[0].Timing!.EntryDate!.Value);
-        }
-        catch (NotImplementedException)
-        {
-            foreach (var work in candidates) work.AddNote("market cap unknown: the as-of shares selection is not implemented in this build");
-            return false;
-        }
 
         foreach (var work in works.Where(w => w.Timing?.EntryDate is null))
         {
@@ -466,8 +396,6 @@ public sealed class ComputeStep(
             work.SharesAsOfFiled = fact.Filed;
             if (work.Closes?.CloseEntry is { } close) work.MarketCap = fact.Value * close;
         }
-
-        return true;
     }
 
     private static SampleReport BuildSample(
@@ -625,9 +553,7 @@ public sealed class ComputeStep(
         List<EventTimingRow> timings,
         List<Tally> orphans,
         ComputeOptions options,
-        PriceQaMode qaMode,
         string priceQaDescription,
-        bool sharesApplied,
         int stoppedBeforeCompute,
         int keptAfterDedup)
     {
@@ -691,9 +617,7 @@ public sealed class ComputeStep(
             stoppedBeforeCompute,
             options.Replications,
             options.Seed,
-            qaMode == PriceQaMode.Applied,
             priceQaDescription,
-            sharesApplied,
             warnings);
     }
 
@@ -856,13 +780,12 @@ public sealed class ComputeStep(
 }
 
 /// <summary>The compute verb's command line. Both options default to the registered values.</summary>
-public sealed record ComputeOptions(int Replications, int Seed, bool UnverifiedPriceQa)
+public sealed record ComputeOptions(int Replications, int Seed)
 {
     public static bool TryParse(IReadOnlyList<string> args, out ComputeOptions options, out string usage)
     {
         var replications = C1Registration.BootstrapReplications;
         var seed = C1Registration.BootstrapSeed;
-        var unverified = false;
         usage = "";
 
         for (var i = 0; i < args.Count; i++)
@@ -877,48 +800,17 @@ public sealed record ComputeOptions(int Replications, int Seed, bool UnverifiedP
                     seed = parsedSeed;
                     i++;
                     break;
-                case "--unverified-price-qa":
-                    unverified = true;
-                    break;
                 default:
-                    options = new ComputeOptions(replications, seed, unverified);
+                    options = new ComputeOptions(replications, seed);
                     usage = $"compute: cannot read the option '{args[i]}'.\n" +
-                            "usage: compute [--reps N] [--seed N] [--unverified-price-qa]\n" +
+                            "usage: compute [--reps N] [--seed N]\n" +
                             $"  --reps N   bootstrap replications (default {C1Registration.BootstrapReplications}, the registered value)\n" +
-                            $"  --seed N   bootstrap seed (default {C1Registration.BootstrapSeed}, the registered value)\n" +
-                            "  --unverified-price-qa  run with gate 09 unapplied because TimingQa.Evaluate is not implemented;\n" +
-                            "                         the memo then carries no verdict and is not a registered result";
+                            $"  --seed N   bootstrap seed (default {C1Registration.BootstrapSeed}, the registered value)";
                     return false;
             }
         }
 
-        options = new ComputeOptions(replications, seed, unverified);
+        options = new ComputeOptions(replications, seed);
         return true;
-    }
-}
-
-/// <summary>
-/// The price-QA rule, quoted into the memo verbatim. WP2 owns <see cref="TimingQa"/> and its
-/// <c>Describe()</c> has not landed on this branch; the lookup is by reflection so that this package
-/// does not edit a file it does not own and picks up the real text the moment it exists. When the
-/// method is absent the memo says so rather than describing a rule nobody wrote (docs/LESSONS.md §8).
-/// </summary>
-public static class TimingQaDescription
-{
-    public const string NotAvailable = "TimingQa.Describe() is not present in this build, so the price-QA rule is not quoted here. This memo does not state the rule it applied at gate 09.";
-
-    public static string Resolve()
-    {
-        var describe = typeof(TimingQa).GetMethod("Describe", BindingFlags.Public | BindingFlags.Static, null, Type.EmptyTypes, null);
-        if (describe is null || describe.ReturnType != typeof(string)) return NotAvailable;
-
-        try
-        {
-            return describe.Invoke(null, null) as string ?? NotAvailable;
-        }
-        catch (TargetInvocationException ex) when (ex.InnerException is NotImplementedException)
-        {
-            return NotAvailable;
-        }
     }
 }

@@ -49,15 +49,6 @@ public static class MemoWriter
         Line(memo, "# C1 — implied vs realized earnings moves (v0)");
         Line(memo);
 
-        if (!report.PriceQaApplied)
-        {
-            Line(memo, "> **NOT A REGISTERED RESULT.** Gate 09 (price QA) was not applied on this run:");
-            Line(memo, "> `TimingQa.Evaluate` is not implemented in this build and `--unverified-price-qa` was passed.");
-            Line(memo, "> Every event carries `price_qa = unknown`, no event was quarantined by the price QA, and");
-            Line(memo, "> **no PASS/FAIL verdict is emitted**. Re-run once the QA lands before quoting anything here.");
-            Line(memo);
-        }
-
         Line(memo, "The number is the number. Every figure below is computed by the `compute` verb from the tables");
         Line(memo, "listed in 1.2 and written by the same run; nothing in this memo is typed by hand.");
         Line(memo);
@@ -403,13 +394,6 @@ public static class MemoWriter
         foreach (var line in report.PriceQaDescription.Replace("\r\n", "\n").Split('\n')) Line(memo, $"  {line}");
         Line(memo, "  ```");
         Line(memo);
-
-        if (!report.SharesAsOfApplied)
-        {
-            Line(memo, "- **Market capitalisation is unavailable on this run**: the as-of shares-outstanding selection is not");
-            Line(memo, "  implemented in this build, so every event falls in the market-cap split's `unknown` bucket. The split is");
-            Line(memo, "  a readout, not a gate, so nothing else is affected — but that split says nothing until it is re-run.");
-        }
 
         foreach (var warning in report.Warnings) Line(memo, $"- {warning}");
         Line(memo);

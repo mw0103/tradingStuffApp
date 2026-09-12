@@ -198,7 +198,5 @@ public sealed record C1Report(
     int EventsStoppedBeforeCompute,
     int Replications,
     int Seed,
-    bool PriceQaApplied,
     string PriceQaDescription,
-    bool SharesAsOfApplied,
     IReadOnlyList<string> Warnings);

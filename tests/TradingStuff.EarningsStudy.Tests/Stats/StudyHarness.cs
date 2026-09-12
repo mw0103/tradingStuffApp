@@ -144,10 +144,10 @@ internal sealed class StudyHarness : IDisposable
     }
 
     /// <summary>
-    /// Writes every table and runs the step with its REAL defaults — WP2's <c>TimingQa.Evaluate</c> and
-    /// <c>AsOf.SharesOutstanding</c>, both of which still throw. This is what the CLI does today.
+    /// Writes every table and runs the step with its REAL defaults — WP2's <c>TimingQa.Evaluate</c>,
+    /// <c>AsOf.SharesOutstanding</c> and <c>TimingQa.Describe</c>. This is what the CLI does.
     /// </summary>
-    public async Task<int> RunWithRealStubsAsync(params string[] args)
+    public async Task<int> RunWithRealDefaultsAsync(params string[] args)
     {
         Write();
         return await new ComputeStep().RunAsync(Context, args, CancellationToken.None);
