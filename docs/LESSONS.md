@@ -208,7 +208,6 @@ imitating:
 
 Two live samples are not a protocol guarantee. Writing the code to survive either ordering costs
 little; assuming the ordering you happened to see costs a defect that appears months later.
-</content>
 
 ## 13. A selection rule's direction is invisible by reading; run it against a null population.
 
