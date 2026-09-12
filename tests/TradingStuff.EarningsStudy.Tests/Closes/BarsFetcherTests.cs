@@ -306,6 +306,14 @@ public sealed class BarsFetcherTests : IDisposable
         var maxObserved = 0;
         var gate = new object();
 
+        // Every request parks until three are in flight together, so overlap is forced rather than
+        // hoped for: a fetcher that ran one symbol at a time could never fill the barrier, and the
+        // timed-out wait answers a permanent 400 — which the fetcher records without retrying — so
+        // the assertions below fail within seconds on a loaded machine and an idle one alike. The
+        // earlier version slept 50 ms and asserted that overlap had happened to occur, which failed
+        // once under full-suite load; an exception here instead would be retried as transient.
+        using var rendezvous = new Barrier(3);
+
         var handler = new ScriptedHandler((_, _) =>
         {
             lock (gate)
@@ -314,7 +322,11 @@ public sealed class BarsFetcherTests : IDisposable
                 maxObserved = Math.Max(maxObserved, inFlight);
             }
 
-            Thread.Sleep(50); // hold the "connection" open long enough for overlap to be observable.
+            if (!rendezvous.SignalAndWait(TimeSpan.FromSeconds(3)))
+            {
+                lock (gate) inFlight--;
+                return JsonResponse(HttpStatusCode.BadRequest, """{"detail":"fewer than three requests were ever in flight together"}""");
+            }
 
             lock (gate)
             {
@@ -332,8 +344,7 @@ public sealed class BarsFetcherTests : IDisposable
 
         Assert.Equal(6, summary.Fetched);
         Assert.Equal(6, summary.Total);
-        Assert.True(maxObserved >= 2, $"expected overlap with concurrency=3, observed max {maxObserved}");
-        Assert.True(maxObserved <= 3, $"concurrency bound violated: observed max {maxObserved}");
+        Assert.Equal(3, maxObserved);
     }
 
     [Fact]
