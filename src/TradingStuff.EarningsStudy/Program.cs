@@ -1,6 +1,7 @@
 using TradingStuff.EarningsStudy;
 using TradingStuff.EarningsStudy.Closes;
 using TradingStuff.EarningsStudy.Edgar;
+using TradingStuff.EarningsStudy.Model;
 using TradingStuff.EarningsStudy.Options;
 using TradingStuff.EarningsStudy.Stats;
 using TradingStuff.EarningsStudy.Timing;
@@ -60,6 +61,10 @@ namespace TradingStuff.EarningsStudy
             var context = new StudyContext(new StudyPaths(dataDirectory), new SessionClock(), output, TimeProvider.System);
             Directory.CreateDirectory(context.Paths.DataDirectory);
             context.Log($"{step.Verb}: data directory {context.Paths.DataDirectory}");
+
+            var dropped = GateCountsFile.DropStep(context.Paths.GateCounts, step.Verb);
+            if (dropped > 0) context.Log($"{step.Verb}: replaced {dropped} gate tally row(s) from a previous run");
+
             return await step.RunAsync(context, rest, cancellationToken);
         }
 
