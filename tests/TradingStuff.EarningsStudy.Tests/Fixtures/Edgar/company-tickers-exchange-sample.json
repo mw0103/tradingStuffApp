@@ -1,0 +1,14 @@
+{
+  "fields": ["cik", "name", "ticker", "exchange"],
+  "data": [
+    [320193, "Apple Inc.", "AAPL", "Nasdaq"],
+    [1067983, "Berkshire Hathaway Inc", "BRK-B", "NYSE"],
+    [14693, "Brown-Forman Corp", "BF-B", "NYSE"],
+    [1652044, "Alphabet Inc.", "GOOG", "Nasdaq"],
+    [1652044, "Alphabet Inc.", "GOOGL", "Nasdaq"],
+    [9999901, "OTC Listed Co", "ZOTC", "OTC"],
+    [9999902, "Empty Exchange Co", "ZEMPTY", ""],
+    [9999903, "Ambiguous Ticker Co A", "ZAMBIG", "Nasdaq"],
+    [9999904, "Ambiguous Ticker Co B", "ZAMBIG", "NYSE"]
+  ]
+}
