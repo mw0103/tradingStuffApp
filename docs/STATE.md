@@ -1,6 +1,6 @@
 # State
 
-Updated: 2026-09-12
+Updated: 2026-09-12 (late)
 
 ## Done
 
@@ -955,7 +955,7 @@ Registered in the hypothesis ledger before any query execution, per the freeze-b
 Both files are registered verbatim as received (spec copy checksum-verified against the source).
 No query has been executed as of this registration.
 
-### Earnings study C1 — pipeline build (2026-09-12, in progress)
+### Earnings study C1 — pipeline build (2026-09-12) — CODE-COMPLETE, NOT YET RUN
 
 `src/TradingStuff.EarningsStudy` — a batch CLI whose verbs run in pipeline order (`universe`,
 `events`, `timing`, `chains`, `closes`, `compute`), each reading the previous verb's CSV under
@@ -1064,7 +1064,49 @@ null-population run in review — a synthetic sample containing none of the cont
 targets — measuring what the rule does to the headline statistic. Reading a selection rule proves
 nothing about its selection effect.
 
+**Review fixes, applied and re-verified.** Timing (Opus/high): the event-move conjunct dropped, the
+as-of pick made strict, the attribution comments corrected; the fix agent re-reproduced the verdict
+flip at three boundary tunings before changing anything, and a new test pins that two closes rows
+differing only in the exit close get the same decision. Stats (Opus/high): `compute` now filters
+the same event set `timing` does and warns when a kept event has no timing row; the IM-collapse
+diagnostic is computed per event, its inputs carried in the event table, and its cross-tab against
+gate 09 printed; the verdict line prints the unrounded value at a boundary; the two quarantine rates
+are reported against their own denominators; the price source is named; a new memo section 9.3
+states that the registered PASS condition is satisfied by a fairly priced market. WP3b (Sonnet/
+high, second attempt — the first died on an output-token cap while still reading): the Theta fetch
+with EOD-report-first and 15:45-minute fallback, verbatim response cache, per-event isolation, and
+a documented property that `chain_empty` and `no_paired_strike` are unreachable by construction in
+this verb's check order (the entry-rows pre-check and parity's solvable set intercept them), so
+those two exclusion rows read zero honestly. A scheduling-sensitive concurrency test in WP4 that
+failed once under full-suite load was rewritten around a barrier with a fast-failing 400. The
+orchestrator's own first negative control for that test mutated nothing and passed — caught before
+push and now LESSONS.md #14.
+
+**Final state.** Six verbs, 293 study tests, the platform's own suite green alongside, full solution
+builds. **Not one live surface has been exercised**: EDGAR, the Theta Terminal and the gateway were
+all unreachable from the build sandbox. Three `Category`-gated live tests pin the facts the fixtures
+assume — `RequiresEdgar` (Apple's 2024-02-01 8-K accepted at hour 16 Eastern), `RequiresThetaTerminal`
+(the EOD header, `underlying_price`, price scale, EOD vs minute fallback), `RequiresGateway` (a real
+bars request) — and `docs/research/c1-run-instructions.md` says to run them before the pipeline.
+Two lessons went to `docs/LESSONS.md` (#13, #14). The frozen registration is unedited; whether C1 v2
+should register a mean-based criterion (see the review's §9.3 finding) is the operator's ledger
+decision.
+
 ## Left
+
+Earnings study C1 (`docs/research/c1-run-instructions.md`):
+
+- Run the three live tests on the operator's machine, then the six verbs in order; the memo
+  `data/earnings-c1/c1_memo.md` is the Monday 2026-09-14 09:00 CT deliverable. Commit the derived
+  tables (not `raw/`).
+- Read the three instruments before the verdict line: parity-vs-close deviation quantiles, the
+  spot-source and price-source tallies, the IM-collapse cross-tab (memo §9.2); and §9.3 on what the
+  registered criterion establishes.
+- Decide, in the ledger, whether C1 v2 registers a mean-based criterion; the frozen v0 file stays
+  as it is either way.
+- Known, not fixed: `TimingQuarantineReasons` in the memo groups every quarantined timing row,
+  including orphans of events the events verb dropped, so it can exceed gate 07's removals; the
+  §4 table prints the median at F6 while the verdict line annotates a boundary value.
 
 Milestone 2 (research platform — sequenced in `docs/plans/ibkr-edge-research-roadmap.md`):
 
