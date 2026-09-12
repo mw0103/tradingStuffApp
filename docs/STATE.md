@@ -1,6 +1,6 @@
 # State
 
-Updated: 2026-07-31
+Updated: 2026-09-12
 
 ## Done
 
@@ -939,6 +939,21 @@ coverage denominators are untouched by this change and the per-conId calendar wo
 historical probing and passed 12/12 on re-run. Some of these tests deliberately drive a raw
 `EClientSocket`, bypassing the pacing governor, so sustained probing can trip TWS's own limits. It is
 not currently a reliable single-run gate.
+
+### Earnings vol premium study — C1 pre-registration frozen (2026-09-12)
+
+Registered in the hypothesis ledger before any query execution, per the freeze-before-compute rule:
+
+- `docs/research/earnings-vol-premium-spec-v0.3.md` — spec v0.3 (supersedes v0.2, closed record):
+  claims C1–C6, definitions, fill model, data sources, feature families F1-A/F1-B/L1/F2,
+  pipeline stages, nulls and kill criteria, side studies, rejected designs.
+- `docs/research/c1-preregistration-v0.md` — **C1 pre-registration v0, FROZEN Saturday
+  2026-09-12 prior to any query execution.** That file is not edited after the first query runs;
+  changes require C1-PREREG v2 in the ledger with a stated reason. Deliverable: one memo by
+  Monday 2026-09-14, 09:00 America/Chicago. C1 FAIL stops the program per spec v0.3.
+
+Both files are registered verbatim as received (spec copy checksum-verified against the source).
+No query has been executed as of this registration.
 
 ## Left
 
