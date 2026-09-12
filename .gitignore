@@ -16,3 +16,7 @@ src/TradingStuff.ResearchService/wwwroot/
 
 # Mutation testing output
 StrykerOutput/
+
+# Earnings C1 study: raw vendor pulls (option chains, daily bar series) are large and re-fetchable;
+# derived per-event tables and the frozen universe seed are committed beside them.
+data/earnings-c1/raw/

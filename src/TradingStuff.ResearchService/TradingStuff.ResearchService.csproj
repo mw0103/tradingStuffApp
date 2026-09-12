@@ -31,7 +31,9 @@
   </ItemGroup>
 
   <!-- Build the React ClientApp before the main build target -->
-  <Target Name="BuildClientApp" BeforeTargets="Build">
+  <!-- SkipClientApp=true lets a consumer that only needs the C# surface (the earnings-study CLI
+       references SessionClock) build without npm; the service's own builds never set it. -->
+  <Target Name="BuildClientApp" BeforeTargets="Build" Condition="'$(SkipClientApp)' != 'true'">
     <!-- Ensure directories exist -->
     <MakeDir Directories="$(IntermediateOutputPath)staticwebassets" />
     <Exec Command="npm ci" WorkingDirectory="ClientApp" />

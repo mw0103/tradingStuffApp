@@ -1,0 +1,34 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Earnings vol premium study, claim C1 (docs/research/c1-preregistration-v0.md). A batch CLI, not a
+    service: each verb reads and writes CSV tables under data/earnings-c1/, so every intermediate the
+    Monday memo depends on is a file that can be diffed, re-run and hashed. Nothing here places an
+    order or opens a broker socket — closes come from the gateway's HTTP history endpoint, option
+    quotes from the local Theta Terminal, events from EDGAR.
+  -->
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <RootNamespace>TradingStuff.EarningsStudy</RootNamespace>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- SessionClock is the platform's single authority on NYSE trading days; the study must not
+         grow a second calendar. Build with -p:SkipClientApp=true to skip the React build that
+         ResearchService otherwise runs for its own UI. -->
+    <ProjectReference Include="..\TradingStuff.ResearchService\TradingStuff.ResearchService.csproj" />
+    <ProjectReference Include="..\TradingStuff.ResearchContracts\TradingStuff.ResearchContracts.csproj" />
+    <ProjectReference Include="..\TradingStuff.Volatility\TradingStuff.Volatility.csproj" />
+    <ProjectReference Include="..\TradingStuff.ServiceDefaults\TradingStuff.ServiceDefaults.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="TradingStuff.EarningsStudy.Tests" />
+  </ItemGroup>
+
+</Project>
