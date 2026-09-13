@@ -81,9 +81,16 @@ reader not to look.
   already process-wide constants when it was written.
 - *"the clock never reads the table, so it is a genuinely independent witness"* — both sides resolve
   the same singleton, cache included.
+- *"Verified against Apple's FY24 Q1 8-K … this field reads 16:30:38"* — EDGAR was unreachable from
+  the sandbox that wrote it, so nothing was verified; the field really reads `21:30:30.000Z`. The
+  unit test and the fixtures were then written from the comment instead of from the venue, so the
+  suite was green while every EDGAR acceptance time was read four or five hours late.
 
 When you fix a defect, fix its comment. When you review, **read the comments as claims to be tested,
-not as documentation to be trusted.**
+not as documentation to be trusted.** And **"verified against X" is a claim, not a verification, when
+X was unreachable from where it was written** — say which it is. Only the registered
+`Category=RequiresEdgar` pin against the real venue exposed that last one, the same job the
+`RequiresTws` tests do in 5.
 
 ## 5. A green unit suite says nothing about the broker
 

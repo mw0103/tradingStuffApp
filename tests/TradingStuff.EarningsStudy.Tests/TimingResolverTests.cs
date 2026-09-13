@@ -1,3 +1,4 @@
+using TradingStuff.EarningsStudy.Edgar;
 using TradingStuff.EarningsStudy.Timing;
 using TradingStuff.ResearchContracts;
 using TradingStuff.ResearchService.Sessions;
@@ -387,6 +388,58 @@ public sealed class TimingResolverTests
 
         // Ten or eleven federal-style holidays a year over four years, plus nothing else.
         Assert.InRange(closedWeekdays, 36, 48);
+    }
+
+    // ---- The parser-to-resolver seam --------------------------------------------------------------
+
+    /// <summary>
+    /// Every other case here starts from a hand-built wall clock, and every case in
+    /// <c>EdgarParsingTests</c> stops at one, so the seam between them had no test — which is where
+    /// the 2026-09-13 defect lived, unseen, with both sides green. These start at a raw EDGAR stamp
+    /// and end at a classification.
+    /// </summary>
+    [Theory]
+    // A 07:00 ET release, stamped 12:00Z under EST. Reading the digits as Eastern put it at noon,
+    // inside the session: INTRADAY, quarantined at gate 07. That is how the defect would have shown
+    // up in the sample -- not as a wrong number, but as the absence of essentially every BMO event.
+    [InlineData("2024-02-01T12:00:00.000Z", TimingResolver.Bmo, 2024, 2, 1, 2024, 1, 31, 2024, 2, 1)]
+    // A 20:00 ET release, stamped 01:00Z the NEXT day. The old reading moved the print date forward
+    // a day and flipped the class, while leaving entry and exit right -- visible only in the class.
+    [InlineData("2024-02-02T01:00:00.000Z", TimingResolver.Amc, 2024, 2, 1, 2024, 2, 1, 2024, 2, 2)]
+    // Apple's own stamp, the string the old unit test was built on: 16:30 ET, and post-close under
+    // either reading. The one time of day at which the defect is invisible here.
+    [InlineData("2024-02-01T21:30:30.000Z", TimingResolver.Amc, 2024, 2, 1, 2024, 2, 1, 2024, 2, 2)]
+    public void A_raw_UTC_EDGAR_stamp_classifies_and_dates_on_its_Eastern_conversion(
+        string acceptanceDateTime, string expectedClass,
+        int printY, int printM, int printD, int entryY, int entryM, int entryD, int exitY, int exitM, int exitD)
+    {
+        var row = TimingResolver.Resolve(
+            Clock, Nyse, "e1", EdgarParsing.ParseAcceptanceEt(acceptanceDateTime)).Row;
+
+        Assert.Equal(expectedClass, row.TimingClass);
+        Assert.Equal(D(printY, printM, printD), row.PrintDate);
+        Assert.Equal(D(entryY, entryM, entryD), row.EntryDate);
+        Assert.Equal(D(exitY, exitM, exitD), row.ExitDate);
+        Assert.False(row.Quarantined);
+    }
+
+    /// <summary>
+    /// The same seam, on the defect's leakage face. Reading the digits as Eastern moved a genuinely
+    /// intraday print to at-or-after the close, so it was admitted as a clean AMC and handed an entry
+    /// close struck up to five hours AFTER the release. These two stamps are the ends of that band;
+    /// both must quarantine instead.
+    /// </summary>
+    [Theory]
+    [InlineData("2024-02-01T16:00:00.000Z")] // 11:00 ET; the old reading made it 16:00 ET, AMC exactly at the bell
+    [InlineData("2024-02-01T20:59:00.000Z")] // 15:59 ET, one minute before the close
+    public void A_raw_UTC_EDGAR_stamp_inside_the_session_is_quarantined_intraday(string acceptanceDateTime)
+    {
+        var row = TimingResolver.Resolve(
+            Clock, Nyse, "e1", EdgarParsing.ParseAcceptanceEt(acceptanceDateTime)).Row;
+
+        Assert.Equal(TimingResolver.Intraday, row.TimingClass);
+        Assert.True(row.Quarantined);
+        Assert.Equal(TimingResolver.IntradayReason, row.QuarantineReason);
     }
 
     private static List<DateOnly> TradingDates(DateOnly from, DateOnly to) =>

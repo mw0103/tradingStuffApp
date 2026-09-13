@@ -136,13 +136,15 @@ public sealed class EventsStepTests
     }
 
     [Fact]
-    public async Task Acceptance_time_is_read_as_Eastern_wall_clock()
+    public async Task Acceptance_time_is_the_UTC_stamp_converted_to_an_Eastern_wall_clock()
     {
         using var dir = new TempStudyDirectory();
         var (_, events, _, _) = await RunAsync(dir, [EligibleRow("SAMP", 1000001)], SampleCoHandler());
 
+        // The fixture stamps this filing "2023-01-30T22:45:00.000Z", which is 17:45 Eastern under EST.
         var filing = events.Single(e => e.AccessionNumber == "0001000001-23-000001");
         Assert.Equal(new DateTime(2023, 1, 30, 17, 45, 0, DateTimeKind.Unspecified), filing.AcceptanceEt);
+        Assert.Equal(DateTimeKind.Unspecified, filing.AcceptanceEt.Kind);
     }
 
     [Fact]
@@ -154,11 +156,11 @@ public sealed class EventsStepTests
         // Both share filingDate 2026-01-02 -- only the acceptance date tells them apart.
         var inWindowAtTheBoundary = events.Single(e => e.AccessionNumber == "0001000001-25-000010");
         Assert.Equal(new DateOnly(2026, 1, 2), inWindowAtTheBoundary.FilingDate);
-        Assert.True(inWindowAtTheBoundary.InWindow, "accepted 2025-12-31T17:45 ET == WindowTo, inclusive");
+        Assert.True(inWindowAtTheBoundary.InWindow, "stamped 2025-12-31T22:45Z == 17:45 ET on WindowTo, inclusive");
 
         var outOfWindow = events.Single(e => e.AccessionNumber == "0001000001-26-000001");
         Assert.Equal(new DateOnly(2026, 1, 2), outOfWindow.FilingDate);
-        Assert.False(outOfWindow.InWindow, "accepted 2026-01-02, one day past WindowTo");
+        Assert.False(outOfWindow.InWindow, "stamped 2026-01-02T13:00Z == 08:00 ET, one day past WindowTo");
         Assert.Equal("out of window", outOfWindow.DedupNote);
     }
 
@@ -168,7 +170,7 @@ public sealed class EventsStepTests
         using var dir = new TempStudyDirectory();
         var (_, events, _, _) = await RunAsync(dir, [EligibleRow("SAMP", 1000001)], SampleCoHandler());
 
-        // A: accepted Jan 30 17:45, filingDate Jan 31. B: accepted Jan 31 08:00, filingDate Jan 31.
+        // A: accepted Jan 30 17:45 ET, filingDate Jan 31. B: accepted Jan 31 08:00 ET, filingDate Jan 31.
         var a = events.Single(e => e.AccessionNumber == "0001000001-23-000001");
         var b = events.Single(e => e.AccessionNumber == "0001000001-23-000002");
 
@@ -283,11 +285,11 @@ public sealed class EventsStepTests
         Assert.Equal(2, sharesFacts.Count(r => r.Cik == 1000001));
     }
 
-    // ---- RequiresEdgar: pins the Eastern reading against the real SEC data ----------------------
+    // ---- RequiresEdgar: pins the UTC-to-Eastern conversion against the real SEC data ------------
 
     [Fact]
     [Trait("Category", "RequiresEdgar")]
-    public async Task Live_apple_8K_filed_2024_02_01_has_item_202_and_accepts_at_hour_16_Eastern()
+    public async Task Live_apple_8Ks_in_both_DST_phases_accept_at_1630_Eastern()
     {
         var userAgent = Environment.GetEnvironmentVariable("EDGAR_USER_AGENT");
         if (string.IsNullOrWhiteSpace(userAgent))
@@ -296,7 +298,7 @@ public sealed class EventsStepTests
             // is unreachable from this sandbox, and this tool refuses to invent a declared
             // User-Agent on the operator's behalf, so this test only runs where a real one is set.
             Console.WriteLine(
-                "SKIPPED Live_apple_8K_filed_2024_02_01_has_item_202_and_accepts_at_hour_16_Eastern: " +
+                "SKIPPED Live_apple_8Ks_in_both_DST_phases_accept_at_1630_Eastern: " +
                 "EDGAR_USER_AGENT is not set in this environment.");
             return;
         }
@@ -306,17 +308,58 @@ public sealed class EventsStepTests
         using var doc = JsonDocument.Parse(body);
         var (recent, _) = EdgarParsing.ParseSubmissions(doc.RootElement);
 
-        var filing = recent.SingleOrDefault(f => f.FilingDate == new DateOnly(2024, 2, 1) && f.Form == "8-K");
+        // Apple releases at 16:30 Eastern every quarter, so the raw stamp is 21:30Z in winter and
+        // 20:30Z in summer: the field is UTC, and the offset moves with DST. One filing cannot pin
+        // that. A feed that had switched to a fixed UTC-5 stamp would satisfy the winter row on its
+        // own while placing every summer acceptance an hour late — enough to carry a 16:00-16:59 ET
+        // filing across the close and turn an intraday print into an AMC one. Two rows, both DST
+        // phases, one fetch.
+        AssertAcceptsAt1630Eastern(recent, new DateOnly(2024, 2, 1), "0000320193-24-000005"); // EST, stamped 21:30:30Z
+        AssertAcceptsAt1630Eastern(recent, new DateOnly(2026, 7, 30), "0000320193-26-000018"); // EDT, stamped 20:30:28Z
+    }
+
+    /// <summary>
+    /// One live filing: selected as an item-2.02 8-K and read to 16:30 Eastern. If EDGAR ever changes
+    /// how it stamps this field, these assertions — not a unit test against fixtures written from
+    /// them — are what will say so.
+    /// </summary>
+    private static void AssertAcceptsAt1630Eastern(List<RawFiling> recent, DateOnly filingDate, string accessionNumber)
+    {
+        var filing = recent.SingleOrDefault(f => f.FilingDate == filingDate && f.Form == "8-K");
         Assert.True(filing is not null,
-            $"expected exactly one 8-K filed 2024-02-01 among {recent.Count} item-2.02 filings fetched live for CIK 320193; " +
+            $"expected exactly one 8-K filed {filingDate:yyyy-MM-dd} among {recent.Count} item-2.02 filings fetched live for CIK 320193; " +
             $"filing dates actually returned: {string.Join(", ", recent.Select(f => $"{f.FilingDate}/{f.Form}"))}");
 
-        Assert.Contains("2.02", filing!.Items.Split(',').Select(s => s.Trim()));
-        // Pins the Eastern-wall-clock reading against reality: a UTC misreading of this same
-        // timestamp would land close to midday ET, not after the 2024-02-01 market close. If EDGAR
-        // ever changes how it stamps this field, this assertion -- not a unit test against a
-        // fixture -- is what will tell us.
+        Assert.Equal(accessionNumber, filing!.AccessionNumber);
+        Assert.Contains("2.02", filing.Items.Split(',').Select(s => s.Trim()));
         Assert.Equal(16, filing.AcceptanceEt.Hour);
         Assert.Equal(30, filing.AcceptanceEt.Minute);
+    }
+
+    // ---- The UTC/Eastern date boundary, through the window gate ---------------------------------
+
+    /// <summary>
+    /// The window gate reads the EASTERN date. The sample fixture's own boundary rows cannot show
+    /// that — 2025-12-31T22:45Z is 2025-12-31 under either reading — so this case, whose UTC date and
+    /// Eastern date are different days, is the one that discriminates.
+    /// </summary>
+    [Fact]
+    public async Task An_evening_acceptance_is_in_window_on_its_Eastern_date_not_its_UTC_one()
+    {
+        using var dir = new TempStudyDirectory();
+        var handler = new FakeHttpHandler()
+            .On("https://data.sec.gov/submissions/CIK0001000004.json", HttpStatusCode.OK, Fixture.Read("Edgar/submissions-eveningfiler.json"))
+            // companyfacts is a separate fetch and says nothing about submissions; a 404 is counted, not a crash.
+            .On("https://data.sec.gov/api/xbrl/companyfacts/CIK0001000004.json", HttpStatusCode.NotFound, "nope");
+
+        var (_, events, _, _) = await RunAsync(dir, [EligibleRow("EVEN", 1000004)], handler);
+
+        // Stamped 2026-01-01T01:00:00.000Z: 20:00 ET on 2025-12-31, the last day of the window, and
+        // 2026-01-01 in UTC, one day past it.
+        var filing = Assert.Single(events);
+        Assert.Equal(new DateTime(2025, 12, 31, 20, 0, 0, DateTimeKind.Unspecified), filing.AcceptanceEt);
+        Assert.True(filing.InWindow, "20:00 ET on 2025-12-31 is inside the window; 01:00Z on 2026-01-01 would not be");
+        Assert.True(filing.KeptAfterDedup);
+        Assert.Equal(new DateOnly(2026, 1, 2), filing.FilingDate); // EDGAR dates a late acceptance to the next business day
     }
 }

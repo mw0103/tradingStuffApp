@@ -25,7 +25,7 @@ dotnet test tests/TradingStuff.EarningsStudy.Tests/TradingStuff.EarningsStudy.Te
   --filter "Category=RequiresEdgar" -p:SkipClientApp=true
 ```
 
-This pins the Eastern reading of EDGAR acceptance times: Apple's 2024-02-01 8-K must show acceptance hour 16.
+This pins the UTC-to-Eastern conversion of EDGAR acceptance times in both DST phases: Apple's 2024-02-01 8-K is stamped `2024-02-01T21:30:30.000Z` (EST) and its 2026-07-30 8-K `2026-07-30T20:30:28.000Z` (EDT), and both must show acceptance 16:30.
 
 ```bash
 TRADING_TEST_THETA=127.0.0.1:25503 \

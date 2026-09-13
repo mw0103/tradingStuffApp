@@ -1125,6 +1125,45 @@ verdict on the (empty) trailing subset. Consequence recorded by the implementer:
 withholds its whole quarter at 07b, so gates 08 and 11 cannot see a "no row at all" case in a full
 pipeline; their guards stay as defence in depth.
 
+**EDGAR acceptance times were four to five hours late; the `RequiresEdgar` pin caught it
+(2026-09-13, Opus/high; 333 study tests).** The pin's first live run failed — expected acceptance
+hour 16, actual 21. `data.sec.gov/submissions/CIK0000320193.json` stamps Apple's 2024-02-01 8-K
+(accession 0000320193-24-000005) `2024-02-01T21:30:30.000Z`, and its 2026-07-30 8-K
+`2026-07-30T20:30:28.000Z`: the same 16:30 Eastern acceptance every quarter, 21:30Z under EST and
+20:30Z under EDT. The field is genuine UTC with a DST-varying offset, which a fixed wall clock could
+not be. `ParseAcceptanceEt` had been stripping the `Z` and reading the digits as Eastern, on a doc
+comment claiming that reading was "verified against Apple's FY24 Q1 8-K … reads 16:30:38" — no live
+fetch ever returned that string, EDGAR being unreachable from the sandbox that wrote the claim, and
+the unit test and the `submissions-sampleco` fixtures encoded the same belief, which is why the
+suite was green. Every acceptance would have been placed four or five hours late, which moves events
+between timing classes rather than moving the numbers inside them. Fixed by
+reading the instant as UTC and converting once through the new `EdgarAcceptance.FromUtcInstant`,
+which reuses the boundary's existing `America/New_York` zone so the one-conversion-site doctrine
+still holds; a stamp that is not Z-marked UTC is now refused as a data-shape break rather than read
+under a guessed zone. Every fixture stamp was converted to the UTC value that yields the Eastern
+time it was written to mean (EST or EDT per its own date), so every classification and gate count is
+unchanged. The pin now passes at hour 16 minute 30, and reintroducing the old return made it fail
+again with 21 — which is also what proves it reaches EDGAR rather than returning early. It covers
+both DST phases off one fetch (the 2024-02-01 and 2026-07-30 8-Ks), because a feed that moved to a
+fixed UTC-5 stamp would satisfy a winter-only pin while reading every summer acceptance an hour
+late. No verb had
+been run, so no derived table needs regenerating. The seam the defect lived in — raw stamp to
+classification — had no test, every parser case stopping at a `DateTime` and every resolver case
+starting from one; `TimingResolverTests` now has theories that run the whole way. Measured through
+them, the old reading did two things, and neither is a wrong number. A BMO release at 07:00 ET
+(stamped 12:00Z) landed at midday, inside the session: INTRADAY, quarantined at gate 07 — so
+essentially every BMO event would have been silently **absent** from the sample. And a true intraday
+print from 11:00 ET to the close (12:00 under EDT) landed at or after 16:00 and was **admitted** as a
+clean AMC, with an entry close struck up to five hours AFTER the release: a post-release entry
+snapshot, which is the leakage face of the same defect. Both are pinned now. The evening case is
+milder than it first looks — a 20:00 ET print (stamped 01:00Z the next day) has its print date moved
+a day forward and its class flipped, but pre-entry, entry and exit are unchanged, because the shift
+crosses no close, and the earnings week is unchanged because a business-day shift cannot cross an ISO
+week boundary. Apple's own 16:30 stamp is post-close under either reading, which is why the unit test
+built on it was green. `Resolve`'s two DST branches are kept: the
+conversion cannot produce a spring-forward wall clock, but wall clocks reach `Resolve` from
+`events.csv` as well, and the CSV carries no offset. Lesson added to `docs/LESSONS.md` (#4).
+
 ## Left
 
 Earnings study C1 (`docs/research/c1-run-instructions.md`):

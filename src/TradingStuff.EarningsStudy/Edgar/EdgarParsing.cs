@@ -1,5 +1,6 @@
 using System.Globalization;
 using System.Text.Json;
+using TradingStuff.EarningsStudy.Timing;
 
 namespace TradingStuff.EarningsStudy.Edgar;
 
@@ -30,25 +31,58 @@ internal static class EdgarParsing
         items.Split(',').Any(token => token.Trim() == "2.02");
 
     /// <summary>
-    /// EDGAR's <c>acceptanceDateTime</c> is shaped like ISO-8601 UTC ("2024-02-01T16:30:38.000Z")
-    /// but the trailing "Z" is NOT a UTC offset marker: EDGAR stamps this field in Eastern wall-clock
-    /// time regardless of the filer's own location. Verified against Apple's FY24 Q1 8-K (CIK
-    /// 320193): it was released after the 2024-02-01 close, and this field reads "16:30:38" — a true
-    /// UTC timestamp for an after-the-close release would read roughly 21:00-22:00 (accounting for
-    /// EST/EDT), not 16:30. So: strip the "Z", parse what remains as a plain local-looking timestamp,
-    /// and stamp the result Unspecified — here "Unspecified" specifically means "Eastern wall clock",
-    /// by the convention of this one EDGAR field, not "timezone unknown".
+    /// EDGAR's <c>acceptanceDateTime</c> is an ISO-8601 UTC instant ("2024-02-01T21:30:30.000Z") and
+    /// the trailing "Z" means exactly what it says. The value is converted once, at
+    /// <see cref="EdgarAcceptance.FromUtcInstant"/>, into the America/New_York wall clock the rest of
+    /// the study carries; the returned <see cref="DateTimeKind.Unspecified"/> means "Eastern wall
+    /// clock", not "timezone unknown", which is the contract
+    /// <see cref="EdgarAcceptance.Resolve"/> enforces.
     /// </summary>
+    /// <remarks>
+    /// <para>
+    /// <b>Observed live 2026-09-13</b> against <c>data.sec.gov/submissions/CIK0000320193.json</c>:
+    /// Apple's 2024-02-01 8-K, accession 0000320193-24-000005, reads
+    /// <c>"2024-02-01T21:30:30.000Z"</c>, and its 2026-07-30 8-K reads
+    /// <c>"2026-07-30T20:30:28.000Z"</c>. Both are the same 16:30 Eastern acceptance: 21:30Z under
+    /// EST (UTC-5), 20:30Z under EDT (UTC-4). A field stamped in a fixed wall clock could not shift
+    /// by an hour with the season, so the offset is genuine.
+    /// </para>
+    /// <para>
+    /// This method previously stripped the "Z" and read the digits as Eastern, on a doc comment
+    /// claiming that reading had been "verified against Apple's FY24 Q1 8-K … reads 16:30:38". No
+    /// live fetch ever returned that string — EDGAR was unreachable from the sandbox that wrote the
+    /// claim — and the effect was to place every acceptance four or five hours late, moving an AMC
+    /// print past midnight and, with it, the print date and every measurement date derived from it.
+    /// The registered <c>Category=RequiresEdgar</c> pin is what caught it, by failing with hour 21
+    /// where it expected 16 (docs/LESSONS.md 4: a confident comment is where defects hide, and
+    /// "verified against X" written where X was unreachable is a claim, not a verification).
+    /// </para>
+    /// <para>
+    /// The offset marker is therefore load-bearing, so a stamp that is not Z-marked UTC is refused
+    /// rather than read under a guess — the same data-shape break as a missing
+    /// <c>acceptanceDateTime</c>, and for the same reason (docs/LESSONS.md 8).
+    /// </para>
+    /// </remarks>
     public static DateTime ParseAcceptanceEt(string raw)
     {
         var trimmed = raw.Trim();
-        if (trimmed.EndsWith('Z') || trimmed.EndsWith('z')) trimmed = trimmed[..^1];
-        var parsed = DateTime.ParseExact(
-            trimmed,
-            ["yyyy-MM-dd'T'HH:mm:ss.fff", "yyyy-MM-dd'T'HH:mm:ss"],
-            CultureInfo.InvariantCulture,
-            DateTimeStyles.None);
-        return DateTime.SpecifyKind(parsed, DateTimeKind.Unspecified);
+        var digits = trimmed.Length > 0 && trimmed[^1] is 'Z' or 'z' ? trimmed[..^1] : null;
+
+        if (digits is null || !DateTime.TryParseExact(
+                digits,
+                ["yyyy-MM-dd'T'HH:mm:ss.fff", "yyyy-MM-dd'T'HH:mm:ss"],
+                CultureInfo.InvariantCulture,
+                DateTimeStyles.None,
+                out var parsed))
+        {
+            throw new InvalidDataException(
+                $"EDGAR acceptanceDateTime '{raw}' is not a Z-marked UTC instant of the form " +
+                "yyyy-MM-ddTHH:mm:ss[.fff]Z. Every acceptanceDateTime EDGAR has been observed to " +
+                "emit is; the zone marker decides what the digits mean, so a different shape is " +
+                "treated as a data-shape break rather than read under an assumed zone.");
+        }
+
+        return EdgarAcceptance.FromUtcInstant(DateTime.SpecifyKind(parsed, DateTimeKind.Utc));
     }
 
     /// <summary>

@@ -24,10 +24,12 @@ public sealed record EdgarAcceptanceInstant(
 /// <para>
 /// This is the study's analogue of the <c>IBApi</c> <c>double</c> boundary in the platform proper:
 /// a vendor hands us a value in its own representation, it is converted once at the edge, and
-/// everything inside works in the canonical one. EDGAR's <c>acceptanceDateTime</c> is an
-/// America/New_York wall clock with no offset attached; <see cref="EventRow.AcceptanceEt"/> carries
-/// it verbatim as a <see cref="DateTimeKind.Unspecified"/> <see cref="DateTime"/>. Downstream of
-/// this class every timing decision is a comparison of UTC instants against
+/// everything inside works in the canonical one. EDGAR's <c>acceptanceDateTime</c> is a UTC instant
+/// (see <c>EdgarParsing.ParseAcceptanceEt</c>); <see cref="FromUtcInstant"/> turns it into the
+/// America/New_York wall clock that <see cref="EventRow.AcceptanceEt"/> carries as a
+/// <see cref="DateTimeKind.Unspecified"/> <see cref="DateTime"/>, and <see cref="Resolve"/> turns
+/// that wall clock back into an instant. Downstream of this class every timing decision is a
+/// comparison of UTC instants against
 /// <see cref="TradingStuff.ResearchContracts.ISessionClock"/> session boundaries, which are
 /// themselves UTC.
 /// </para>
@@ -37,13 +39,19 @@ public sealed record EdgarAcceptanceInstant(
 /// <i>calendar</i>: what session an instant falls in, and what trading date it belongs to. Neither
 /// question is asked here. This class answers only "what instant did EDGAR mean", and it asks the
 /// clock nothing. A second conversion anywhere in the study — a hand-rolled "subtract five hours", a
-/// <c>DateTime.SpecifyKind(..., Utc)</c>, a second <see cref="TimeZoneInfo"/> lookup — is the defect
-/// this class exists to make unnecessary.
+/// <c>DateTime.SpecifyKind(..., Utc)</c> on a value that is not already a UTC instant, a second
+/// <see cref="TimeZoneInfo"/> lookup — is the defect this class exists to make unnecessary. The one
+/// <c>SpecifyKind(..., Utc)</c> in the study is in <c>EdgarParsing.ParseAcceptanceEt</c>, on digits
+/// the stamp's "Z" has already declared UTC, feeding <see cref="FromUtcInstant"/> directly: that is
+/// labelling, not converting.
 /// </para>
 /// <para>
 /// <b>DST.</b> Neither DST case can arise from real EDGAR data: US transitions happen at 02:00 local
-/// on a Sunday, and EDGAR accepts filings on business days between 06:00 and 22:00 ET. Both are
-/// nevertheless decided here rather than left to the framework's defaults, because those defaults
+/// on a Sunday, and EDGAR accepts filings on business days between 06:00 and 22:00 ET. Nor can
+/// <see cref="FromUtcInstant"/> manufacture an invalid one. Neither fact makes the two branches
+/// below dead, because a wall clock reaches <see cref="Resolve"/> from <c>events.csv</c> as readily
+/// as from the parser, and by then the offset is gone. Both are therefore decided here rather than
+/// left to the framework's defaults, because those defaults
 /// are wrong in opposite directions — <see cref="TimeZoneInfo.ConvertTimeToUtc(DateTime, TimeZoneInfo)"/>
 /// throws on an invalid time (a throw that would kill a whole run over one row) and silently assumes
 /// standard time on an ambiguous one.
@@ -78,6 +86,40 @@ public static class EdgarAcceptance
 
     /// <summary>Noon Eastern: the cut used to label an acceptance on a day the exchange never opened. See <see cref="TimingResolver"/>.</summary>
     public static readonly TimeOnly NoonEt = new(12, 0);
+
+    /// <summary>
+    /// The inbound half of the boundary: EDGAR's UTC <c>acceptanceDateTime</c> instant to the
+    /// America/New_York wall clock every row downstream carries. Lives here, beside the single
+    /// <see cref="TimeZoneInfo"/> instance in the study, so the "one conversion site" claim above
+    /// stays true — <c>EdgarParsing.ParseAcceptanceEt</c> calls this instead of resolving the zone a
+    /// second time.
+    /// </summary>
+    /// <param name="utcInstant">
+    /// The instant EDGAR stamped. Must carry <see cref="DateTimeKind.Utc"/>, the mirror of
+    /// <see cref="Resolve"/>'s Unspecified contract: a value of some other kind has already been
+    /// interpreted by somebody else, and converting it again here would shift it silently.
+    /// </param>
+    /// <remarks>
+    /// Unlike <see cref="Resolve"/>, this direction decides nothing: every UTC instant names exactly
+    /// one Eastern wall clock. It cannot return a time inside the spring-forward gap, and where it
+    /// lands in the fall-back hour the offset that told the two occurrences apart is gone from the
+    /// returned value by construction. That is why <see cref="Resolve"/> still has to rule on both
+    /// cases — the wall clocks reaching it come from <c>events.csv</c> as often as from this method,
+    /// and the CSV carries no offset.
+    /// </remarks>
+    public static DateTime FromUtcInstant(DateTime utcInstant)
+    {
+        if (utcInstant.Kind is not DateTimeKind.Utc)
+        {
+            throw new ArgumentException(
+                "the EDGAR acceptance instant must carry DateTimeKind.Utc before it is converted to " +
+                $"an Eastern wall clock; got {utcInstant.Kind} for {utcInstant:O}.",
+                nameof(utcInstant));
+        }
+
+        return DateTime.SpecifyKind(
+            TimeZoneInfo.ConvertTimeFromUtc(utcInstant, Eastern), DateTimeKind.Unspecified);
+    }
 
     /// <summary>Resolves an EDGAR acceptance wall clock to its UTC instant.</summary>
     /// <param name="acceptanceEt">

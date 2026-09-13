@@ -133,6 +133,9 @@ public sealed class EventsStep(
 
         foreach (var group in candidates)
         {
+            // Ordered by the Eastern wall clock, which is the acceptance instant for every value
+            // EDGAR can produce: the one hour where two instants share a wall clock is the autumn
+            // fall-back, 01:00-02:00 ET on a Sunday, and EDGAR accepts on business days.
             var ordered = group.OrderBy(x => x.Event.AcceptanceEt).ThenBy(x => x.Event.Symbol, StringComparer.Ordinal).ToList();
             var kept = ordered[0];
             events[kept.Index] = kept.Event with { KeptAfterDedup = true, DedupNote = null };
