@@ -1100,20 +1100,43 @@ outcome-blind rule is ratified with the v0 two-signal comparison allowed only as
 diagnostic; a blind deadline fallback is pre-committed (the most recent K fully-covered calendar
 quarters, symbol-partial subsets prohibited, memo labelled PROVISIONAL, full run still owed); the
 readings of frozen text are ratified; four live pins are required before unblinding. Registered
-verbatim; the implementation of §1–§3 in `compute` follows as a separate entry.
+verbatim.
+
+**v2 implemented in `compute` (Opus/high, 2026-09-13 early; 325 study tests).** The verdict is
+mean(RF/IM) < 1 with the week-clustered interval excluding 1 (closed interval; a mean or an
+endpoint of exactly 1 fails; the boundary annotation covers all three numbers); median and
+P(RF<IM) print as descriptive readouts with their intervals; the straddle hold-through cross-check
+prints agree/disagree (long-straddle convention: negative mean agrees with PASS, exactly zero with
+FAIL); the v0 two-signal rule is a `bool?` column and a §9.2 line with the would-have-been-removed
+set's mean(RF/IM) beside the sample's, and gates nothing. The deadline fallback is automatic: a
+quarter is covered when every in-window kept event with a print date in it has a row in both
+`option_measures.csv` and `closes.csv` (any status; an empty quarter is covered vacuously, with its
+event count printed), the deliverable subset is the trailing run of covered quarters ending at
+2025Q4, applied as gate `07b_full_quarter_coverage_subset` (a time-only cut, added to
+`Gates.InOrder` after 07), the memo is titled PROVISIONAL with the sixteen-quarter coverage table,
+nothing deliverable exits non-zero, and `--require-full-window` refuses a provisional run. The
+chains verb processes the most recent print dates first so a partial pull completes whole recent
+quarters. Calibration through the real step: the fairly priced population that PASSed under v0
+(median 0.71, interval [0.617, 0.683]) FAILs under v2 (mean 1.000000, interval [0.913, 1.084]); the
+same population with IM inflated 30 % PASSes (mean 0.769, interval [0.702, 0.834]); reintroducing
+the v0 criterion makes the fair population pass again. Orchestrator check: removing one quarter's
+option rows from the fixture withheld that quarter at 07b and produced a PROVISIONAL memo with no
+verdict on the (empty) trailing subset. Consequence recorded by the implementer: a missing row now
+withholds its whole quarter at 07b, so gates 08 and 11 cannot see a "no row at all" case in a full
+pipeline; their guards stay as defence in depth.
 
 ## Left
 
 Earnings study C1 (`docs/research/c1-run-instructions.md`):
 
-- Run the three live tests on the operator's machine, then the six verbs in order; the memo
-  `data/earnings-c1/c1_memo.md` is the Monday 2026-09-14 09:00 CT deliverable. Commit the derived
-  tables (not `raw/`).
+- Run the four live pins of v2 §5 on the operator's machine, then the six verbs in order (start
+  `closes` first — a quarter is covered only when every symbol's bars are in); the memo
+  `data/earnings-c1/c1_memo.md` is the Monday 2026-09-14 09:00 CT deliverable, PROVISIONAL if the
+  fallback fired, and the full-window run stays owed. Pass `--require-full-window` on the final
+  run. Commit the derived tables (not `raw/`).
 - Read the three instruments before the verdict line: parity-vs-close deviation quantiles, the
   spot-source and price-source tallies, the IM-collapse cross-tab (memo §9.2); and §9.3 on what the
   registered criterion establishes.
-- Decide, in the ledger, whether C1 v2 registers a mean-based criterion; the frozen v0 file stays
-  as it is either way.
 - Known, not fixed: `TimingQuarantineReasons` in the memo groups every quarantined timing row,
   including orphans of events the events verb dropped, so it can exceed gate 07's removals; the
   §4 table prints the median at F6 while the verdict line annotates a boundary value.
