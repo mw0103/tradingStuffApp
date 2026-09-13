@@ -1,6 +1,6 @@
 # State
 
-Updated: 2026-07-31
+Updated: 2026-09-12 (late)
 
 ## Done
 
@@ -940,7 +940,245 @@ historical probing and passed 12/12 on re-run. Some of these tests deliberately 
 `EClientSocket`, bypassing the pacing governor, so sustained probing can trip TWS's own limits. It is
 not currently a reliable single-run gate.
 
+### Earnings vol premium study — C1 pre-registration frozen (2026-09-12)
+
+Registered in the hypothesis ledger before any query execution, per the freeze-before-compute rule:
+
+- `docs/research/earnings-vol-premium-spec-v0.3.md` — spec v0.3 (supersedes v0.2, closed record):
+  claims C1–C6, definitions, fill model, data sources, feature families F1-A/F1-B/L1/F2,
+  pipeline stages, nulls and kill criteria, side studies, rejected designs.
+- `docs/research/c1-preregistration-v0.md` — **C1 pre-registration v0, FROZEN Saturday
+  2026-09-12 prior to any query execution.** That file is not edited after the first query runs;
+  changes require C1-PREREG v2 in the ledger with a stated reason. Deliverable: one memo by
+  Monday 2026-09-14, 09:00 America/Chicago. C1 FAIL stops the program per spec v0.3.
+
+Both files are registered verbatim as received (spec copy checksum-verified against the source).
+No query has been executed as of this registration.
+
+### Earnings study C1 — pipeline build (2026-09-12) — CODE-COMPLETE, NOT YET RUN
+
+`src/TradingStuff.EarningsStudy` — a batch CLI whose verbs run in pipeline order (`universe`,
+`events`, `timing`, `chains`, `closes`, `compute`), each reading the previous verb's CSV under
+`data/earnings-c1/`. The record contracts, gate keys and CSV mapper were fixed in a skeleton first so
+five packages could be built in parallel against one shape. The CBOE optionable directory as of
+2026-09-12 is frozen in the repo as the survivorship-logged seed (5,333 symbols). Stock prices are
+official IBKR daily closes via the gateway's history endpoint (no new data subscription); the spot
+in IM's denominator is the option feed's underlying price where the Terminal supplies one, else
+put-call parity at the ATM pair, with the parity-vs-close deviation reported as a diagnostic.
+
+**Where each verb must run.** EDGAR refuses this sandbox's requests ("Undeclared Automated Tool" —
+the SEC requires a declared contact in the User-Agent, and the operator's contact was not put into
+an outbound header without being asked), the Theta Terminal and TWS are on the operator's machine.
+Every verb that touches a network source (`universe` needs the SEC ticker file, `events`,
+`chains`, `closes`) is therefore built against fixtures plus `Category`-tagged live tests, and runs
+on the operator's machine; the sandbox verified the code paths on fixtures only.
+
+**Model arbitration for this build** (CLAUDE.md phase-start protocol: Opus attacker vs Opus
+justifier, Fable arbiter; table wins ties, a deviation needs a named trigger):
+
+- **WP1 EDGAR events/universe — Sonnet/high, held.** Both advocates agreed. Winning argument: every
+  gate is a boolean over fields EDGAR stamps, with an independent oracle (hand-check twenty CIKs).
+  Conceded: the as-of shares pick and the first-filing-wins dedup are selection/as-of semantics
+  outside the leakage reviewer's default remit — the as-of pick was moved into WP2's `AsOf` (the
+  study's one point-in-time function) and the review scope extended to WP1's dedup.
+- **WP2 timing/dates/QA rule — Opus/high, held.** Both agreed. Winning argument: the calendar is
+  reused, not manufactured, but the acceptance→BMO/AMC boundary and the late-filing quarantine rule
+  are invented here with no oracle but the memo's own quarantine line — class (b) verbatim.
+  Conceded: had the quarantine rule been descoped, this package falls to Sonnet/high.
+- **WP3 option measures — split.** The pure selection core (front expiry, parity spot, ATM pair,
+  tiers) **escalated to Opus/high**; the fetch/cache/assembly plumbing **held at Sonnet/high**.
+  Winning argument (calibration, not forecast): the repository's worst confirmed critical was
+  selection semantics written at Sonnet — the 54-node grid collapse — whose outputs were well-formed
+  and pointed at the wrong contracts, and this core defines the primary sample. Conceded (the
+  attacker's point, accepted): the justifier's named trigger, the decimal/double boundary, was
+  neutralised by design instead — prices are parsed to decimal from the feed's text, never through
+  the Volatility library's double quotes — and selection is fixture-assertable, so the escalation
+  rests on the calibration evidence alone. The bracketing guard from the Phase 1+2 fix is required.
+- **WP4 IBKR closes — Sonnet/medium, held.** The justifier argued the class (c) floor
+  ("a rerun adds nothing" is a negative claim). Winning argument: the claim is verified positively
+  downstream — `compute` counts a missing close as an exclusion, so absence renders as a number,
+  not as health. Conceded: resumability must never trust a partial file, so the step writes each
+  series atomically with a completion marker and re-fetches anything unmarked.
+- **WP5 statistics/memo — escalated Sonnet/high → Opus/high.** Named trigger: correctness hard to
+  cover with tests where the validating artifact is produced by the same code — the memo certifies
+  the verdict it computes, and the least-symptomatic defect (a bootstrap that ignores week
+  clustering narrows the interval) points at PASS. Conceded (the attacker's point, accepted):
+  consequence severity is not a trigger, and synthetic clustered data does give the resampling
+  arithmetic an oracle — the escalation rests on the definitional half (ties, trimming, even-n
+  median, ISO weeks, boundaries) that must be fixed before data is seen, on a package class the
+  table has never been calibrated against. Prediction to check at review: defects, if any, will be
+  definitional rather than arithmetic.
+
+**Build outcomes, per package** (each agent ran reintroduce-the-defect controls on its own tests;
+counts are theirs, re-run by the orchestrator only as the green suite after merge): WP3a 42 cases /
+39 mutations all caught; WP2 42 tests / 38 mutations, and its own controls surfaced two real defects
+(a corrupt acceptance date near `DateOnly`'s bounds killed the whole run — now refused per row as
+UNRESOLVED); WP4 37 tests / 6 mutations plus a real end-to-end run against an in-process Kestrel
+stub of the gateway; WP5 66 tests / 23 mutations (including resampling events instead of weeks);
+WP1 54 tests / 14 mutations. Cross-package checks the orchestrator ran itself: the trailing
+20-day scale is a fraction on both the producing (WP4) and consuming (WP2) side; `timing` then
+`compute` chained through the shared tables on the fixture; a verb re-run leaves one tally per
+(step, gate) — the append-only tally file would otherwise have double-counted the exclusion table,
+fixed centrally in the CLI before any package noticed; dual-class names (GOOG/GOOGL share a CIK)
+collapse to one kept event per quarter under the registered CIK-quarter dedup, with the tie now
+broken by symbol rather than seed-file order. Full solution builds; the platform's own suite is
+1,445/1,445 with the new projects in place.
+
+**Leakage review (Opus/high, executed rather than read — 8 findings, 1 critical).** The critical
+one was the question the orchestrator had put to the reviewer on launch: gate 09's price QA
+conditioned INCLUSION on the post-entry event move, i.e. on RF, the numerator of the primary
+statistic. Quantified on 6,000 clean synthetic events: the rule removed 3.1 % of events, and the
+removed set was the strongest PASS evidence in the sample (P(RF<IM) 0.946 against a population
+0.620); in a boundary population it flipped the verdict PASS → FAIL. The WP2 comment asserting the
+opposite direction was false — a false positive removes a small-RF event, which raises
+median(RF/IM) and lowers P(RF<IM), toward the FAIL that stops the program — so the rule defeated
+the registration's stated logic that every v0 bias points toward PASS. A pre-entry-only rule at
+the same threshold caught the same injected late filings and moved the statistics essentially
+not at all. Fix: the event-move conjunct is dropped; the decision uses pre-entry closes and the
+trailing scale only. Also found: `compute` and `timing` held different definitions of the event
+set (KeptAfterDedup vs InWindow && KeptAfterDedup), so a missing `event_timing.csv` row rendered as
+a gate-07 removal with the memo header contradicting its own exclusion table — class (c) exactly;
+the IM-collapse witness for gate 09 was written, tested and called by nothing (the same shape as
+`MigrationHealthCheck` in the Phase 1+2 review); the as-of shares pick admitted a fact filed after
+the close on the entry date (inclusive `<=`; now strict); the verdict line could print
+"1.000000 < 1"; the quarantine rate mixed two denominators. Checked and sound: the calendar
+resolution over every day 2022–2025 × 65 acceptance times (94,965 resolutions, zero look-ahead);
+the week-clustered bootstrap (3.39× wider than event-level under a common weekly shock,
+nearest-rank endpoints exact, byte-identical memo on re-run); the selection core over 20,000
+random ladders (zero edge clamps); decimal round-trips and null handling.
+
+One finding is about the registration itself, not the code: the registered PASS condition
+(median(RF/IM) < 1 and P(RF<IM) > 0.5) is also satisfied by a fairly priced market whenever
+median|move| < mean|move|, which holds for every symmetric distribution — a zero-edge calibration
+gave median 0.845 and P 0.575. The memo executes the registered rule unchanged and now says this
+in its limitations; the mean-based straddle hold-through diagnostic is the readout that speaks to
+a premium in expectation. The frozen file is not edited; whether C1 v2 should register a
+mean-based criterion is a ledger decision for the operator.
+
+**Calibration verdict on the arbitration record.** The prediction "definitional, not
+arithmetic" held for WP5 — every arithmetic path with an oracle came back clean — but the critical
+defect lived in WP2's rule, already escalated to Opus/high as class (b), and escalation found the
+rule's shape, not its direction: direction is invisible by reading and took a population to see.
+Durable correction, by class: any package whose acceptance criterion is a registered verdict gets a
+null-population run in review — a synthetic sample containing none of the contamination the rule
+targets — measuring what the rule does to the headline statistic. Reading a selection rule proves
+nothing about its selection effect.
+
+**Review fixes, applied and re-verified.** Timing (Opus/high): the event-move conjunct dropped, the
+as-of pick made strict, the attribution comments corrected; the fix agent re-reproduced the verdict
+flip at three boundary tunings before changing anything, and a new test pins that two closes rows
+differing only in the exit close get the same decision. Stats (Opus/high): `compute` now filters
+the same event set `timing` does and warns when a kept event has no timing row; the IM-collapse
+diagnostic is computed per event, its inputs carried in the event table, and its cross-tab against
+gate 09 printed; the verdict line prints the unrounded value at a boundary; the two quarantine rates
+are reported against their own denominators; the price source is named; a new memo section 9.3
+states that the registered PASS condition is satisfied by a fairly priced market. WP3b (Sonnet/
+high, second attempt — the first died on an output-token cap while still reading): the Theta fetch
+with EOD-report-first and 15:45-minute fallback, verbatim response cache, per-event isolation, and
+a documented property that `chain_empty` and `no_paired_strike` are unreachable by construction in
+this verb's check order (the entry-rows pre-check and parity's solvable set intercept them), so
+those two exclusion rows read zero honestly. A scheduling-sensitive concurrency test in WP4 that
+failed once under full-suite load was rewritten around a barrier with a fast-failing 400. The
+orchestrator's own first negative control for that test mutated nothing and passed — caught before
+push and now LESSONS.md #14.
+
+**Final state.** Six verbs, 293 study tests, the platform's own suite green alongside, full solution
+builds. **Not one live surface has been exercised**: EDGAR, the Theta Terminal and the gateway were
+all unreachable from the build sandbox. Three `Category`-gated live tests pin the facts the fixtures
+assume — `RequiresEdgar` (Apple's 2024-02-01 8-K accepted at hour 16 Eastern), `RequiresThetaTerminal`
+(the EOD header, `underlying_price`, price scale, EOD vs minute fallback), `RequiresGateway` (a real
+bars request) — and `docs/research/c1-run-instructions.md` says to run them before the pipeline.
+Two lessons went to `docs/LESSONS.md` (#13, #14). The frozen v0 registration is unedited.
+
+**C1-PREREG v2 registered (2026-09-12, evening; `docs/research/c1-preregistration-v2.md`).** A
+pre-result amendment with the blind intact — no real-data memo exists. Stated reason: the review's
+proof that the v0 shape criterion passes under fair pricing. The decision criterion becomes
+mean(RF/IM) < 1 with the week-clustered 95 % interval excluding 1 (null value exactly 1 under fair
+per-event pricing by the tower property); median and P(RF<IM) are demoted to readouts; the straddle
+hold-through return is the economic cross-check whose sign must agree with the verdict; gate 09's
+outcome-blind rule is ratified with the v0 two-signal comparison allowed only as a post-hoc
+diagnostic; a blind deadline fallback is pre-committed (the most recent K fully-covered calendar
+quarters, symbol-partial subsets prohibited, memo labelled PROVISIONAL, full run still owed); the
+readings of frozen text are ratified; four live pins are required before unblinding. Registered
+verbatim.
+
+**v2 implemented in `compute` (Opus/high, 2026-09-13 early; 325 study tests).** The verdict is
+mean(RF/IM) < 1 with the week-clustered interval excluding 1 (closed interval; a mean or an
+endpoint of exactly 1 fails; the boundary annotation covers all three numbers); median and
+P(RF<IM) print as descriptive readouts with their intervals; the straddle hold-through cross-check
+prints agree/disagree (long-straddle convention: negative mean agrees with PASS, exactly zero with
+FAIL); the v0 two-signal rule is a `bool?` column and a §9.2 line with the would-have-been-removed
+set's mean(RF/IM) beside the sample's, and gates nothing. The deadline fallback is automatic: a
+quarter is covered when every in-window kept event with a print date in it has a row in both
+`option_measures.csv` and `closes.csv` (any status; an empty quarter is covered vacuously, with its
+event count printed), the deliverable subset is the trailing run of covered quarters ending at
+2025Q4, applied as gate `07b_full_quarter_coverage_subset` (a time-only cut, added to
+`Gates.InOrder` after 07), the memo is titled PROVISIONAL with the sixteen-quarter coverage table,
+nothing deliverable exits non-zero, and `--require-full-window` refuses a provisional run. The
+chains verb processes the most recent print dates first so a partial pull completes whole recent
+quarters. Calibration through the real step: the fairly priced population that PASSed under v0
+(median 0.71, interval [0.617, 0.683]) FAILs under v2 (mean 1.000000, interval [0.913, 1.084]); the
+same population with IM inflated 30 % PASSes (mean 0.769, interval [0.702, 0.834]); reintroducing
+the v0 criterion makes the fair population pass again. Orchestrator check: removing one quarter's
+option rows from the fixture withheld that quarter at 07b and produced a PROVISIONAL memo with no
+verdict on the (empty) trailing subset. Consequence recorded by the implementer: a missing row now
+withholds its whole quarter at 07b, so gates 08 and 11 cannot see a "no row at all" case in a full
+pipeline; their guards stay as defence in depth.
+
+**EDGAR acceptance times were four to five hours late; the `RequiresEdgar` pin caught it
+(2026-09-13, Opus/high; 333 study tests).** The pin's first live run failed — expected acceptance
+hour 16, actual 21. `data.sec.gov/submissions/CIK0000320193.json` stamps Apple's 2024-02-01 8-K
+(accession 0000320193-24-000005) `2024-02-01T21:30:30.000Z`, and its 2026-07-30 8-K
+`2026-07-30T20:30:28.000Z`: the same 16:30 Eastern acceptance every quarter, 21:30Z under EST and
+20:30Z under EDT. The field is genuine UTC with a DST-varying offset, which a fixed wall clock could
+not be. `ParseAcceptanceEt` had been stripping the `Z` and reading the digits as Eastern, on a doc
+comment claiming that reading was "verified against Apple's FY24 Q1 8-K … reads 16:30:38" — no live
+fetch ever returned that string, EDGAR being unreachable from the sandbox that wrote the claim, and
+the unit test and the `submissions-sampleco` fixtures encoded the same belief, which is why the
+suite was green. Every acceptance would have been placed four or five hours late, which moves events
+between timing classes rather than moving the numbers inside them. Fixed by
+reading the instant as UTC and converting once through the new `EdgarAcceptance.FromUtcInstant`,
+which reuses the boundary's existing `America/New_York` zone so the one-conversion-site doctrine
+still holds; a stamp that is not Z-marked UTC is now refused as a data-shape break rather than read
+under a guessed zone. Every fixture stamp was converted to the UTC value that yields the Eastern
+time it was written to mean (EST or EDT per its own date), so every classification and gate count is
+unchanged. The pin now passes at hour 16 minute 30, and reintroducing the old return made it fail
+again with 21 — which is also what proves it reaches EDGAR rather than returning early. It covers
+both DST phases off one fetch (the 2024-02-01 and 2026-07-30 8-Ks), because a feed that moved to a
+fixed UTC-5 stamp would satisfy a winter-only pin while reading every summer acceptance an hour
+late. No verb had
+been run, so no derived table needs regenerating. The seam the defect lived in — raw stamp to
+classification — had no test, every parser case stopping at a `DateTime` and every resolver case
+starting from one; `TimingResolverTests` now has theories that run the whole way. Measured through
+them, the old reading did two things, and neither is a wrong number. A BMO release at 07:00 ET
+(stamped 12:00Z) landed at midday, inside the session: INTRADAY, quarantined at gate 07 — so
+essentially every BMO event would have been silently **absent** from the sample. And a true intraday
+print from 11:00 ET to the close (12:00 under EDT) landed at or after 16:00 and was **admitted** as a
+clean AMC, with an entry close struck up to five hours AFTER the release: a post-release entry
+snapshot, which is the leakage face of the same defect. Both are pinned now. The evening case is
+milder than it first looks — a 20:00 ET print (stamped 01:00Z the next day) has its print date moved
+a day forward and its class flipped, but pre-entry, entry and exit are unchanged, because the shift
+crosses no close, and the earnings week is unchanged because a business-day shift cannot cross an ISO
+week boundary. Apple's own 16:30 stamp is post-close under either reading, which is why the unit test
+built on it was green. `Resolve`'s two DST branches are kept: the
+conversion cannot produce a spring-forward wall clock, but wall clocks reach `Resolve` from
+`events.csv` as well, and the CSV carries no offset. Lesson added to `docs/LESSONS.md` (#4).
+
 ## Left
+
+Earnings study C1 (`docs/research/c1-run-instructions.md`):
+
+- Run the four live pins of v2 §5 on the operator's machine, then the six verbs in order (start
+  `closes` first — a quarter is covered only when every symbol's bars are in); the memo
+  `data/earnings-c1/c1_memo.md` is the Monday 2026-09-14 09:00 CT deliverable, PROVISIONAL if the
+  fallback fired, and the full-window run stays owed. Pass `--require-full-window` on the final
+  run. Commit the derived tables (not `raw/`).
+- Read the three instruments before the verdict line: parity-vs-close deviation quantiles, the
+  spot-source and price-source tallies, the IM-collapse cross-tab (memo §9.2); and §9.3 on what the
+  registered criterion establishes.
+- Known, not fixed: `TimingQuarantineReasons` in the memo groups every quarantined timing row,
+  including orphans of events the events verb dropped, so it can exceed gate 07's removals; the
+  §4 table prints the median at F6 while the verdict line annotates a boundary value.
 
 Milestone 2 (research platform — sequenced in `docs/plans/ibkr-edge-research-roadmap.md`):
 

@@ -1,0 +1,18 @@
+{
+  "cik": "1000004",
+  "name": "Evening Filer Inc",
+  "tickers": ["EVEN"],
+  "exchanges": ["Nasdaq"],
+  "formerNames": [],
+  "filings": {
+    "recent": {
+      "accessionNumber": ["0001000004-26-000001"],
+      "filingDate": ["2026-01-02"],
+      "reportDate": ["2025-12-31"],
+      "acceptanceDateTime": ["2026-01-01T01:00:00.000Z"],
+      "form": ["8-K"],
+      "items": ["2.02,9.01"]
+    },
+    "files": []
+  }
+}

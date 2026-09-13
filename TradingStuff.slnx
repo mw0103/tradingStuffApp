@@ -3,6 +3,7 @@
     <Project Path="src/TradingStuff.AppHost/TradingStuff.AppHost.csproj" />
     <Project Path="src/TradingStuff.AuditDashboard/TradingStuff.AuditDashboard.csproj" />
     <Project Path="src/TradingStuff.Contracts/TradingStuff.Contracts.csproj" />
+    <Project Path="src/TradingStuff.EarningsStudy/TradingStuff.EarningsStudy.csproj" />
     <Project Path="src/TradingStuff.ExecutionService/TradingStuff.ExecutionService.csproj" />
     <Project Path="src/TradingStuff.IbkrGateway/TradingStuff.IbkrGateway.csproj" />
     <Project Path="src/TradingStuff.MarketDataService/TradingStuff.MarketDataService.csproj" />
@@ -13,6 +14,7 @@
     <Project Path="src/TradingStuff.Volatility/TradingStuff.Volatility.csproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/TradingStuff.EarningsStudy.Tests/TradingStuff.EarningsStudy.Tests.csproj" />
     <Project Path="tests/TradingStuff.Tests/TradingStuff.Tests.csproj" />
   </Folder>
   <Folder Name="/third_party/">

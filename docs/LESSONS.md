@@ -81,9 +81,16 @@ reader not to look.
   already process-wide constants when it was written.
 - *"the clock never reads the table, so it is a genuinely independent witness"* — both sides resolve
   the same singleton, cache included.
+- *"Verified against Apple's FY24 Q1 8-K … this field reads 16:30:38"* — EDGAR was unreachable from
+  the sandbox that wrote it, so nothing was verified; the field really reads `21:30:30.000Z`. The
+  unit test and the fixtures were then written from the comment instead of from the venue, so the
+  suite was green while every EDGAR acceptance time was read four or five hours late.
 
 When you fix a defect, fix its comment. When you review, **read the comments as claims to be tested,
-not as documentation to be trusted.**
+not as documentation to be trusted.** And **"verified against X" is a claim, not a verification, when
+X was unreachable from where it was written** — say which it is. Only the registered
+`Category=RequiresEdgar` pin against the real venue exposed that last one, the same job the
+`RequiresTws` tests do in 5.
 
 ## 5. A green unit suite says nothing about the broker
 
@@ -208,4 +215,39 @@ imitating:
 
 Two live samples are not a protocol guarantee. Writing the code to survive either ordering costs
 little; assuming the ordering you happened to see costs a defect that appears months later.
-</content>
+
+## 13. A selection rule's direction is invisible by reading; run it against a null population.
+
+When a rule decides which events, rows or samples are INCLUDED in a statistic, reading the rule
+(and reviewing it at any model size) tells you its shape, not its selection effect. **Before
+trusting it, build a synthetic population that contains none of the contamination the rule targets,
+apply the rule, and measure what it did to the headline statistic** — the removed set's own
+statistic is the tell.
+
+Incident (2026-09-12, C1 earnings study, gate 09 price QA): the rule quarantined an event when its
+pre-entry move exceeded both its event move and 3× its trailing daily scale. The event move is RF,
+the numerator of the primary statistic, so inclusion was conditioned on the outcome. The code
+comment asserted that false positives biased "the opposite direction and much less"; it was wrong.
+On 6,000 clean synthetic events the rule removed 3.1% of them, and the removed set had P(RF<IM) =
+0.946 against a population 0.620 — the strongest PASS evidence in the sample — and in a boundary
+population it flipped the registered verdict from PASS to FAIL, the outcome that stops the program.
+The package had already been escalated to the largest model as class (b) work and reviewed; the
+escalation found the rule's shape and not its direction, and the Opus leakage review found it only
+by executing a population. The fix used only pre-entry information and moved the statistics
+essentially not at all on clean data while catching the same injected late filings.
+
+## 14. Prove the mutation happened before believing a negative control.
+
+A reintroduce-the-defect control is only evidence if the defect was actually reintroduced: **mutate
+by matching the exact code text (and assert the match count), never by line number, and check the
+mutated text is present before running the tests.**
+
+Incident (2026-09-12, C1 earnings study, closes concurrency test): a control edited "line 341" to
+drop the fetcher's concurrency from 3 to 1, but earlier edits had shifted the line numbers, the sed
+matched nothing, the unmutated test passed, and a commit message was written claiming the control
+had failed as intended. Caught by reading the control's output — the printed "mutated" line was
+`.ToList();` — before pushing; redone by pattern, the control then failed in 18 seconds as it
+should. A second, related lesson from the same test: when the fake handler under mutation threw an
+exception, the code under test correctly retried it as a transient fault and the control hung for
+ten minutes; a control's failure path must be one the code treats as permanent (the handler now
+answers a 400) so the defect fails fast.
