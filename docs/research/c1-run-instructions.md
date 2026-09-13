@@ -97,9 +97,9 @@ Joins every table, applies remaining gates with counts, computes primary and sec
 
 ## Deadline fallback: partial-window runs and final reruns
 
-The v2 deadline fallback (§3) applies automatically: when the full registered window has not completed by Monday 09:00 CT, the compute verb restricts to the most recent K fully-fetched calendar quarters, K maximized, labels the memo PROVISIONAL, and prints the per-quarter coverage table. Nothing is deliverable when no quarter has 100% fetch coverage; the run exits non-zero and writes no memo in that case.
+The v2 deadline fallback (§3) applies automatically: when the full registered window has not completed by Monday 09:00 CT, the compute verb restricts to the most recent K fully-fetched calendar quarters, K maximized, labels the memo PROVISIONAL, and prints the per-quarter coverage table. Nothing is deliverable when the run of fully covered quarters ending at 2025Q4 is empty; the compute verb then writes the memo with the coverage table and no verdict and exits non-zero. The full-window run remains owed whatever a provisional memo says.
 
-To ensure whole recent quarters complete, `chains` processes the most recent print dates first (tied events broken by event ID). Start `closes` first — it pulls per symbol — so each symbol completes before `chains` moves to the next print date. The final (full-window) run should pass `--require-full-window` so a provisional memo is refused rather than written.
+To ensure whole recent quarters complete, `chains` processes the most recent print dates first (tied events broken by event ID). Start `closes` first and let it finish: it pulls one series per symbol, and a quarter counts as covered only when every event in it has both an option row and a closes row, so an incomplete `closes` run leaves every quarter uncovered no matter how far `chains` got. The final (full-window) run should pass `--require-full-window` so a provisional memo is refused rather than written.
 
 ## Reading the memo
 
