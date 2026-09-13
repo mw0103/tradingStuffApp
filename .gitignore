@@ -16,3 +16,7 @@ src/TradingStuff.ResearchService/wwwroot/
 
 # Mutation testing output
 StrykerOutput/
+
+# Theta Terminal login file (local secret, never commit it at any depth)
+creds.txt
+**/creds.txt
