@@ -1088,9 +1088,19 @@ all unreachable from the build sandbox. Three `Category`-gated live tests pin th
 assume — `RequiresEdgar` (Apple's 2024-02-01 8-K accepted at hour 16 Eastern), `RequiresThetaTerminal`
 (the EOD header, `underlying_price`, price scale, EOD vs minute fallback), `RequiresGateway` (a real
 bars request) — and `docs/research/c1-run-instructions.md` says to run them before the pipeline.
-Two lessons went to `docs/LESSONS.md` (#13, #14). The frozen registration is unedited; whether C1 v2
-should register a mean-based criterion (see the review's §9.3 finding) is the operator's ledger
-decision.
+Two lessons went to `docs/LESSONS.md` (#13, #14). The frozen v0 registration is unedited.
+
+**C1-PREREG v2 registered (2026-09-12, evening; `docs/research/c1-preregistration-v2.md`).** A
+pre-result amendment with the blind intact — no real-data memo exists. Stated reason: the review's
+proof that the v0 shape criterion passes under fair pricing. The decision criterion becomes
+mean(RF/IM) < 1 with the week-clustered 95 % interval excluding 1 (null value exactly 1 under fair
+per-event pricing by the tower property); median and P(RF<IM) are demoted to readouts; the straddle
+hold-through return is the economic cross-check whose sign must agree with the verdict; gate 09's
+outcome-blind rule is ratified with the v0 two-signal comparison allowed only as a post-hoc
+diagnostic; a blind deadline fallback is pre-committed (the most recent K fully-covered calendar
+quarters, symbol-partial subsets prohibited, memo labelled PROVISIONAL, full run still owed); the
+readings of frozen text are ratified; four live pins are required before unblinding. Registered
+verbatim; the implementation of §1–§3 in `compute` follows as a separate entry.
 
 ## Left
 
