@@ -38,7 +38,16 @@ public sealed class ChainsStep : IStudyStep
             }
         }
 
-        var timing = CsvFile.Read<EventTimingRow>(context.Paths.EventTiming);
+        // Most recent print date first, ties broken by event id so the order is total and reproducible.
+        // A chains run that stops early - a limit, a deadline, a Terminal that falls over - then leaves
+        // the RECENT calendar quarters whole, and whole recent quarters are exactly what the v2
+        // deadline fallback can deliver on (docs/research/c1-preregistration-v2.md section 3). In
+        // filing order it would instead leave every quarter partially fetched and every one of them
+        // outside the deliverable subset.
+        var timing = CsvFile.Read<EventTimingRow>(context.Paths.EventTiming)
+            .OrderByDescending(t => t.PrintDate)
+            .ThenBy(t => t.EventId, StringComparer.Ordinal)
+            .ToList();
         if (options.Limit is { } limit) timing = timing.Take(limit).ToList();
 
         var symbols = ResolveSymbols(timing,

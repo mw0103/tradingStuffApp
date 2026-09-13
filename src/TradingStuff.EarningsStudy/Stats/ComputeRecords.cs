@@ -13,6 +13,7 @@ namespace TradingStuff.EarningsStudy.Stats;
 /// </summary>
 /// <param name="ClusterKey">The bootstrap cluster: the earnings week, or <c>unknown-week:{event_id}</c> when the timing step recorded none — a singleton, counted and reported.</param>
 /// <param name="PriceQa">ok | quarantined | unknown | not_reached.</param>
+/// <param name="V0TwoSignalWouldQuarantine">What the RETIRED v0 two-signal rule would have decided (<see cref="V0TwoSignalRule"/>). POST-HOC DIAGNOSTIC: it never affects inclusion. Empty for an event that never reached gate 09, or whose two moves are not both recorded.</param>
 /// <param name="SpotSource">feed | parity | none — which spot the implied move was divided by.</param>
 /// <param name="StraddleMidPreEntry">The straddle mid at the PRE-ENTRY snapshot, carried so <paramref name="ImCollapseRatio"/> can be recomputed from this file by hand.</param>
 /// <param name="SpotParityPreEntry">The parity spot at the PRE-ENTRY snapshot, carried for the same reason.</param>
@@ -40,6 +41,7 @@ public sealed record C1EventRow(
     string? PriceQaReason,
     decimal? PriceQaPreEntryMove,
     decimal? PriceQaEventMove,
+    bool? V0TwoSignalWouldQuarantine,
     string? Root,
     DateOnly? Expiration,
     int? DteCalendarDays,
@@ -137,6 +139,8 @@ public sealed record SplitBucketReport(
     string? Range,
     int Members,
     int Clusters,
+    decimal? Mean,
+    BootstrapInterval? MeanInterval,
     decimal? Median,
     BootstrapInterval? MedianInterval,
     decimal? ProportionLess,
@@ -145,7 +149,7 @@ public sealed record SplitBucketReport(
 /// <summary>One split's readout for one sample.</summary>
 public sealed record SplitReport(string Key, string Title, string Rule, IReadOnlyList<SplitBucketReport> Buckets);
 
-/// <summary>Everything the memo says about one sample.</summary>
+/// <summary>Everything the memo says about one sample. <c>Mean</c> is the v2 primary statistic; <c>Median</c> and <c>ProportionLess</c> are the demoted descriptive readouts.</summary>
 public sealed record SampleReport(
     string Key,
     string Title,
@@ -155,6 +159,7 @@ public sealed record SampleReport(
     IReadOnlyList<string> UnmeasurableEvents,
     int Clusters,
     int SingletonUnknownWeeks,
+    decimal? Mean,
     decimal? Median,
     decimal? ProportionLess,
     int LessCount,
@@ -235,6 +240,9 @@ public sealed record MeasuredContext(
 /// <param name="EventsWithNoTimingRow">Events with no row in <c>event_timing.csv</c> at all. A pipeline discontinuity, warned about and reported separately: folding it into the gate-07 removal count would render a missing file as a gate decision (docs/STATE.md, class (c)).</param>
 public sealed record C1Report(
     C1Verdict Verdict,
+    StraddleCrossCheck StraddleCrossCheck,
+    CoverageReport Coverage,
+    V0TwoSignalDiagnostic V0TwoSignal,
     SampleReport Primary,
     SampleReport Secondary,
     IReadOnlyList<GateCountRow> ExclusionTable,
@@ -251,3 +259,14 @@ public sealed record C1Report(
     int Seed,
     string PriceQaDescription,
     IReadOnlyList<string> Warnings);
+
+/// <summary>
+/// The v2 primary criterion's own description, printed in the memo beside the verdict so the rule
+/// and its execution are read together. A constant rather than prose so a test can compare it
+/// against <see cref="C1Verdict"/>.
+/// </summary>
+public static class C1Criterion
+{
+    public const string Rule =
+        "PASS = mean(RF/IM) < 1 AND the week-clustered bootstrap 95% CI for mean(RF/IM) excludes 1. FAIL = otherwise.";
+}

@@ -22,6 +22,15 @@ public static class Gates
     // timing verb
     public const string TimingClassified = "07_timing_classified_bmo_or_amc";
 
+    /// <summary>
+    /// The v2 deadline fallback (<c>docs/research/c1-preregistration-v2.md</c> section 3). A TIME-ONLY
+    /// cut: an event whose print date falls outside the deliverable subset of fully fetched calendar
+    /// quarters is removed here, before any measure is read. Symbol-partial subsets are prohibited, so
+    /// nothing about the name reaches this decision. When the whole window is covered the gate
+    /// considers every event and removes none, and the memo is final rather than provisional.
+    /// </summary>
+    public const string QuarterCoverage = "07b_full_quarter_coverage_subset";
+
     // compute verb, in this order
     public const string ClosesPresent = "08_closes_present_pre_entry_entry_exit";
     public const string PriceQa = "09_price_qa_not_quarantined";
@@ -34,7 +43,7 @@ public static class Gates
     [
         SeedOptionable, CikMapped, PrimaryListing,
         HasItem202, NotAmendment, Dedup,
-        TimingClassified,
+        TimingClassified, QuarterCoverage,
         ClosesPresent, PriceQa, MinimumPrice, ChainFound, Quotable, Tradable
     ];
 }

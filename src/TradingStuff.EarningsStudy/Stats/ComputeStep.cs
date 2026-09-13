@@ -114,6 +114,32 @@ public sealed class ComputeStep(
         var measuresById = measures.ToDictionary(m => m.EventId, StringComparer.Ordinal);
         var factsByCik = sharesFacts.GroupBy(f => f.Cik).ToDictionary(g => g.Key, g => (IReadOnlyList<SharesFactRow>)[.. g]);
 
+        // The v2 deadline fallback, measured BEFORE anything is written: the deliverable subset is a
+        // property of which fetches completed, not of what the statistics turn out to be, and
+        // --require-full-window has to be able to refuse without leaving a half-written memo behind.
+        var coverage = QuarterCoverage.Measure(
+            [.. kept.Select(e => new CoverageInput(
+                timingById.GetValueOrDefault(e.EventId)?.PrintDate,
+                measuresById.GetValueOrDefault(e.EventId)?.FetchStatus,
+                closesById.GetValueOrDefault(e.EventId)?.Status))],
+            C1Registration.WindowFrom,
+            C1Registration.WindowTo);
+
+        if (options.RequireFullWindow && !coverage.FullWindow)
+        {
+            foreach (var quarter in coverage.Quarters.Where(q => !q.Covered))
+            {
+                context.Output.WriteLine(
+                    $"compute: {quarter.Quarter} is not fully fetched - {quarter.Events} event(s), " +
+                    $"{quarter.MissingChainRow} with no option_measures row, {quarter.MissingClosesRow} with no closes row.");
+            }
+
+            return Refuse(context,
+                $"{ComputeOptions.RequireFullWindowFlag} was given, but " +
+                $"{coverage.Quarters.Count(q => !q.Covered)} of {coverage.Quarters.Count} quarter(s) in the registered " +
+                "window are not fully fetched, so this run would be PROVISIONAL.");
+        }
+
         var works = new List<EventWork>(kept.Count);
         foreach (var @event in kept)
         {
@@ -161,7 +187,23 @@ public sealed class ComputeStep(
 
         var counts = new List<GateCountRow>();
 
-        var afterCloses = ApplyGate(entering, Gates.ClosesPresent, counts, work =>
+        // Gate 07b: the v2 deadline fallback's TIME-ONLY cut, applied before any measure is read so a
+        // provisional run's statistics and splits are restricted to the covered quarters by
+        // construction rather than by each statistic remembering to filter. An event removed here
+        // keeps its event-table row with this gate as its stop, which is what makes the restriction
+        // auditable instead of invisible.
+        var subsetNote = coverage.Subset.Count == 0
+            ? "deliverable subset: none - the most recent quarter of the registered window is not fully fetched"
+            : $"deliverable subset: {coverage.Subset[0]}..{coverage.Subset[^1]} ({coverage.Subset.Count} quarter(s)" +
+              (coverage.FullWindow ? ", the full registered window)" : ", PROVISIONAL)");
+
+        var afterCoverage = ApplyGate(entering, Gates.QuarterCoverage, counts, work =>
+            coverage.Includes(work.Timing!.PrintDate)
+                ? null
+                : $"print date in {QuarterCoverage.QuarterOf(work.Timing!.PrintDate)}, outside the deliverable subset",
+            subsetNote);
+
+        var afterCloses = ApplyGate(afterCoverage, Gates.ClosesPresent, counts, work =>
         {
             if (work.Closes is null) return "no row in closes.csv";
             if (!string.Equals(work.Closes.Status, "ok", StringComparison.Ordinal)) return $"closes status '{work.Closes.Status}'";
@@ -214,6 +256,15 @@ public sealed class ComputeStep(
                 : "combined ATM spread wider than the tradable tier";
         });
 
+        // The RETIRED v0 two-signal rule, evaluated for every event gate 09 decided on. POST-HOC
+        // DIAGNOSTIC: nothing downstream reads it, and it is stamped AFTER every gate has run so it
+        // cannot be mistaken for one.
+        foreach (var work in afterCloses)
+        {
+            work.V0TwoSignal = V0TwoSignalRule.WouldQuarantine(
+                work.Qa?.PreEntryMove, work.Qa?.EventMove, work.Closes?.MedianAbsReturn20);
+        }
+
         foreach (var work in works) Measure(work);
 
         ApplyMarketCaps(works, factsByCik);
@@ -253,14 +304,19 @@ public sealed class ComputeStep(
             cancellationToken,
             (eventId, split, label) => StampQuintile(byId[eventId], "secondary", split, label));
 
-        var verdict = C1Verdict.Decide(primary.Median, primary.Bootstrap?.ProportionLess);
+        // v2 section 1: the mean and ITS interval decide. The median and P(RF < IM) are computed and
+        // printed above, and reach nothing from here on.
+        var verdict = C1Verdict.Decide(primary.Mean, primary.Bootstrap?.Mean);
+        var crossCheck = StraddleCrossCheck.Evaluate(verdict, primary.Straddle.Mean);
+        var v0Diagnostic = V0Diagnostic(afterCloses, afterTradable, primary.Mean);
         var qaDescription = this.describePriceQa();
 
         var orphans = OrphanCounts(timings, closes, measures, works.Select(w => w.Event.EventId).ToHashSet(StringComparer.Ordinal));
 
         var gateCounts = priorGateCounts.Where(r => !string.Equals(r.Step, StepName, StringComparison.Ordinal)).Concat(counts).ToList();
         var report = BuildReport(
-            verdict, primary, secondary, gateCounts, required, universe, entering, afterCloses, timings, orphans,
+            verdict, crossCheck, coverage, v0Diagnostic, primary, secondary, gateCounts, required, universe,
+            entering, afterCloses, timings, orphans,
             options, qaDescription, quarantinedByTimingStep, noTimingRow, kept.Count);
 
         CsvFile.Write(paths.EventTable, works.Select(w => w.ToRow()));
@@ -278,8 +334,41 @@ public sealed class ComputeStep(
 
         context.Log($"event table: {paths.EventTable} ({works.Count} rows)");
         context.Log($"memo: {paths.Memo}");
+        context.Log($"coverage: {subsetNote}");
         context.Log(verdict.Line.Replace("**", ""));
+
+        // Nothing deliverable is not a verdict of FAIL and must not exit like a clean run: the memo
+        // carries the coverage table and says why there is no verdict, and the exit code says so too.
+        if (coverage.NothingDeliverable)
+        {
+            context.Log("compute: no quarter of the registered window ending at " +
+                        $"{coverage.Quarters[^1].Quarter} is fully fetched, so there is no deliverable subset and no " +
+                        "verdict. The coverage table in section 1.3 of the memo names what is missing.");
+            return 1;
+        }
+
         return 0;
+    }
+
+    /// <summary>
+    /// What the RETIRED v0 two-signal rule would have done, measured on the events gate 09 decided
+    /// and on the primary sample. The removed set's own mean beside the sample's is the tell
+    /// docs/LESSONS.md section 13 asks for, now on real data rather than a synthetic null population.
+    /// </summary>
+    private static V0TwoSignalDiagnostic V0Diagnostic(
+        List<EventWork> consideredAtPriceQa, List<EventWork> primaryMembers, decimal? primaryMean)
+    {
+        var measurable = primaryMembers.Where(w => w.RatioMeasurable && w.Ratio is not null).ToList();
+        var flagged = measurable.Where(w => w.V0TwoSignal == true).Select(w => w.Ratio!.Value).ToList();
+
+        return new V0TwoSignalDiagnostic(
+            consideredAtPriceQa.Count,
+            consideredAtPriceQa.Count(w => w.V0TwoSignal == true),
+            consideredAtPriceQa.Count(w => w.V0TwoSignal is null),
+            measurable.Count,
+            flagged.Count,
+            Statistics.Mean(flagged),
+            primaryMean);
     }
 
     private static int Refuse(StudyContext context, string message)
@@ -510,6 +599,7 @@ public sealed class ComputeStep(
             unmeasurable,
             clusters,
             singletons,
+            Statistics.Mean(ratios),
             Statistics.Median(ratios),
             Statistics.ProportionLess(sample),
             sample.Count(e => e.RfLessThanIm),
@@ -543,6 +633,8 @@ public sealed class ComputeStep(
                 bucket.Range,
                 bucket.Events.Count,
                 bucket.Events.Select(e => e.ClusterKey).Distinct(StringComparer.Ordinal).Count(),
+                Statistics.Mean([.. bucket.Events.Select(e => e.Ratio)]),
+                bootstrap?.Mean,
                 Statistics.Median([.. bucket.Events.Select(e => e.Ratio)]),
                 bootstrap?.Median,
                 Statistics.ProportionLess(bucket.Events),
@@ -569,6 +661,9 @@ public sealed class ComputeStep(
 
     private static C1Report BuildReport(
         C1Verdict verdict,
+        StraddleCrossCheck crossCheck,
+        CoverageReport coverage,
+        V0TwoSignalDiagnostic v0Diagnostic,
         SampleReport primary,
         SampleReport secondary,
         List<GateCountRow> gateCounts,
@@ -648,6 +743,35 @@ public sealed class ComputeStep(
                          "does not match events.csv. Neither number is silently preferred.");
         }
 
+        if (coverage.NothingDeliverable)
+        {
+            warnings.Add($"NO DELIVERABLE SUBSET. {coverage.Quarters[^1].Quarter}, the most recent quarter of the " +
+                         "registered window, is not fully fetched, so the run of covered quarters ending there is empty " +
+                         "and every event was removed at gate 07b. There is no verdict. Section 1.3 names what is " +
+                         "missing per quarter; the run exits non-zero.");
+        }
+        else if (coverage.Provisional)
+        {
+            warnings.Add($"PROVISIONAL memo: only {coverage.Subset.Count} of {coverage.Quarters.Count} registered " +
+                         $"quarters are fully fetched, so every statistic and split below is restricted to " +
+                         $"{coverage.Subset[0]}..{coverage.Subset[^1]}. The full-window run remains owed whatever this " +
+                         "verdict says (v2 section 3).");
+        }
+
+        if (coverage.EventsWithNoPrintDate > 0)
+        {
+            warnings.Add($"{coverage.EventsWithNoPrintDate} event(s) in window and kept after dedup have no print date, " +
+                         "so they fall in no calendar quarter and are in no quarter's coverage denominator. They are " +
+                         "counted in section 1.3 rather than left to be inferred from a total that does not add up.");
+        }
+
+        if (coverage.EventsOutsideWindowQuarters > 0)
+        {
+            warnings.Add($"{coverage.EventsOutsideWindowQuarters} event(s) in window and kept after dedup have a print " +
+                         "date outside every quarter of the registered window. They are outside the deliverable subset " +
+                         "and are counted in section 1.3.");
+        }
+
         if (primary.UnmeasurableEvents.Count > 0 || secondary.UnmeasurableEvents.Count > 0)
         {
             warnings.Add($"{primary.UnmeasurableEvents.Count} primary and {secondary.UnmeasurableEvents.Count} secondary sample member(s) have no computable RF/IM; they are listed in section 4 and carried in the event table.");
@@ -655,6 +779,9 @@ public sealed class ComputeStep(
 
         return new C1Report(
             verdict,
+            crossCheck,
+            coverage,
+            v0Diagnostic,
             primary,
             secondary,
             recognised,
@@ -794,6 +921,9 @@ public sealed class ComputeStep(
         public string StopGate { get; set; } = "";
         public string PriceQa { get; set; } = "not_reached";
         public TimingQaResult? Qa { get; set; }
+        /// <summary>POST-HOC DIAGNOSTIC only (<see cref="V0TwoSignalRule"/>). Null when the retired rule could not be evaluated.</summary>
+        public bool? V0TwoSignal { get; set; }
+
         public string SpotSource { get; set; } = "none";
         public decimal? SpotForIm { get; set; }
         public decimal? ImCollapse { get; set; }
@@ -846,6 +976,7 @@ public sealed class ComputeStep(
             Qa?.Reason,
             Qa?.PreEntryMove,
             Qa?.EventMove,
+            V0TwoSignal,
             Measures?.Root,
             Measures?.Expiration,
             Measures?.DteCalendarDays,
@@ -896,41 +1027,5 @@ public sealed class ComputeStep(
             string.Equals(Timing?.TimingClass, "BMO", StringComparison.OrdinalIgnoreCase) ? "BMO"
             : string.Equals(Timing?.TimingClass, "AMC", StringComparison.OrdinalIgnoreCase) ? "AMC"
             : "other";
-    }
-}
-
-/// <summary>The compute verb's command line. Both options default to the registered values.</summary>
-public sealed record ComputeOptions(int Replications, int Seed)
-{
-    public static bool TryParse(IReadOnlyList<string> args, out ComputeOptions options, out string usage)
-    {
-        var replications = C1Registration.BootstrapReplications;
-        var seed = C1Registration.BootstrapSeed;
-        usage = "";
-
-        for (var i = 0; i < args.Count; i++)
-        {
-            switch (args[i])
-            {
-                case "--reps" when i + 1 < args.Count && int.TryParse(args[i + 1], out var reps) && reps > 0:
-                    replications = reps;
-                    i++;
-                    break;
-                case "--seed" when i + 1 < args.Count && int.TryParse(args[i + 1], out var parsedSeed):
-                    seed = parsedSeed;
-                    i++;
-                    break;
-                default:
-                    options = new ComputeOptions(replications, seed);
-                    usage = $"compute: cannot read the option '{args[i]}'.\n" +
-                            "usage: compute [--reps N] [--seed N]\n" +
-                            $"  --reps N   bootstrap replications (default {C1Registration.BootstrapReplications}, the registered value)\n" +
-                            $"  --seed N   bootstrap seed (default {C1Registration.BootstrapSeed}, the registered value)";
-                    return false;
-            }
-        }
-
-        options = new ComputeOptions(replications, seed);
-        return true;
     }
 }

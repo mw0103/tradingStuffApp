@@ -97,8 +97,12 @@ internal sealed class StudyHarness : IDisposable
         string symbol = "TEST",
         string snapshotKind = "eod",
         string? snapshotTime = "16:00:00",
-        decimal? shares = 1_000_000m)
+        decimal? shares = 1_000_000m,
+        DateOnly? printDate = null)
     {
+        // The print date is what the v2 quarter-coverage subset cuts on, so it is settable; the
+        // default keeps every event in 2024Q1, which the coverage rule finds fully fetched.
+        var print = printDate ?? new DateOnly(2024, 2, 1);
         var entryClose = closeEntryOverride ?? 100m;
         var exitClose = closeExitOverride ?? entryClose * (1m + rf);
         var straddleMid = straddleMidOverride ?? im * 100m;
@@ -108,8 +112,8 @@ internal sealed class StudyHarness : IDisposable
 
         if (withTiming)
         {
-            Timings.Add(new EventTimingRow(id, timingClass, new DateOnly(2024, 2, 1),
-                new DateOnly(2024, 1, 30), new DateOnly(2024, 1, 31), new DateOnly(2024, 2, 2),
+            Timings.Add(new EventTimingRow(id, timingClass, print,
+                print.AddDays(-2), print.AddDays(-1), print.AddDays(1),
                 week, quarantinedAtTiming, quarantinedAtTiming ? "acceptance is intraday" : null));
         }
 

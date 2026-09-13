@@ -16,6 +16,56 @@ public sealed class ClusteredBootstrapTests
 {
     private const decimal Level = 0.95m;
 
+    /// <summary>
+    /// The interval the v2 verdict reads. Two properties pin it: a degenerate sample where every
+    /// replicate mean is forced to one value, so both endpoints must be that value and nothing else;
+    /// and a sample where the mean and the median are far apart, so an interval accidentally built
+    /// from the median replicates could not pass.
+    /// </summary>
+    [Fact]
+    public void The_mean_interval_is_built_from_the_replicate_means_and_not_from_any_other_statistic()
+    {
+        // Every event identical: every replicate mean is 0.8 whatever clusters are drawn.
+        var flat = Enumerable.Range(0, 30)
+            .Select(i => new SampleEvent($"e{i}", $"w{i % 6}", 0.8m, true, false, null, null, null, "AMC", null))
+            .ToList();
+
+        var degenerate = ClusteredBootstrap.Run(flat, 500, Level, 4242UL)!;
+        Assert.Equal(0.8m, degenerate.Mean.Lower);
+        Assert.Equal(0.8m, degenerate.Mean.Upper);
+        Assert.Equal(6, degenerate.Clusters);
+        Assert.Equal(30, degenerate.SampleSize);
+
+        // Four clusters of five. Three sit at 0.5 and one at 5.5, so the sample mean is 1.75 and the
+        // median is 0.5: an interval taken off the median replicates would sit nowhere near the mean.
+        var skewed = new List<SampleEvent>();
+        for (var cluster = 0; cluster < 4; cluster++)
+        {
+            for (var i = 0; i < 5; i++)
+            {
+                var ratio = cluster == 3 ? 5.5m : 0.5m;
+                skewed.Add(new SampleEvent($"c{cluster}e{i}", $"w{cluster}", ratio, ratio < 1m, false, null, null, null, "AMC", null));
+            }
+        }
+
+        var result = ClusteredBootstrap.Run(skewed, 4000, Level, 777UL)!;
+        Assert.Equal(1.75m, Statistics.Mean([.. skewed.Select(e => e.Ratio)]));
+        Assert.Equal(0.5m, Statistics.Median([.. skewed.Select(e => e.Ratio)]));
+
+        // A replicate draws four clusters with replacement, so its mean is 0.5 + 1.25k for k high
+        // clusters drawn: 0.5, 1.75, 3, 4.25 or 5.5. Both endpoints must be one of those five values,
+        // and the interval must cover the sample mean.
+        decimal[] possible = [0.5m, 1.75m, 3m, 4.25m, 5.5m];
+        Assert.Contains(result.Mean.Lower, possible);
+        Assert.Contains(result.Mean.Upper, possible);
+        Assert.True(result.Mean.Lower <= 1.75m && result.Mean.Upper >= 1.75m);
+
+        // The median interval is a different interval on the same replicates, and stays on the
+        // median's own scale rather than drifting toward the mean.
+        Assert.Equal(0.5m, result.Median.Lower);
+        Assert.True(result.Median.Upper <= 5.5m);
+    }
+
     [Fact]
     public void One_event_per_cluster_matches_an_ordinary_event_bootstrap()
     {

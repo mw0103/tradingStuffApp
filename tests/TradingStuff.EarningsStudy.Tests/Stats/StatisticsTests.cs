@@ -12,6 +12,42 @@ public sealed class StatisticsTests
     private static SampleEvent Event(decimal ratio, string cluster = "w1", string id = "", bool? less = null, bool equal = false) =>
         new(id.Length == 0 ? $"e{ratio}" : id, cluster, ratio, less ?? ratio < 1m, equal, null, null, null, "AMC", null);
 
+    /// <summary>
+    /// The v2 PRIMARY statistic. Every expected value here is the hand-summed total over the count,
+    /// written out in the comment so the assertion argues with arithmetic rather than with a second
+    /// copy of the implementation.
+    /// </summary>
+    [Fact]
+    public void Mean_is_the_sum_over_the_count_for_small_known_samples()
+    {
+        // 5 + 1 + 3 + 9 + 2 = 20, over 5 -> 4. The median of the same sample is 3, so a test that
+        // confused the two would not pass both.
+        Assert.Equal(4m, Statistics.Mean([5m, 1m, 3m, 9m, 2m]));
+        Assert.Equal(3m, Statistics.Median([5m, 1m, 3m, 9m, 2m]));
+
+        Assert.Equal(7m, Statistics.Mean([7m]));
+
+        // 0.25 + 0.25 + 1.5 = 2, over 3 -> 0.666...; asserted against the exact decimal quotient.
+        Assert.Equal(2m / 3m, Statistics.Mean([0.25m, 0.25m, 1.5m]));
+
+        // One large outlier is the whole point of a mean: 1, 1, 1, 1, 96 sums to 100 -> 20,
+        // where the median is 1. Nothing is trimmed from the primary statistic.
+        Assert.Equal(20m, Statistics.Mean([1m, 1m, 1m, 1m, 96m]));
+        Assert.Equal(1m, Statistics.Median([1m, 1m, 1m, 1m, 96m]));
+
+        // Order does not change it: the same multiset, summed the other way round.
+        Assert.Equal(Statistics.Mean([0.5m, 1.25m, 2m, 0.25m]), Statistics.Mean([2m, 0.25m, 0.5m, 1.25m]));
+
+        // A zero-RF event is in the mean, as it is in the median: (0 + 0.5 + 1) / 3.
+        Assert.Equal(0.5m, Statistics.Mean([0m, 0.5m, 1m]));
+    }
+
+    [Fact]
+    public void Mean_of_an_empty_sample_is_absent_not_zero()
+    {
+        Assert.Null(Statistics.Mean([]));
+    }
+
     [Fact]
     public void Median_of_odd_n_is_the_middle_value()
     {

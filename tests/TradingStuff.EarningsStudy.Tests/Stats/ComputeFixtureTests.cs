@@ -12,6 +12,11 @@ namespace TradingStuff.EarningsStudy.Tests.Stats;
 /// The sorted primary ratios are:
 /// 0, 0.25, 0.25, 1/3, 0.4, 0.49, 0.5, 0.5, 0.5, 0.5, 0.5, 0.6, 0.7, 0.75, 0.8, 0.8, 0.8, 5/6, 1, 1,
 /// 1.2, 1.5, 1.5, 2 — 24 events, so the median is (0.6 + 0.7) / 2 = 0.65 and P(RF &lt; IM) = 18/24.
+/// Their sum is 17.70666... and the v2 primary statistic, the mean, is that over 24 = 0.737778 at
+/// six places. The secondary sample adds the ratio-2.0 event: (17.70666... + 2) / 25 = 0.788267.
+/// Every fixture event prints in 2024Q1 and every one has a row in both fetch tables, so the quarter
+/// is covered; the other fifteen quarters of the registered window hold no events and are covered
+/// vacuously, which makes this a FINAL memo over the full window.
 /// </summary>
 public sealed class ComputeFixtureTests
 {
@@ -44,20 +49,30 @@ public sealed class ComputeFixtureTests
         Assert.Equal(Gates.TimingClassified, study.Row("e27").StopGate);
 
         var counts = study.WrittenGateCounts.Where(c => c.Step == ComputeStep.StepName).ToList();
-        Assert.Equal([30, 29, 28, 27, 26, 25], counts.Select(c => c.Considered));
-        Assert.Equal([1, 1, 1, 1, 1, 1], counts.Select(c => c.Removed));
+        Assert.Equal([30, 30, 29, 28, 27, 26, 25], counts.Select(c => c.Considered));
+        Assert.Equal([0, 1, 1, 1, 1, 1, 1], counts.Select(c => c.Removed));
         Assert.Equal(24, counts[^1].Remaining);
 
+        // The v2 subset gate considered every event and removed none: the window is fully fetched.
+        Assert.Equal(Gates.QuarterCoverage, counts[0].Gate);
+        Assert.Contains("**Deliverable subset: 2022Q1..2025Q4 — the full registered window (16 quarters). This memo is FINAL.**", memo);
+        Assert.DoesNotContain($" — {MemoWriter.ProvisionalLabel}", memo.Split('\n')[0]);
+        Assert.Equal("# C1 — implied vs realized earnings moves (v2)", memo.Split('\n')[0]);
+        Assert.Contains("| 2024Q1 | 31 | 0 | 0 | 0 | 1 | yes | yes |", memo);
+        Assert.Contains("| 2025Q4 | 0 | 0 | 0 | 0 | 0 | yes | yes |", memo);
+
         Assert.Contains("| events in sample | 24 | |", memo);
-        Assert.Contains("| median(RF/IM) | 0.650000 |", memo);
-        Assert.Contains("| P(RF < IM) | 0.750000 |", memo);
+        Assert.Contains("| **mean(RF/IM)** — PRIMARY, decides the verdict | **0.737778** |", memo);
+        Assert.Contains("| median(RF/IM) — DESCRIPTIVE READOUT | 0.650000 |", memo);
+        Assert.Contains("| P(RF < IM) — DESCRIPTIVE READOUT | 0.750000 |", memo);
         Assert.Contains("| ties (RF = IM, counted as not less) | 2 |", memo);
         Assert.Contains("| earnings-week clusters | 9 |", memo);
 
-        // The secondary sample adds the wide-spread event (ratio 2.0): 25 events, median 0.7.
+        // The secondary sample adds the wide-spread event (ratio 2.0): 25 events, median 0.7, mean 0.788267.
         Assert.Contains("| events in sample | 25 | |", memo);
-        Assert.Contains("| median(RF/IM) | 0.700000 |", memo);
-        Assert.Contains("| P(RF < IM) | 0.720000 |", memo);
+        Assert.Contains("| **mean(RF/IM)** — PRIMARY, decides the verdict | **0.788267** |", memo);
+        Assert.Contains("| median(RF/IM) — DESCRIPTIVE READOUT | 0.700000 |", memo);
+        Assert.Contains("| P(RF < IM) — DESCRIPTIVE READOUT | 0.720000 |", memo);
 
         // Each rate on its own denominator: gate 07 saw 31, gate 09 only the 29 that got past gate 08.
         Assert.Contains("- Timing QA (gate 07): **1** quarantined of **31** considered = **0.032258**.", memo);
@@ -115,9 +130,15 @@ public sealed class ComputeFixtureTests
         Assert.Equal(0, await study.RunAsync("--reps", "300"));
         Assert.Equal(first, File.ReadAllBytes(study.Paths.Memo));
 
-        // P(RF < IM) = 0.75 over 9 clusters: the interval sits above 0.5 and the median is 0.65.
+        // mean(RF/IM) = 0.737778 over 9 clusters: the interval sits entirely below 1.
         Assert.Contains("**VERDICT: PASS**", study.Memo);
-        Assert.Contains("median(RF/IM) = 0.650000 < 1", study.Memo);
+        Assert.Contains("mean(RF/IM) = 0.737778 < 1", study.Memo);
+        Assert.Contains("excludes 1 (below it)", study.Memo);
+
+        // The memo cites v2 as governing and v0 as the superseded record, by path.
+        Assert.Contains("# C1 — implied vs realized earnings moves (v2)", study.Memo);
+        Assert.Contains("Governing registration: `docs/research/c1-preregistration-v2.md`", study.Memo);
+        Assert.Contains("Superseded record: `docs/research/c1-preregistration-v0.md`", study.Memo);
     }
 
     /// <summary>

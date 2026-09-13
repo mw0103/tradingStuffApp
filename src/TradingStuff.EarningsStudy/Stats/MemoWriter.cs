@@ -18,10 +18,20 @@ namespace TradingStuff.EarningsStudy.Stats;
 ///
 /// Nothing time-dependent is written: the same inputs and seed must produce a byte-identical memo.
 /// </summary>
-public static class MemoWriter
+public static partial class MemoWriter
 {
-    /// <summary>The frozen rule this memo is an execution of. Quoted, not paraphrased.</summary>
-    public const string PreRegistrationPath = "docs/research/c1-preregistration-v0.md";
+    /// <summary>The GOVERNING registration this memo is an execution of. Quoted, not paraphrased.</summary>
+    public const string PreRegistrationPath = "docs/research/c1-preregistration-v2.md";
+
+    /// <summary>Quoted from that file's header line "Amended: Saturday 2026-09-12, evening."</summary>
+    public const string PreRegistrationAmended = "Saturday 2026-09-12";
+
+    /// <summary>
+    /// The SUPERSEDED record. v2 section 6 leaves the universe rule, gate order, window, measure
+    /// definitions, splits and accounting unchanged, so v0 is still the source of those and is cited
+    /// beside v2 rather than replaced by it.
+    /// </summary>
+    public const string SupersededRegistrationPath = "docs/research/c1-preregistration-v0.md";
 
     /// <summary>Quoted from that file's header line "Frozen: Saturday 2026-09-12, prior to any query execution."</summary>
     public const string PreRegistrationFrozen = "Saturday 2026-09-12";
@@ -42,16 +52,48 @@ public static class MemoWriter
 
     private const string Absent = "n/a";
 
+    /// <summary>The title suffix that says, on the first line, whether this memo is the deliverable.</summary>
+    public const string ProvisionalLabel = "PROVISIONAL";
+
+    /// <summary>The title suffix when the run of covered quarters ending at the most recent one is empty.</summary>
+    public const string NoSubsetLabel = "NO DELIVERABLE SUBSET";
+
     public static string Render(C1Report report)
     {
         var memo = new StringBuilder();
+        var title = "# C1 — implied vs realized earnings moves (v2)";
+        if (report.Coverage.NothingDeliverable) title += $" — {NoSubsetLabel}";
+        else if (report.Coverage.Provisional) title += $" — {ProvisionalLabel}";
 
-        Line(memo, "# C1 — implied vs realized earnings moves (v0)");
+        Line(memo, title);
+        Line(memo);
+
+        Line(memo, $"Governing registration: `{PreRegistrationPath}`, amended {PreRegistrationAmended} as a PRE-RESULT");
+        Line(memo, "amendment — no real-data memo existed when it was written. It corrects the decision criterion to");
+        Line(memo, "mean(RF/IM), ratifies the outcome-blind gate-09 timing rule, and pre-commits the deadline fallback.");
+        Line(memo, $"Superseded record: `{SupersededRegistrationPath}`, frozen {PreRegistrationFrozen} prior to any query");
+        Line(memo, "execution. v2 section 6 leaves that file's universe rule, gate order, window, measure definitions,");
+        Line(memo, "splits and exclusion accounting unchanged, so both are executed here and neither is added to.");
         Line(memo);
 
         Line(memo, "The number is the number. Every figure below is computed by the `compute` verb from the tables");
         Line(memo, "listed in 1.2 and written by the same run; nothing in this memo is typed by hand.");
         Line(memo);
+
+        if (report.Coverage.NothingDeliverable)
+        {
+            Line(memo, $"**{NoSubsetLabel}.** The most recent quarter of the registered window is not fully fetched, so");
+            Line(memo, "the run of covered quarters ending there is empty. Every event was removed at gate 07b and there");
+            Line(memo, "is NO VERDICT. Section 1.3 names what is missing, per quarter. The run exits non-zero.");
+            Line(memo);
+        }
+        else if (report.Coverage.Provisional)
+        {
+            Line(memo, $"**{ProvisionalLabel}.** Only {report.Coverage.Subset.Count} of {report.Coverage.Quarters.Count} registered quarters are fully fetched. Every");
+            Line(memo, $"statistic and split below is restricted to {report.Coverage.Subset[0]}..{report.Coverage.Subset[^1]}, a TIME-ONLY subset applied at gate 07b.");
+            Line(memo, "The full-window run remains owed whatever the verdict below says (v2 section 3).");
+            Line(memo);
+        }
 
         UniverseSection(memo, report);
         ExclusionSection(memo, report);
@@ -70,9 +112,9 @@ public static class MemoWriter
     {
         Line(memo, "## 1. Universe rule");
         Line(memo);
-        Line(memo, $"Pre-registration: `{PreRegistrationPath}`, frozen {PreRegistrationFrozen} prior to any query");
-        Line(memo, "execution. That file defines the universe, the gates, the measures, the statistics and the");
-        Line(memo, "PASS/FAIL rule; this memo executes it and adds nothing to it.");
+        Line(memo, $"The universe, the gates, the window, the measures and the splits are `{SupersededRegistrationPath}`'s,");
+        Line(memo, $"unchanged by v2 section 6. The decision criterion, the timing rule and the deadline fallback are");
+        Line(memo, $"`{PreRegistrationPath}`'s. This memo executes both and adds nothing to either.");
         Line(memo);
         Line(memo, $"- Registered window: {Date(C1Registration.WindowFrom)} to {Date(C1Registration.WindowTo)} (v0 subsets by TIME only).");
         Line(memo, $"- Minimum entry close: {Money(C1Registration.MinimumEntryPrice)}. Tradable tier: combined ATM spread <= {Num(C1Registration.TradableSpreadFraction)} x straddle mid.");
@@ -106,49 +148,9 @@ public static class MemoWriter
         Line(memo, "`gate_counts.csv` is not hashed here: `compute` appends its own rows to it, so it is an output of");
         Line(memo, "this run as well as an input, and a hash of it would change on a re-run that changed nothing.");
         Line(memo);
-    }
 
-    private static IEnumerable<string> Definitions() =>
-    [
-        "1. **Median, even n** — the mean of the two middle order statistics. Odd n is the middle value.",
-        "2. **P(RF < IM)** — strict. An event with RF exactly equal to IM counts as NOT less and is reported",
-        "   separately as a tie. The comparison is made on RF and IM, never on the stored ratio, so a ratio",
-        "   that rounds to exactly 1 cannot flip a boundary event.",
-        "3. **Bootstrap cluster** — `event_timing.earnings_week`. An event with no week recorded is its own",
-        "   singleton cluster (`unknown-week:<event_id>`), counted and reported per sample: singletons narrow",
-        "   the interval, so the count is printed rather than buried.",
-        "4. **Bootstrap draw** — clusters with replacement, as many draws as the sample has clusters; the drawn",
-        "   clusters' events are pooled and both statistics recomputed on the pool.",
-        "5. **Interval** — percentile method at (1 - level)/2 and 1 - (1 - level)/2, endpoints taken as order",
-        "   statistics by the nearest-rank rule (the smallest replicate whose 1-based rank is at least p x reps).",
-        "   No interpolation: an endpoint is a value the resampling actually produced.",
-        "6. **Verdict boundaries** — `median < 1` is strict, so a median of exactly 1 FAILS. \"Excludes 0.5\" means",
-        "   0.5 lies outside the CLOSED interval, so an endpoint of exactly 0.5 does NOT exclude it and FAILS.",
-        "7. **Trim** — floor(0.01 x n) values dropped from EACH tail of the sorted log ratios, n counted AFTER the",
-        "   RF = 0 exclusion. If the two tails would leave nothing, the trimmed mean is reported as not computable.",
-        "8. **RF = 0** — no logarithm exists, so such events are excluded from the secondary log statistics ONLY,",
-        "   and counted. They stay in the median and in P(RF < IM).",
-        "9. **Quintiles** — equal-count buckets by rank WITHIN the sample being reported: ascending, ties broken by",
-        "   event id, bucket = floor(rank x 5 / n) clamped to 4. When n is not divisible by 5 the bucket sizes differ",
-        "   by at most one and which buckets carry the extra event is decided by that formula and nothing else",
-        "   (n = 7 gives 2, 1, 2, 1, 1; n = 11 gives 3, 2, 2, 2, 2). An event with no value never joins a quintile;",
-        "   it goes to the `unknown` bucket, which is printed even when empty.",
-        "10. **Spot for IM** — `spot_feed_entry` when present, otherwise `spot_parity_entry`. The source is recorded",
-        "    per event and tallied in 9.2, with the parity-vs-close deviation quantiles beside it.",
-        "11. **Sample nesting** — the primary (tradable) sample is a SUBSET of the secondary (all-quotable) sample.",
-        "    An event in the primary sample is counted in both; `in_primary` / `in_secondary` in the event table are",
-        "    the authoritative flags.",
-        "12. **Unmeasurable events** — an event that passes the quotable gate but has no computable RF/IM is counted",
-        "    and listed by id, never dropped and never defaulted. It counts toward sample membership, not toward n.",
-        "13. **Straddle hold-through** — diagnostic only, never an input to the verdict. A missing exit mid is counted,",
-        "    not dropped.",
-        "14. **Random draws** — SplitMix64 seeded from the registered seed mixed with an FNV-1a hash of each analysis",
-        "    name, so every interval reproduces exactly and adding an analysis does not move the others.",
-        "15. **Rounding** — every comparison is made on unrounded `decimal` values. Numbers are formatted only when",
-        "    written: 6 decimal places for ratios, proportions and moves, 2 for prices, 0 for market capitalisations.",
-        "16. **Market cap** — as-of shares outstanding (the latest fact filed on or before the entry date) x the entry",
-        "    close. No fact on or before that date means the `unknown` bucket, never an interpolated figure."
-    ];
+        CoverageSection(memo, report);
+    }
 
     private static void ExclusionSection(StringBuilder memo, C1Report report)
     {
@@ -244,10 +246,15 @@ public static class MemoWriter
         Line(memo, $"| events in sample | {sample.Members} | |");
         Line(memo, $"| of which RF/IM computable (n) | {sample.Measurable} | |");
         Line(memo, $"| earnings-week clusters | {sample.Clusters} | |");
-        Line(memo, $"| median(RF/IM) | {Num(sample.Median)} | {Interval(sample.Bootstrap?.Median)} |");
-        Line(memo, $"| P(RF < IM) | {Num(sample.ProportionLess)} | {Interval(sample.Bootstrap?.ProportionLess)} |");
+        Line(memo, $"| **mean(RF/IM)** — PRIMARY, decides the verdict | **{Num(sample.Mean)}** | **{Interval(sample.Bootstrap?.Mean)}** |");
+        Line(memo, $"| median(RF/IM) — DESCRIPTIVE READOUT | {Num(sample.Median)} | {Interval(sample.Bootstrap?.Median)} |");
+        Line(memo, $"| P(RF < IM) — DESCRIPTIVE READOUT | {Num(sample.ProportionLess)} | {Interval(sample.Bootstrap?.ProportionLess)} |");
         Line(memo, $"| events with RF < IM | {sample.LessCount} | |");
         Line(memo, $"| ties (RF = IM, counted as not less) | {sample.TieCount} | |");
+        Line(memo);
+        Line(memo, "Only the mean row decides anything. v2 section 1 demoted the median and P(RF < IM) to descriptive");
+        Line(memo, "readouts: they measure the SHAPE of the ratio distribution, which a fairly priced market already");
+        Line(memo, "satisfies, and they are kept because C2 sizing needs them. See section 9.3.");
         Line(memo);
 
         if (sample.SingletonUnknownWeeks > 0)
@@ -270,8 +277,10 @@ public static class MemoWriter
     {
         Line(memo, "## 5. Verdict");
         Line(memo);
-        Line(memo, "PASS = median(RF/IM) < 1 AND the week-clustered 95% CI for P(RF < IM) excludes 0.5. FAIL = otherwise.");
-        Line(memo, "Measured on the PRIMARY (tradable) sample.");
+        Line(memo, C1Criterion.Rule);
+        Line(memo, report.Coverage.FullWindow
+            ? "Measured on the PRIMARY (tradable) sample over the full registered window."
+            : $"Measured on the PRIMARY (tradable) sample, restricted to the deliverable subset (section 1.3).");
         Line(memo);
         Line(memo, report.Verdict.Line);
         Line(memo);
@@ -286,6 +295,8 @@ public static class MemoWriter
             Line(memo, "No consequence is triggered by a verdict that was not computed.");
         }
         Line(memo);
+
+        CrossCheckSection(memo, report);
     }
 
     private static void SplitsSection(StringBuilder memo, C1Report report)
@@ -313,11 +324,12 @@ public static class MemoWriter
     {
         Line(memo, $"{sampleTitle}:");
         Line(memo);
-        Line(memo, "| bucket | range | n | clusters | median | median CI | P(RF < IM) | P CI |");
-        Line(memo, "|---|---|---:|---:|---:|---|---:|---|");
+        Line(memo, "| bucket | range | n | clusters | mean | mean CI | median | median CI | P(RF < IM) | P CI |");
+        Line(memo, "|---|---|---:|---:|---:|---|---:|---|---:|---|");
         foreach (var bucket in split.Buckets)
         {
             Line(memo, $"| {bucket.Label} | {Text(bucket.Range)} | {bucket.Members} | {bucket.Clusters} | " +
+                       $"{Num(bucket.Mean)} | {Interval(bucket.MeanInterval)} | " +
                        $"{Num(bucket.Median)} | {Interval(bucket.MedianInterval)} | {Num(bucket.ProportionLess)} | {Interval(bucket.ProportionInterval)} |");
         }
         Line(memo);
@@ -371,7 +383,7 @@ public static class MemoWriter
         Line(memo);
         Line(memo, "### 9.1 Registered v0 biases");
         Line(memo);
-        Line(memo, $"Verbatim from `{PreRegistrationPath}`, section \"Known v0 biases (logged, with direction)\":");
+        Line(memo, $"Verbatim from `{SupersededRegistrationPath}`, section \"Known v0 biases (logged, with direction)\":");
         Line(memo);
         Line(memo, "```");
         Line(memo, RegisteredBiases);
@@ -414,6 +426,7 @@ public static class MemoWriter
         Line(memo, "  ```");
         Line(memo);
 
+        V0TwoSignalSection(memo, report);
         GateNineSelectionEffect(memo, report);
         ImCollapseSection(memo, report);
 
@@ -467,24 +480,6 @@ public static class MemoWriter
         Line(memo, "|---|---:|---:|---:|---:|");
         Line(memo, $"| quarantined | {a.QuarantinedCollapsed} | {a.QuarantinedNotCollapsed} | {a.QuarantinedNotComputable} | {a.Quarantined} |");
         Line(memo, $"| not quarantined | {a.KeptCollapsed} | {a.KeptNotCollapsed} | {a.KeptNotComputable} | {a.Kept} |");
-        Line(memo);
-    }
-
-    /// <summary>
-    /// The arithmetic property of the registered PASS condition itself. Printed on every run, passing
-    /// or failing: it is a fact about the rule, not about the data, and it is the one caveat a reader
-    /// cannot recover from any number in this memo.
-    /// </summary>
-    private static void CriterionSection(StringBuilder memo)
-    {
-        Line(memo, "### 9.3 What the registered criterion does and does not establish");
-        Line(memo);
-        Line(memo, "For any move distribution whose median absolute move is below its mean absolute move — which is every");
-        Line(memo, "symmetric one — a straddle priced at exactly the mean absolute move, carrying no premium at all, already");
-        Line(memo, "gives median(RF/IM) < 1 and P(RF < IM) > 0.5, so the registered PASS condition is satisfied by a fairly");
-        Line(memo, "priced market and is not by itself evidence of a premium in expectation. This memo executes the");
-        Line(memo, "registered rule as written and does not reinterpret it; the mean-based straddle hold-through diagnostic");
-        Line(memo, "in section 7 is the readout that speaks to a premium in expectation.");
         Line(memo);
     }
 

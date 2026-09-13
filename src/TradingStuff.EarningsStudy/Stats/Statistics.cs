@@ -6,6 +6,7 @@ namespace TradingStuff.EarningsStudy.Stats;
 /// (<see cref="MemoWriter"/>) so the reader of the memo can check the code against the text:
 ///
 /// <list type="bullet">
+/// <item>mean (the v2 primary statistic): summed in decimal over the sample, divided once;</item>
 /// <item>median: odd n is the middle order statistic, EVEN n is the mean of the two middle values;</item>
 /// <item>P(RF &lt; IM): strict, ties counted as not-less and reported separately;</item>
 /// <item>quantiles: nearest rank, no interpolation;</item>
@@ -19,9 +20,25 @@ namespace TradingStuff.EarningsStudy.Stats;
 public static class Statistics
 {
     /// <summary>
+    /// The mean of a sample — the PRIMARY statistic under v2. Summed in <c>decimal</c> in the sample's
+    /// own order and divided once at the end; no running average, no <c>double</c>, so the value is a
+    /// function of the multiset and not of how the addition was chunked. Null for an empty sample.
+    /// </summary>
+    public static decimal? Mean(IReadOnlyList<decimal> values)
+    {
+        if (values.Count == 0) return null;
+        var total = 0m;
+        foreach (var value in values) total += value;
+        return total / values.Count;
+    }
+
+    /// <summary>
     /// The median of a sample. Odd n is the middle order statistic; even n is the mean of the two
     /// middle values — the pre-registration does not say which convention, so this one is fixed here
     /// and stated in the memo. Null for an empty sample.
+    ///
+    /// DESCRIPTIVE READOUT under v2: reported, never deciding. It measures the shape of the ratio
+    /// distribution, which a fairly priced market already satisfies.
     /// </summary>
     public static decimal? Median(IReadOnlyList<decimal> values)
     {
@@ -40,7 +57,9 @@ public static class Statistics
     }
 
     /// <summary>
-    /// P(RF &lt; IM). Strictly less: an event whose realized move exactly equals its implied move
+    /// P(RF &lt; IM), a DESCRIPTIVE READOUT under v2 — reported, never deciding.
+    ///
+    /// Strictly less: an event whose realized move exactly equals its implied move
     /// counts as NOT less, and is reported separately as a tie. The comparison itself is made on RF
     /// and IM when the sample is built, never on the stored ratio, so a ratio that rounds to exactly
     /// 1 at decimal's precision cannot flip a boundary event. Null for an empty sample.

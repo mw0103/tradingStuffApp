@@ -20,11 +20,11 @@ public sealed class ComputeStepTests
             ? new TimingQaResult(true, "entry close already carries the move", 0.001m, 0.090m)
             : new TimingQaResult(false, null, 0.001m, 0.020m);
 
-        study.AddEvent("closes-missing", withCloses: false);
+        study.AddEvent("closes-incomplete", closePreEntry: null);
         study.AddEvent("closes-status", closesStatus: "missing_exit_bar");
         study.AddEvent("qa");
         study.AddEvent("cheap", closeEntryOverride: 9.99m);
-        study.AddEvent("chain-missing", withMeasures: false);
+        study.AddEvent("chain-error", fetchStatus: "error");
         study.AddEvent("chain-status", fetchStatus: "no_chain");
         study.AddEvent("no-bid", putBid: 0m);
         study.AddEvent("wide", combinedSpread: 4m);
@@ -41,11 +41,11 @@ public sealed class ComputeStepTests
         Assert.Equal(11, table.Count);
         Assert.DoesNotContain(table, r => r.EventId == "not-kept");
 
-        Assert.Equal(Gates.ClosesPresent, study.Row("closes-missing").StopGate);
+        Assert.Equal(Gates.ClosesPresent, study.Row("closes-incomplete").StopGate);
         Assert.Equal(Gates.ClosesPresent, study.Row("closes-status").StopGate);
         Assert.Equal(Gates.PriceQa, study.Row("qa").StopGate);
         Assert.Equal(Gates.MinimumPrice, study.Row("cheap").StopGate);
-        Assert.Equal(Gates.ChainFound, study.Row("chain-missing").StopGate);
+        Assert.Equal(Gates.ChainFound, study.Row("chain-error").StopGate);
         Assert.Equal(Gates.ChainFound, study.Row("chain-status").StopGate);
         Assert.Equal(Gates.Quotable, study.Row("no-bid").StopGate);
         Assert.Equal(Gates.Tradable, study.Row("wide").StopGate);
@@ -54,7 +54,7 @@ public sealed class ComputeStepTests
         Assert.Equal("", study.Row("good").StopGate);
 
         // Each removed row says why, in its own words.
-        Assert.Contains("no row in closes.csv", study.Row("closes-missing").Note);
+        Assert.Contains("close_pre_entry missing", study.Row("closes-incomplete").Note);
         Assert.Contains("entry close below 10", study.Row("cheap").Note);
         Assert.Contains("the ATM put bid is zero", study.Row("no-bid").Note);
         Assert.Contains("wider than the tradable tier", study.Row("wide").Note);
@@ -72,10 +72,17 @@ public sealed class ComputeStepTests
 
         var counts = study.WrittenGateCounts.Where(c => c.Step == ComputeStep.StepName).ToList();
 
-        Assert.Equal([8, 9, 10, 11, 12, 13], counts.Select(c => c.Order));
+        Assert.Equal([8, 9, 10, 11, 12, 13, 14], counts.Select(c => c.Order));
         Assert.Equal(
-            [Gates.ClosesPresent, Gates.PriceQa, Gates.MinimumPrice, Gates.ChainFound, Gates.Quotable, Gates.Tradable],
+            [Gates.QuarterCoverage, Gates.ClosesPresent, Gates.PriceQa, Gates.MinimumPrice, Gates.ChainFound,
+             Gates.Quotable, Gates.Tradable],
             counts.Select(c => c.Gate));
+
+        // Every quarter of the registered window is fetched here, so the v2 subset gate considers
+        // every event and removes none. It still records a row: a gate that decided nothing has to
+        // say so rather than be absent from the ledger.
+        Assert.Equal(0, counts[0].Removed);
+        Assert.Contains("the full registered window", counts[0].Note);
 
         foreach (var count in counts)
         {
@@ -104,7 +111,7 @@ public sealed class ComputeStepTests
         var afterSecond = File.ReadAllBytes(study.Paths.GateCounts);
 
         Assert.Equal(afterFirst, afterSecond);
-        Assert.Equal(6, study.WrittenGateCounts.Count(c => c.Step == ComputeStep.StepName));
+        Assert.Equal(7, study.WrittenGateCounts.Count(c => c.Step == ComputeStep.StepName));
         Assert.Equal(7, study.WrittenGateCounts.Count(c => c.Step != ComputeStep.StepName));
     }
 
@@ -237,9 +244,10 @@ public sealed class ComputeStepTests
         Assert.True(study.Row("zero").InPrimary);
         Assert.Equal(0m, study.Row("zero").Ratio);
 
-        // Ratios 0, 0.5, 1 -> median 0.5, P(RF < IM) = 2/3, one tie. Logs keep only 0.5 and 1.
-        Assert.Contains("| median(RF/IM) | 0.500000 |", study.Memo);
-        Assert.Contains("| P(RF < IM) | 0.666667 |", study.Memo);
+        // Ratios 0, 0.5, 1 -> mean 0.5, median 0.5, P(RF < IM) = 2/3, one tie. Logs keep only 0.5 and 1.
+        Assert.Contains("| **mean(RF/IM)** — PRIMARY, decides the verdict | **0.500000** |", study.Memo);
+        Assert.Contains("| median(RF/IM) — DESCRIPTIVE READOUT | 0.500000 |", study.Memo);
+        Assert.Contains("| P(RF < IM) — DESCRIPTIVE READOUT | 0.666667 |", study.Memo);
         Assert.Contains("| ties (RF = IM, counted as not less) | 1 |", study.Memo);
         Assert.Contains("| Primary sample — tradable tier | 2 | 1 | 0 |", study.Memo);
     }
@@ -271,7 +279,7 @@ public sealed class ComputeStepTests
     {
         using var study = new StudyHarness();
         study.PriceQa = (timing, _) => new TimingQaResult(timing.EventId == "q", "post-print entry", null, null);
-        study.AddEvent("q").AddEvent("a").AddEvent("b").AddEvent("no-closes", withCloses: false);
+        study.AddEvent("q").AddEvent("a").AddEvent("b").AddEvent("no-pre-entry", closePreEntry: null);
 
         Assert.Equal(0, await study.RunAsync("--reps", "20"));
 
@@ -306,7 +314,7 @@ public sealed class ComputeStepTests
     public async Task With_nothing_reaching_gate_09_the_price_qa_rate_is_absent_rather_than_zero()
     {
         using var study = new StudyHarness();
-        study.AddEvent("no-closes", withCloses: false);
+        study.AddEvent("no-pre-entry", closePreEntry: null);
 
         Assert.Equal(0, await study.RunAsync("--reps", "20"));
 
@@ -360,7 +368,7 @@ public sealed class ComputeStepTests
         // and one event that never reaches gate 09 at all, which must not appear in the table.
         study.AddEvent("q-collapsed").AddEvent("q-steady").AddEvent("q-unknown")
              .AddEvent("k-collapsed").AddEvent("k-steady-a").AddEvent("k-steady-b")
-             .AddEvent("never-reaches-gate-09", withCloses: false);
+             .AddEvent("never-reaches-gate-09", closePreEntry: null);
 
         SetPreEntry(study, "q-collapsed", 20m);
         SetPreEntry(study, "q-steady", 8m);
@@ -427,21 +435,30 @@ public sealed class ComputeStepTests
     }
 
     [Fact]
-    public async Task The_memo_states_what_the_registered_criterion_does_not_establish()
+    public async Task The_memo_states_what_the_v2_criterion_does_and_does_not_establish()
     {
         using var study = new StudyHarness();
         study.AddEvent("a").AddEvent("b");
 
         Assert.Equal(0, await study.RunAsync("--reps", "20"));
 
+        // Why v0 was amended: its condition is met with no premium at all.
         Assert.Contains(
-            "For any move distribution whose median absolute move is below its mean absolute move — which is every\n" +
-            "symmetric one — a straddle priced at exactly the mean absolute move, carrying no premium at all, already\n" +
-            "gives median(RF/IM) < 1 and P(RF < IM) > 0.5, so the registered PASS condition is satisfied by a fairly\n" +
-            "priced market and is not by itself evidence of a premium in expectation. This memo executes the\n" +
-            "registered rule as written and does not reinterpret it; the mean-based straddle hold-through diagnostic\n" +
-            "in section 7 is the readout that speaks to a premium in expectation.",
+            "**The retired v0 criterion was satisfied by a fairly priced market.** For any move distribution whose\n" +
+            "median absolute move is below its mean absolute move — which is every symmetric one, and absolute\n" +
+            "returns are right-skewed — a straddle priced at exactly the mean absolute move, carrying no premium at\n" +
+            "all, already gives median(RF/IM) < 1 and P(RF < IM) > 0.5.",
             study.Memo);
+
+        // What v2 replaced it with, and why that number is 1.
+        Assert.Contains(
+            "**The v2 criterion has null value exactly 1.** Under fair per-event pricing — IM_i = E[RF_i] for every\n" +
+            "event — the tower property gives E[RF_i/IM_i] = E[E[RF_i | IM_i]/IM_i] = 1, so mean(RF/IM) estimates 1\n" +
+            "with no premium, whatever the shape of the move distribution.",
+            study.Memo);
+
+        Assert.Contains("**median(RF/IM) and P(RF < IM) are shape readouts only.**", study.Memo);
+        Assert.Contains("### 9.3 What the criterion does and does not establish", study.Memo);
     }
 
     [Fact]
@@ -489,6 +506,8 @@ public sealed class ComputeStepTests
         Assert.Equal(Gates.InOrder, gates);
         Assert.Contains("| 1 | `01_seed_current_optionable_list` | universe |", study.Memo);
         Assert.Contains("| 7 | `07_timing_classified_bmo_or_amc` | timing |", study.Memo);
+        Assert.Contains("| 8 | `07b_full_quarter_coverage_subset` | compute |", study.Memo);
+        Assert.Contains("| 14 | `13_combined_atm_spread_within_15pct_of_straddle` | compute |", study.Memo);
     }
 
     [Fact]
@@ -531,6 +550,7 @@ public sealed class ComputeStepTests
         [
             "### 1.1 Definitions fixed before compute",
             "### 1.2 Inputs",
+            "### 1.3 Fetch coverage and the deliverable subset",
             "### 4.1 Primary sample — tradable tier",
             "### 4.2 Secondary sample — all quotable",
             "### 6.1 Market-cap quintile",
@@ -539,34 +559,36 @@ public sealed class ComputeStepTests
             "### 6.4 BMO vs AMC",
             "### 9.1 Registered v0 biases",
             "### 9.2 Measured in this run",
-            "### 9.3 What the registered criterion does and does not establish"
+            "### 9.3 What the criterion does and does not establish"
         ], subheadings);
     }
 
     [Fact]
     public async Task A_pass_and_a_fail_are_both_reachable_and_the_memo_says_which()
     {
-        // Twelve weeks, every event's realized move well inside its implied move: P(RF < IM) = 1, so
-        // the interval is [1, 1] and the median is 0.25.
+        // Twelve weeks, every event's ratio exactly 0.25: the mean is 0.25 and every replicate of it
+        // is 0.25 too, so the interval is [0.25, 0.25] and sits entirely below 1.
         using var pass = new StudyHarness();
         for (var i = 0; i < 24; i++) pass.AddEvent($"e{i}", rf: 0.02m, im: 0.08m, week: $"2024-W{i % 12:00}");
 
         Assert.Equal(0, await pass.RunAsync("--reps", "300"));
         Assert.Contains("**VERDICT: PASS**", pass.Memo);
-        Assert.Contains("excludes 0.5 (above it)", pass.Memo);
+        Assert.Contains("excludes 1 (below it)", pass.Memo);
         Assert.Contains("proceed to C2 preparation", pass.Memo);
 
-        // Half the weeks under, half over: the median is below 1 but the interval straddles 0.5.
+        // Half the clusters at 0.5 and half at 1.5: the mean is exactly 1, which fails on the strict
+        // inequality alone, and the interval straddles 1 as well.
         using var fail = new StudyHarness();
         for (var i = 0; i < 24; i++)
         {
             var under = i % 2 == 0;
-            fail.AddEvent($"e{i}", rf: under ? 0.02m : 0.10m, im: 0.08m, week: $"2024-W{i % 12:00}");
+            fail.AddEvent($"e{i}", rf: under ? 0.04m : 0.12m, im: 0.08m, week: $"2024-W{i % 12:00}");
         }
 
         Assert.Equal(0, await fail.RunAsync("--reps", "300"));
         Assert.Contains("**VERDICT: FAIL**", fail.Memo);
-        Assert.Contains("contains 0.5", fail.Memo);
+        Assert.Contains("mean(RF/IM) = 1.000000 >= 1", fail.Memo);
+        Assert.Contains("contains 1", fail.Memo);
         Assert.Contains("the program stops", fail.Memo);
     }
 
@@ -657,7 +679,8 @@ public sealed class ComputeStepTests
 
         Assert.Empty(study.EventTable);
         Assert.Contains("| events in sample | 0 | |", study.Memo);
-        Assert.Contains("| median(RF/IM) | n/a | n/a |", study.Memo);
+        Assert.Contains("| **mean(RF/IM)** — PRIMARY, decides the verdict | **n/a** | **n/a** |", study.Memo);
+        Assert.Contains("| median(RF/IM) — DESCRIPTIVE READOUT | n/a | n/a |", study.Memo);
         Assert.Contains("**VERDICT: NOT COMPUTED**", study.Memo);
         Assert.Equal(0, study.WrittenGateCounts.Single(c => c.Gate == Gates.ClosesPresent).Considered);
     }
@@ -678,7 +701,7 @@ public sealed class ComputeStepTests
 
         Assert.Contains("this gate's tally is absent, not zero", study.Memo);
         Assert.Contains("- Timing QA (gate 07): **0** quarantined; the rate is **not computable**.", study.Memo);
-        Assert.Equal(6, study.WrittenGateCounts.Count);
+        Assert.Equal(7, study.WrittenGateCounts.Count);
     }
 
     [Fact]

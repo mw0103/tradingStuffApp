@@ -9,8 +9,13 @@ public sealed record BootstrapInterval(
     int Clusters,
     int SampleSize);
 
-/// <summary>Both registered statistics, resampled together so each replicate is one draw of clusters.</summary>
+/// <summary>
+/// The registered statistics, resampled together so each replicate is one draw of clusters.
+/// <see cref="Mean"/> is the v2 primary interval — the one the verdict reads; the other two are the
+/// demoted descriptive readouts, computed on the SAME replicates so the three describe one draw.
+/// </summary>
 public sealed record BootstrapResult(
+    BootstrapInterval Mean,
     BootstrapInterval Median,
     BootstrapInterval ProportionLess,
     int Clusters,
@@ -22,8 +27,8 @@ public sealed record BootstrapResult(
 /// through the market factor), 10,000 reps, 95% CI".
 ///
 /// The unit of resampling is the CLUSTER, not the event. One replicate draws as many clusters as the
-/// sample has, with replacement, pools all the events of the drawn clusters, and recomputes both
-/// statistics on that pool — so a week is either wholly in or wholly out of a replicate and the
+/// sample has, with replacement, pools all the events of the drawn clusters, and recomputes every
+/// statistic on that pool — so a week is either wholly in or wholly out of a replicate and the
 /// within-week common shock is preserved. Resampling events instead would treat same-week events as
 /// independent and understate the interval, which is exactly the error the registration names; the
 /// test <c>Common_week_shock_makes_the_clustered_interval_materially_wider</c> is the control for it.
@@ -33,7 +38,7 @@ public sealed record BootstrapResult(
 /// </summary>
 public static class ClusteredBootstrap
 {
-    private sealed record Cluster(string Key, decimal[] Ratios, int LessCount);
+    private sealed record Cluster(string Key, decimal[] Ratios, decimal RatioSum, int LessCount);
 
     /// <summary>
     /// Runs the clustered bootstrap. Null when there is nothing to resample (an empty sample, or a
@@ -47,7 +52,7 @@ public static class ClusteredBootstrap
         var clusters = sample
             .GroupBy(e => e.ClusterKey, StringComparer.Ordinal)
             .OrderBy(g => g.Key, StringComparer.Ordinal)
-            .Select(g => new Cluster(g.Key, [.. g.Select(e => e.Ratio)], g.Count(e => e.RfLessThanIm)))
+            .Select(g => new Cluster(g.Key, [.. g.Select(e => e.Ratio)], g.Sum(e => e.Ratio), g.Count(e => e.RfLessThanIm)))
             .ToArray();
 
         // A replicate draws `clusters.Length` clusters, so the pooled sample cannot exceed that many
@@ -56,6 +61,7 @@ public static class ClusteredBootstrap
         if (capacity > int.MaxValue) throw new InvalidOperationException("the sample is too large to bootstrap in one buffer");
         var buffer = new decimal[(int)capacity];
         var random = new SplitMix64(seed);
+        var means = new decimal[replications];
         var medians = new decimal[replications];
         var proportions = new decimal[replications];
 
@@ -63,23 +69,32 @@ public static class ClusteredBootstrap
         {
             var length = 0;
             var less = 0;
+            var total = 0m;
             for (var c = 0; c < clusters.Length; c++)
             {
                 var drawn = clusters[random.NextBelow(clusters.Length)];
                 Array.Copy(drawn.Ratios, 0, buffer, length, drawn.Ratios.Length);
                 length += drawn.Ratios.Length;
                 less += drawn.LessCount;
+                total += drawn.RatioSum;
             }
 
+            // The replicate mean is the pooled sum over the pooled count, accumulated from each drawn
+            // cluster's own decimal sum. Adding the cluster subtotals is the same arithmetic as adding
+            // the events one by one — decimal addition is exact until the scale runs out — so this is a
+            // shortcut past re-walking the buffer, not a different estimator.
+            means[r] = total / length;
             Array.Sort(buffer, 0, length);
             medians[r] = Statistics.MedianOfSorted(buffer, length);
             proportions[r] = (decimal)less / length;
         }
 
+        Array.Sort(means);
         Array.Sort(medians);
         Array.Sort(proportions);
         var tail = (1m - level) / 2m;
         return new BootstrapResult(
+            Interval(means, tail, level, clusters.Length, sample.Count),
             Interval(medians, tail, level, clusters.Length, sample.Count),
             Interval(proportions, tail, level, clusters.Length, sample.Count),
             clusters.Length,
